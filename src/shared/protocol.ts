@@ -34,17 +34,97 @@ export type MsgStatus =
   | "queued" | "delivered" | "held" | "rejected" | "failed"
   | "expired" | "posted" | "dropped";
 
+/** A retained message together with its durable paging order and current delivery state. */
+export type StoredMessage = WireMsg & {
+  order: number;
+  fromSessionId?: string;
+  channel?: string;
+  toSessionId?: string;
+  status: MsgStatus;
+  reason?: string;
+};
+
+export type SessionState = "live" | "gone" | "removed";
+
+/** Stable historical identity; names can be reused, but ids cannot. */
+export type SessionIdentity = {
+  id: string;
+  name: string;
+  previousNames: string[];
+  harness: Harness | "unknown";
+  cwd?: string;
+  state: SessionState;
+  inbound: Inbound;
+  createdAt: number;
+  removedAt?: number;
+};
+
+export type ChannelSummary = {
+  name: string;
+  count: number;
+  lastAt: number;
+  lastOrder: number;
+};
+
+export type HistoryScope =
+  | { scope: "session"; sessionId: string }
+  | { scope: "inbox" }
+  | { scope: "channel"; channel: string };
+
+export type HistoryPageRequest = HistoryScope & { before?: number; limit?: number };
+export type ReadScope = Exclude<HistoryScope, { scope: "inbox" }>;
+
+/** `position` is monotone; `reminder` is one independently persisted unread item. */
+export type ReadState = {
+  scope: ReadScope;
+  position: number;
+  reminder: number | null;
+  version: number;
+  unread: number;
+};
+
 export type TailEvent =
-  | { type: "session"; action: "registered" | "renamed" | "gone" | "removed";
-      name: string; harness: Harness; cwd?: string; oldName?: string }
-  | { type: "message"; msg: WireMsg; status: MsgStatus; reason?: string };
+  | { type: "session"; action: "registered" | "renamed" | "gone" | "removed" | "updated";
+      name: string; harness: Harness; cwd?: string; oldName?: string; session: SessionIdentity }
+  | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string }
+  | { type: "read"; state: ReadState }
+  | { type: "retention" };
+
+export type PositionedEvent = { position: number; event: TailEvent };
+
+export type SyncResult = {
+  watermark: number;
+  eventFloor: number;
+  sessions: SessionIdentity[];
+  channels: ChannelSummary[];
+  readStates: ReadState[];
+};
+
+export type HistoryPage = { messages: StoredMessage[]; hasMore: boolean };
+
+export type ReplayResult = {
+  events: PositionedEvent[];
+  gap: boolean;
+  hasMore: boolean;
+  eventFloor: number;
+  watermark: number;
+};
+
+export type ReadMutationResult = { applied: boolean; state: ReadState };
 
 /** `session`/`key` identify the target binding on connections that host several sessions. */
 export type Push =
   | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string }
-  | { push: "event"; event: TailEvent };
+  | { push: "event"; position: number; event: TailEvent };
 
 export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unknown_target"; reason?: string };
+
+export type SendOptions = {
+  kind?: Kind;
+  thread?: string;
+  replyTo?: string;
+  done?: boolean;
+};
 
 export class AsenqError extends Error {
   constructor(readonly code: ErrCode, message: string) { super(message); }
