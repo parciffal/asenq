@@ -51,7 +51,7 @@ export type SessionIdentity = {
   id: string;
   name: string;
   previousNames: string[];
-  harness: Harness;
+  harness: Harness | "unknown";
   cwd?: string;
   state: SessionState;
   inbound: Inbound;
@@ -87,7 +87,8 @@ export type TailEvent =
   | { type: "session"; action: "registered" | "renamed" | "gone" | "removed" | "updated";
       name: string; harness: Harness; cwd?: string; oldName?: string; session: SessionIdentity }
   | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string }
-  | { type: "read"; state: ReadState };
+  | { type: "read"; state: ReadState }
+  | { type: "retention" };
 
 export type PositionedEvent = { position: number; event: TailEvent };
 

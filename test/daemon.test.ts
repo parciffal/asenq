@@ -348,6 +348,7 @@ test("sync watermark resumes missed status events and replay reports a pruned re
   env.clock.advance(8 * 86_400_000);
   env.daemon.prune();
   const afterPrune = await resumed.replay(0);
+  assert.ok(afterPrune.events.some((entry) => entry.event.type === "retention"));
   assert.equal(afterPrune.gap, true);
   assert.ok(afterPrune.eventFloor >= messageEvents.at(-1)!.position);
   const history = await resumed.historyPage({ scope: "session", sessionId: alpha.session.id });
@@ -385,11 +386,13 @@ test("shared read state keeps reminders against stale windows and excludes human
     [true, order, null, 0],
   );
 
-  await alpha.client.request("channel_send", { channel: "general", text: "initializes stream" });
+  await alpha.client.request("channel_send", { channel: "general", text: "first unread" });
+  assert.equal((await first.readState({ scope: "channel", channel: "general" })).unread, 1);
   await first.request("channel_send", { channel: "general", text: "human post" });
-  await alpha.client.request("channel_send", { channel: "general", text: "counts unread" });
+  assert.equal((await first.readState({ scope: "channel", channel: "general" })).unread, 1);
+  await alpha.client.request("channel_send", { channel: "general", text: "second unread" });
   const channel = await first.readState({ scope: "channel", channel: "general" });
-  assert.equal(channel.unread, 1);
+  assert.equal(channel.unread, 2);
 });
 
 test("schema rollout orders old equal-time rows by rowid and initializes retained history read", async () => {
@@ -413,15 +416,24 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
     `INSERT INTO sessions(id,harness,key,name,cwd,inbound,state,created_at)
      VALUES('s_old','omp','old-key','old-session','/old','accept','live',1)`,
   );
-  for (const [id, text] of [["m_old_1", "first"], ["m_old_2", "second"]]) {
+  for (const [id, text, fromName] of [
+    ["m_old_1", "first", "prior-session"],
+    ["m_old_2", "second", "old-session"],
+  ]) {
     db.run(
       `INSERT INTO messages(
         id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,
         done,status,reason,attempts,created_at,updated_at)
-       VALUES(?,'old-session','s_old','human',NULL,NULL,?,NULL,NULL,NULL,0,'posted',NULL,0,10,10)`,
-      id, text,
+       VALUES(?,?,'s_old','human',NULL,NULL,?,NULL,NULL,NULL,0,'posted',NULL,0,10,10)`,
+      id, fromName, text,
     );
   }
+  db.run(
+    `INSERT INTO messages(
+      id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,
+      done,status,reason,attempts,created_at,updated_at)
+     VALUES('m_orphan','human',NULL,'removed-session','s_removed',NULL,'archived',NULL,NULL,NULL,0,'delivered',NULL,0,11,12)`,
+  );
 
   const daemon = new Daemon({
     socket: socketPath(),
@@ -441,6 +453,16 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
     ]);
     const state = await client.readState({ scope: "session", sessionId: "s_old" });
     assert.deepEqual([state.position, state.unread], [2, 0]);
+    const snapshot = await client.sync();
+    const active = snapshot.sessions.find((session) => session.id === "s_old");
+    assert.deepEqual(active?.previousNames, ["prior-session"]);
+    const recovered = snapshot.sessions.find((session) => session.id === "s_removed");
+    assert.deepEqual(
+      recovered && [recovered.name, recovered.harness, recovered.state, recovered.removedAt],
+      ["removed-session", "unknown", "removed", 12],
+    );
+    const archived = await client.historyPage({ scope: "session", sessionId: "s_removed" });
+    assert.deepEqual(archived.messages.map((message) => message.id), ["m_orphan"]);
   } finally {
     client.close();
     await daemon.close();

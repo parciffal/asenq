@@ -540,7 +540,7 @@ export class Daemon {
       type: "session",
       action,
       name: session.name,
-      harness: session.harness,
+      harness: row.harness,
       ...(session.cwd ? { cwd: session.cwd } : {}),
       ...(oldName ? { oldName } : {}),
       session,
@@ -831,6 +831,12 @@ export class Daemon {
   }
 
   private insert(row: MsgRow): void {
+    let scope: ReadScope | undefined;
+    if (row.channel && row.from_name !== "human") scope = { scope: "channel", channel: row.channel };
+    else if (!row.channel && row.to_name === "human" && row.from_session && this.store.identity(row.from_session)) {
+      scope = { scope: "session", sessionId: row.from_session };
+    }
+    if (scope) this.store.ensureRead(scope);
     const positioned = this.store.transaction(() => {
       this.store.insertMsg(row);
       const event: TailEvent = {
@@ -842,11 +848,6 @@ export class Daemon {
       return this.store.appendEvent(event, this.now());
     });
     this.publish(positioned);
-    let scope: ReadScope | undefined;
-    if (row.channel && row.from_name !== "human") scope = { scope: "channel", channel: row.channel };
-    else if (!row.channel && row.to_name === "human" && row.from_session && this.store.identity(row.from_session)) {
-      scope = { scope: "session", sessionId: row.from_session };
-    }
     if (scope) this.emit({ type: "read", state: this.store.ensureRead(scope) });
   }
 
@@ -1006,9 +1007,16 @@ export class Daemon {
 
   prune(): void {
     const cutoff = this.now() - (this.opts.historyDays ?? 7) * 86_400_000;
-    this.store.db.run("DELETE FROM messages WHERE created_at<? AND status NOT IN ('queued','held')", cutoff);
+    const removedMessages = this.store.db.run(
+      "DELETE FROM messages WHERE created_at<? AND status NOT IN ('queued','held')",
+      cutoff,
+    ).changes;
     this.store.pruneEvents(cutoff);
-    for (const state of this.store.reconcileReads()) this.emit({ type: "read", state });
+    const reconciliation = this.store.reconcileReads();
+    for (const state of reconciliation.states) this.emit({ type: "read", state });
+    if (removedMessages + reconciliation.removedPositions + reconciliation.removedIdentities > 0) {
+      this.emit({ type: "retention" });
+    }
   }
 
   private opChannelSend(s: Sender, p: Params): Result {

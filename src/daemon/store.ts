@@ -44,8 +44,12 @@ export type MsgRow = {
 };
 
 type IdentityRow = {
-  id: string; harness: Harness; name: string; previous_names: string; cwd: string | null;
+  id: string; harness: Harness | "unknown"; name: string; previous_names: string; cwd: string | null;
   inbound: Inbound; state: SessionState; created_at: number; removed_at: number | null;
+};
+
+type EndpointRow = {
+  session_id: string; name: string; created_at: number; updated_at: number; ord: number;
 };
 
 type ReadRow = {
@@ -152,6 +156,56 @@ export class Store {
       `INSERT OR IGNORE INTO session_identities(id,harness,name,previous_names,cwd,inbound,state,created_at)
        SELECT id,harness,name,'[]',cwd,inbound,state,created_at FROM sessions`,
     );
+    const recovered = new Map<string, {
+      name: string; previousNames: string[]; createdAt: number; removedAt: number;
+    }>();
+    const endpoints = this.db.all<EndpointRow>(
+      `SELECT session_id,name,created_at,updated_at,ord FROM (
+         SELECT from_session AS session_id,from_name AS name,created_at,updated_at,ord
+         FROM messages WHERE from_session IS NOT NULL
+         UNION ALL
+         SELECT to_session AS session_id,to_name AS name,created_at,updated_at,ord
+         FROM messages WHERE to_session IS NOT NULL
+       ) ORDER BY ord`,
+    );
+    for (const endpoint of endpoints) {
+      const identity = recovered.get(endpoint.session_id);
+      if (!identity) {
+        recovered.set(endpoint.session_id, {
+          name: endpoint.name,
+          previousNames: [],
+          createdAt: endpoint.created_at,
+          removedAt: endpoint.updated_at,
+        });
+      } else {
+        if (endpoint.name !== identity.name) {
+          if (!identity.previousNames.includes(identity.name)) identity.previousNames.push(identity.name);
+          identity.name = endpoint.name;
+        }
+        identity.createdAt = Math.min(identity.createdAt, endpoint.created_at);
+        identity.removedAt = Math.max(identity.removedAt, endpoint.updated_at);
+      }
+    }
+    for (const [id, identity] of recovered) {
+      const existing = this.db.get<IdentityRow>("SELECT * FROM session_identities WHERE id=?", id);
+      if (existing) {
+        const previousNames = JSON.parse(existing.previous_names) as string[];
+        for (const name of [...identity.previousNames, identity.name]) {
+          if (name !== existing.name && !previousNames.includes(name)) previousNames.push(name);
+        }
+        this.db.run(
+          "UPDATE session_identities SET previous_names=? WHERE id=?",
+          JSON.stringify(previousNames), id,
+        );
+      } else {
+        this.db.run(
+          `INSERT INTO session_identities(
+            id,harness,name,previous_names,cwd,inbound,state,created_at,removed_at)
+           VALUES(?,'unknown',?,?,NULL,'accept','removed',?,?)`,
+          id, identity.name, JSON.stringify(identity.previousNames), identity.createdAt, identity.removedAt,
+        );
+      }
+    }
   }
 
   private initializeReadPositions(): void {
@@ -397,7 +451,7 @@ export class Store {
     };
   }
 
-  reconcileReads(): ReadState[] {
+  reconcileReads(): { states: ReadState[]; removedPositions: number; removedIdentities: number } {
     const changed: ReadScope[] = [];
     for (const row of this.db.all<ReadRow>("SELECT * FROM human_read_positions WHERE reminder IS NOT NULL")) {
       const scope: ReadScope = row.scope === "session"
@@ -411,19 +465,19 @@ export class Store {
         changed.push(scope);
       }
     }
-    this.db.run(
+    let removedPositions = this.db.run(
       `DELETE FROM human_read_positions WHERE scope='channel'
        AND NOT EXISTS(SELECT 1 FROM messages WHERE channel=human_read_positions.stream_key)`,
-    );
-    this.db.run(
+    ).changes;
+    removedPositions += this.db.run(
       `DELETE FROM human_read_positions WHERE scope='session'
        AND EXISTS(SELECT 1 FROM session_identities WHERE id=human_read_positions.stream_key AND state='removed')
        AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=human_read_positions.stream_key OR to_session=human_read_positions.stream_key)`,
-    );
-    this.db.run(
+    ).changes;
+    const removedIdentities = this.db.run(
       `DELETE FROM session_identities WHERE state='removed'
        AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=session_identities.id OR to_session=session_identities.id)`,
-    );
+    ).changes;
     const states: ReadState[] = [];
     for (const scope of changed) {
       const key = scope.scope === "session" ? scope.sessionId : scope.channel;
@@ -433,6 +487,6 @@ export class Store {
       );
       if (row) states.push(this.readStateFromRow(row));
     }
-    return states;
+    return { states, removedPositions, removedIdentities };
   }
 }
