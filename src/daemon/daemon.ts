@@ -728,12 +728,12 @@ export class Daemon {
       if (frame.type === "control" && frame.action === "peer_message_status") {
         const msgId = this.envelopeIds.get(String(frame.msg_id ?? ""));
         const row = msgId ? this.store.msg(msgId) : undefined;
-        this.log(`peer_message_status ${String(frame.msg_id)} ${String(frame.status)} ${String(frame.reason ?? "")}`);
-        if (row) {
-          this.emit({
-            type: "message", msg: toStored(row), status: String(frame.status) as MsgStatus,
-            ...(frame.reason ? { reason: String(frame.reason) } : {}),
-          });
+        const status = frame.status;
+        this.log(`peer_message_status ${String(frame.msg_id)} ${String(status)} ${String(frame.reason ?? "")}`);
+        if (row && (status === "delivered" || status === "failed" || status === "rejected" ||
+          status === "expired" || status === "dropped")) {
+          const reason = typeof frame.reason === "string" ? frame.reason : undefined;
+          if (row.status !== status || row.reason !== (reason ?? null)) this.setStatus(row.id, status, reason, false);
         }
         return;
       }
@@ -851,7 +851,7 @@ export class Daemon {
     if (scope) this.emit({ type: "read", state: this.store.ensureRead(scope) });
   }
 
-  private setStatus(msgId: string, status: MsgStatus, reason?: string): void {
+  private setStatus(msgId: string, status: MsgStatus, reason?: string, notify = true): void {
     const positioned = this.store.transaction(() => {
       this.store.db.run("UPDATE messages SET status=?, reason=?, updated_at=? WHERE id=?", status, reason ?? null, this.now(), msgId);
       const row = this.store.msg(msgId);
@@ -867,7 +867,7 @@ export class Daemon {
     if (!positioned) return;
     this.publish(positioned);
     const row = this.store.msg(msgId)!;
-    if (status === "failed" || status === "expired") this.notifyFailure(row, reason ?? status);
+    if (notify && (status === "failed" || status === "expired")) this.notifyFailure(row, reason ?? status);
   }
 
   /** Tells a live agent sender that its message will never arrive. */
@@ -923,8 +923,8 @@ export class Daemon {
       }
       const r = await writeLine(target.claude_socket, claudeFrame(text, envelope));
       if (r === "ok") {
-        this.setStatus(row.id, "delivered");
-        return "delivered";
+        if (this.store.msg(row.id)?.status === "queued") this.setStatus(row.id, "delivered");
+        return this.store.msg(row.id)?.status ?? "failed";
       }
       if (r === "dead") {
         const cur = this.store.session(target.id);

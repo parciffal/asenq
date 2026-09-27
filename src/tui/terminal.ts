@@ -195,6 +195,11 @@ export class TerminalAdapter {
   #pasteText = "";
   #pasting = false;
   #suppressKeys = false;
+  #standaloneEscape = false;
+  #keysBeforePaste = 0;
+  #pendingEscape?: KeyInput;
+  #escapeTimer?: NodeJS.Timeout;
+  #candidateTimer?: NodeJS.Timeout;
   #clearSuppressionQueued = false;
 
   constructor(options: TerminalAdapterOptions = {}) {
@@ -266,6 +271,8 @@ export class TerminalAdapter {
 
   cleanup(): void {
     if (this.#state !== "running") return;
+    this.#cancelEscape();
+    clearTimeout(this.#candidateTimer);
     this.#state = "closed";
 
     process.stdin.removeListener("data", this.#onRawData);
@@ -293,8 +300,33 @@ export class TerminalAdapter {
     if (style.inverse) this.#terminal.inverse();
   }
 
+  #cancelEscape(): void {
+    clearTimeout(this.#escapeTimer);
+    this.#escapeTimer = undefined;
+    this.#pendingEscape = undefined;
+    this.#standaloneEscape = false;
+  }
+
+  #deliverEscape(): void {
+    const pending = this.#pendingEscape;
+    this.#cancelEscape();
+    this.#bracketCandidate = "";
+    if (!this.#pasting) this.#suppressKeys = false;
+    if (pending && this.#state === "running") this.#options.onKey?.(pending);
+  }
+
   readonly #onKey = (name: string, matches: string[], details: KeyDetails): void => {
-    if (this.#suppressKeys) return;
+    if (this.#suppressKeys) {
+      if (this.#keysBeforePaste && details.isCharacter) this.#keysBeforePaste--;
+      else if (!(name === "ESCAPE" && this.#standaloneEscape && !this.#pasting)) return;
+    }
+    if (name === "ESCAPE" && this.#standaloneEscape) {
+      this.#pendingEscape = {
+        name, matches, ctrl: false, alt: false, shift: false,
+      };
+      this.#escapeTimer = setTimeout(() => this.#deliverEscape(), 80);
+      return;
+    }
     if (name === "CTRL_C") {
       this.cleanup();
       this.#options.onInterrupt?.();
@@ -347,6 +379,17 @@ export class TerminalAdapter {
 
   readonly #onRawData = (chunk: Buffer | string): void => {
     const text = typeof chunk === "string" ? chunk : this.#decoder.write(chunk);
+    const pasteStart = text.indexOf(BRACKETED_PASTE_START);
+    const lastEscape = text.lastIndexOf("\u001b");
+    const candidateStart = pasteStart >= 0 ? pasteStart
+      : lastEscape >= 0 && BRACKETED_PASTE_START.startsWith(text.slice(lastEscape)) ? lastEscape : -1;
+    if (candidateStart > 0 && !this.#pasting) {
+      // Preserve typed keys coalesced with a complete or fragmented paste marker.
+      const before = text.slice(0, candidateStart)
+        .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+        .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+      for (const _ of before) this.#keysBeforePaste++;
+    }
     let pasteTraffic = this.#pasting;
 
     for (const character of text) {
@@ -376,14 +419,32 @@ export class TerminalAdapter {
           if (candidate === BRACKETED_PASTE_START) {
             pasteTraffic = true;
             this.#pasting = true;
+            this.#cancelEscape();
+            clearTimeout(this.#candidateTimer);
             this.#bracketCandidate = "";
+          } else if (candidate.length > 1) {
+            // Once ESC continues as CSI it is not a standalone key. Bound a stalled prefix.
+            this.#cancelEscape();
+            clearTimeout(this.#candidateTimer);
+            this.#candidateTimer = setTimeout(() => {
+              this.#candidateTimer = undefined;
+              this.#bracketCandidate = "";
+              this.#suppressKeys = false;
+            }, 1000);
           }
         } else {
+          clearTimeout(this.#candidateTimer);
+          this.#candidateTimer = undefined;
+          if (this.#pendingEscape) {
+            if (candidate.startsWith("\u001b[")) this.#cancelEscape();
+            else this.#deliverEscape();
+          }
           this.#bracketCandidate = character === "\u001b" ? character : "";
         }
       }
     }
 
+    this.#standaloneEscape = this.#bracketCandidate === "\u001b" && !this.#pasting;
     this.#suppressKeys = pasteTraffic || this.#pasting || this.#bracketCandidate.length > 0;
     if (this.#suppressKeys && !this.#clearSuppressionQueued) {
       this.#clearSuppressionQueued = true;

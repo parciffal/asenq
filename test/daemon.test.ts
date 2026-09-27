@@ -71,6 +71,35 @@ async function fakeClaude(path: string): Promise<FakeClaude> {
   };
 }
 
+test("client rejects an old daemon before requesting new history operations", async () => {
+  const home = mkdtempSync(join(tmpdir(), "asenq-old-protocol-"));
+  const previousHome = process.env.ASENQ_HOME;
+  process.env.ASENQ_HOME = home;
+  const server = net.createServer((sock) => {
+    sock.setEncoding("utf8");
+    let buffer = "";
+    sock.on("data", (chunk: string) => {
+      buffer += chunk;
+      const end = buffer.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(buffer.slice(0, end)) as { id: number; op: string };
+      assert.equal(request.op, "hello");
+      sock.write(JSON.stringify({ id: request.id, ok: true, protocol: 1 }) + "\n");
+    });
+  });
+  const client = new AsenqClient();
+  try {
+    await new Promise<void>((resolve) => server.listen(socketPath(), resolve));
+    await assert.rejects(client.sync(), /protocol mismatch; restart it/);
+  } finally {
+    client.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ASENQ_HOME;
+    else process.env.ASENQ_HOME = previousHome;
+  }
+});
+
 test("registration: slug names, collision suffix, takeover of a gone session keeps its queue", async () => {
   env = await startEnv();
   const human = env.human();
@@ -254,6 +283,36 @@ test("envelope: sanitized sender name, escaped body, and replies route back to t
   assert.deepEqual([d.msg.from, d.msg.text], ["orch", "answer"]);
 });
 
+test("Claude peer failure updates retained delivery state and replay; unknown peer states do not masquerade as delivery", async () => {
+  env = await startEnv({ envelope: true });
+  const fake = await fakeClaude(join(env.home, "claude.sock"));
+  const human = env.human();
+  const started = await human.request("claude_hook", {
+    event: "start", key: join(env.home, "claude.sock"), socket: join(env.home, "claude.sock"),
+    sessionId: "s1", name: "orch",
+  });
+  const sent = (await send(human, "orch", "question"))[0];
+  assert.equal(sent.status, "delivered");
+  const frame = JSON.parse(await fake.nextLine()) as { from: string; msg_id: string };
+  const before = await human.sync();
+  const conn = net.createConnection(decodeURIComponent(frame.from.slice(4)));
+  const failed = await env.watch(isStatus(sent.msgId, "failed"));
+  conn.write(JSON.stringify({ type: "control", action: "peer_message_status", msg_id: frame.msg_id, status: "failed", reason: "peer unavailable" }) + "\n");
+  await failed.event;
+  assert.equal((await logOf(human, sent.msgId!)).status, "failed");
+  const session = started.session;
+  assert.ok(session && typeof session === "object" && "id" in session && typeof session.id === "string");
+  const history = await human.historyPage({ scope: "session", sessionId: session.id });
+  assert.deepEqual([history.messages.at(-1)?.status, history.messages.at(-1)?.reason], ["failed", "peer unavailable"]);
+  const replayed = await human.replay(before.watermark);
+  assert.ok(replayed.events.some(({ event }) => event.type === "message" && event.msg.id === sent.msgId && event.msg.status === "failed"));
+  conn.write(JSON.stringify({ type: "control", action: "peer_message_status", msg_id: frame.msg_id, status: "accepted" }) + "\n");
+  conn.end();
+  await new Promise<void>((resolve) => conn.on("close", resolve));
+  assert.equal((await logOf(human, sent.msgId!)).status, "failed");
+  await fake.stop();
+});
+
 test("channels are stored and read back, never pushed", async () => {
   env = await startEnv();
   const a = await env.adapter("omp", "a", "alpha");
@@ -352,7 +411,8 @@ test("sync watermark resumes missed status events and replay reports a pruned re
   assert.equal(afterPrune.gap, true);
   assert.ok(afterPrune.eventFloor >= messageEvents.at(-1)!.position);
   const history = await resumed.historyPage({ scope: "session", sessionId: alpha.session.id });
-  assert.deepEqual(history, { messages: [], hasMore: false });
+  assert.deepEqual(history.messages, []);
+  assert.equal(history.hasMore, false);
 });
 
 test("shared read state keeps reminders against stale windows and excludes human channel posts", async () => {

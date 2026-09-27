@@ -152,6 +152,8 @@ export class Store {
   }
 
   private backfillIdentities(): void {
+    // Historical endpoint reconstruction is a rollout migration, not a scan on every daemon start.
+    if (this.meta("identity_backfill") !== undefined) return;
     this.db.run(
       `INSERT OR IGNORE INTO session_identities(id,harness,name,previous_names,cwd,inbound,state,created_at)
        SELECT id,harness,name,'[]',cwd,inbound,state,created_at FROM sessions`,
@@ -206,6 +208,7 @@ export class Store {
         );
       }
     }
+    this.setMeta("identity_backfill", 1);
   }
 
   private initializeReadPositions(): void {
