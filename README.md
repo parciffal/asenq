@@ -87,8 +87,8 @@ Four tabs — **Sessions**, **Inbox**, **Channels** and **Activity** — share o
 | `↑` / `↓`, `Enter` | In a list: move and open. In a conversation: select messages (long ones scroll row by row) and show a message's full details inline |
 | `/` | Search sessions by current or former name, archive included |
 | `PageUp` / `PageDown`, `Home`, `End` | Scroll; scrolling to the top loads older history; `End` jumps to the latest message |
-| `c` | Write in the inline composer: `Enter` inserts a newline, `Ctrl+D` sends, `Esc` leaves (the draft is kept) |
-| `Ctrl+E` | Full editor with kind, thread, reply-to and done fields |
+| `c` | Write in the inline composer: `Enter` sends, `Shift+Enter` inserts a newline (`Alt+Enter` or `Ctrl+J` where the terminal can't report Shift+Enter), `Esc` leaves (the draft is kept). `Ctrl+D` also sends |
+| `Ctrl+E` | Full editor with kind, thread, reply-to and done fields; `Enter` in the text field submits, `Shift+Enter` adds a newline |
 | `u` | Mark the latest eligible item unread again |
 | `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity |
 | `?` | Searchable action palette, including help |
@@ -98,7 +98,7 @@ The palette also lists broadcasts, channel posts, held-message release/drop, ren
 
 Colors mark roles and states and leave your terminal background alone. With `NO_COLOR`, `TERM=dumb` or a terminal that reports no color, only bold/inverse and the literal state words remain. States are always written out in words, so color is never the only signal. Normal updates redraw only the rows that changed.
 
-Unread is **not delivery**. Counts cover messages to `human` grouped by their sending session identity, plus non-human channel posts. Agent-to-agent traffic appears in conversations but never counts toward your unread. Reading positions and one-item unread reminders are shared between TUI windows and survive restart; ordinary `asenq inbox` and `asenq channel read` do not change them. Previously retained messages start read on upgrade. Opening, selecting or receiving messages never marks them read. A conversation is marked read only when you scroll or press `End` and the last row of its newest incoming message comes into view. If reconnect crosses pruned history, the TUI signals the gap and reloads retained state rather than claiming complete replay.
+Unread is **not delivery**. Counts cover messages to `human` grouped by their sending session identity, plus non-human channel posts. Agent-to-agent traffic appears in conversations but never counts toward your unread. Reading positions and one-item unread reminders are shared between TUI windows and survive restart; ordinary `asenq inbox` and `asenq channel read` do not change them. Previously retained messages start read on upgrade. An open conversation — focus in the conversation or its composer — is marked read as soon as the last row of its newest incoming message is on screen, including messages that arrive while you are at the bottom. Moving through the list, or reading while scrolled up above new messages, leaves them unread. After `u`, the reminder stays until you scroll, press `End` or reopen the conversation. If reconnect crosses pruned history, the TUI signals the gap and reloads retained state rather than claiming complete replay.
 
 The TUI needs an input/output TTY on macOS or Linux under Node ≥ 22.13 or Bun. Keyboard navigation works without mouse reporting; clicks and wheel scrolling work in terminals that report them. For scripts or terminals without a usable TTY, use the unchanged CLI commands above. Terminal text is sanitized before display, and the TUI restores the normal screen after ordinary exit, Ctrl-C or an uncaught exception; SIGKILL cannot run cleanup.
 

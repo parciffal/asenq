@@ -55,8 +55,8 @@ const HELP = [
   "",
   "Tabs: s Sessions · i Inbox · # Channels · a Activity. Tab / Shift+Tab move focus between tabs, list, conversation and composer.",
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
-  "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest and marks it read · u marks the latest item unread.",
-  "Composer: c to write · Enter newline · Ctrl+D send · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
+  "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
+  "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
   "? opens this action palette; type to filter. Esc dismisses errors, closes panels and returns to Sessions. q quits.",
   "CLI commands remain available in another terminal.",
@@ -102,6 +102,8 @@ type Shown = { key: string; layout: TranscriptLayout; top: number; height: numbe
 type ComposeTarget = { kind: "session"; id: string; name: string } | { kind: "channel"; name: string };
 type Pane = { rows: TerminalLine[]; cursor?: TerminalCursor };
 
+/** Shift+Enter where the terminal reports it; Alt+Enter and Ctrl+J (iTerm's Shift+Enter) elsewhere. */
+const NEWLINE_KEYS: Record<string, true> = { SHIFT_ENTER: true, ALT_ENTER: true, CTRL_J: true };
 const stringify = (e: unknown): string => e instanceof Error ? e.message : String(e);
 const keyOf = (scope: HistoryScope): string =>
   scope.scope === "session" ? `s:${scope.sessionId}` : scope.scope === "channel" ? `c:${scope.channel}` : "inbox";
@@ -150,6 +152,9 @@ export class ConsoleApp {
   private resync = false;
   private closed = false;
   private tasks = new Set<Promise<unknown>>();
+  /** Stream whose `u` reminder must survive until the user scrolls, presses End or reopens it. */
+  private readHold?: string;
+  private reading = false;
   private resolve?: (code: number) => void;
 
   constructor(deps: ConsoleDeps = {}) {
@@ -582,6 +587,7 @@ export class ConsoleApp {
       return;
     }
     if (this.tab === "activity") return this.openActivity();
+    this.readHold = undefined;
     this.focus = "transcript";
     await this.opened();
   }
@@ -631,6 +637,11 @@ export class ConsoleApp {
     lines.push(...body.rows);
     if (bottom) lines.push(this.footer(width));
     this.screen.render({ lines, ...(body.cursor ? { cursor: body.cursor } : {}) });
+    const shown = this.shown as Shown | undefined; // assigned while laying out the body
+    const engaged = this.focus === "transcript" || this.focus === "composer";
+    if (shown && engaged && this.readStates.get(shown.key)?.unread && !this.reading && this.readHold !== shown.key) {
+      this.track(this.readIfReached());
+    }
   }
 
   private tabBar(width: number): TerminalLine {
@@ -672,9 +683,9 @@ export class ConsoleApp {
 
   private footer(width: number): TerminalLine {
     const hints = this.palette ? "type to filter · ↑↓ · Enter run · Esc close"
-      : this.form ? "Tab field · Ctrl+D submit · Esc cancel"
+      : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel"
       : this.searching ? "type name · ↑↓ · Enter keep · Esc clear"
-      : this.focus === "composer" ? "Ctrl+D send · Enter newline · Ctrl+E editor · Esc done"
+      : this.focus === "composer" ? "Enter send · Shift+Enter newline · Ctrl+E editor · Esc done"
       : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · ? menu"
       : this.focus === "tabs" ? "←→ switch · Enter open · ? menu"
       : "↑↓ move · Enter open · Tab focus · ? menu";
@@ -866,7 +877,7 @@ export class ConsoleApp {
     }
     const focused = this.focus === "composer";
     const label = target.kind === "session" ? `to ${target.name}` : `#${target.name}`;
-    const hint = focused ? "Ctrl+D send" : "c write";
+    const hint = focused ? "Enter send" : "c write";
     const rows: TerminalLine[] = [];
     const layout = editorLayout(text, this.cursor, Math.max(1, width - 2));
     const count = Math.min(maxRows, Math.max(1, layout.rows.length));
@@ -942,7 +953,7 @@ export class ConsoleApp {
   private formPane(width: number, height: number, y0: number): Pane {
     const form = this.form!;
     const rows: { line: TerminalLine; field?: number }[] = [];
-    rows.push({ line: justify([{ text: form.title, style: theme.accentBold }], [{ text: "Tab next field · Ctrl+D submit · Esc cancel", style: theme.dim }], width) });
+    rows.push({ line: justify([{ text: form.title, style: theme.accentBold }], [{ text: "Tab next field · Enter submit · Esc cancel", style: theme.dim }], width) });
     for (const text of form.description ?? []) {
       for (const line of wrapTerminalText(text, width)) rows.push({ line: [{ text: line, style: theme.dim }] });
     }
@@ -986,6 +997,7 @@ export class ConsoleApp {
     const next = Math.max(0, Math.min(maxTop(shown.layout, shown.height), shown.top + delta));
     current.stream.viewport = viewportAt(shown.layout, next, shown.height);
     if (next === 0 && current.stream.hasMore) this.track(this.load(current.scope, true));
+    if (next !== shown.top) this.readHold = undefined;
     return next !== shown.top;
   }
 
@@ -1026,20 +1038,28 @@ export class ConsoleApp {
   }
 
   /**
-   * Marks the stream read only after a user action has brought the last row of its latest
-   * eligible incoming message on screen. Selection, loading and pushes never call this.
+   * Marks the open conversation read once the last row of its newest incoming message is on
+   * screen while the user is in it (conversation or composer focus). Moving through the list
+   * never marks anything read, and a fresh `u` reminder holds until the user scrolls, presses
+   * End or reopens the conversation.
    */
   private async readIfReached(): Promise<void> {
     const scope = this.readScope();
     const shown = this.shown;
-    if (!scope || !shown || shown.key !== keyOf(scope)) return;
+    if (!scope || !shown || shown.key !== keyOf(scope) || this.reading || this.readHold === shown.key) return;
+    if (this.focus !== "transcript" && this.focus !== "composer") return;
     const state = this.readStates.get(shown.key);
     const stream = this.streams.get(shown.key);
     if (!state?.unread || !stream) return;
     const latest = stream.messages.findLast((m) => this.eligible(scope, m));
     const range = latest && shown.layout.ranges.get(latest.id);
     if (!latest || !range || range.bodyEnd > shown.top + shown.height - 1) return;
-    await this.markRead(scope, latest.order, state);
+    this.reading = true;
+    try {
+      await this.markRead(scope, latest.order, state);
+    } finally {
+      this.reading = false;
+    }
   }
 
   private async markRead(scope: ReadScope, through: number, state: ReadState): Promise<void> {
@@ -1078,6 +1098,7 @@ export class ConsoleApp {
     const state = this.readStates.get(keyOf(scope));
     if (!state) return;
     const result = await this.client.markUnread(scope, state.version);
+    this.readHold = keyOf(scope);
     this.readStates.set(keyOf(scope), result.state);
     if (!result.applied) this.say("Marker changed in another window; repeat to confirm.");
     this.render();
@@ -1149,9 +1170,8 @@ export class ConsoleApp {
         break;
       case "TAB": this.cycleFocus(1); break;
       case "SHIFT_TAB": this.cycleFocus(-1); break;
-      case "CTRL_D": await this.sendComposer(target); break;
+      case "ENTER": case "KP_ENTER": case "CTRL_D": await this.sendComposer(target); break;
       case "CTRL_E": this.openEditor(); break;
-      case "ENTER": case "KP_ENTER": this.composerInsert("\n"); break;
       case "BACKSPACE": {
         const start = stepGrapheme(draft, this.cursor, -1);
         set(draft.slice(0, start) + draft.slice(this.cursor), start);
@@ -1172,7 +1192,8 @@ export class ConsoleApp {
       }
       case "CTRL_U": set("", 0); break;
       default:
-        if (k.text && !k.ctrl) this.composerInsert(cleanInput(k.text));
+        if (NEWLINE_KEYS[k.name]) this.composerInsert("\n");
+        else if (k.text && !k.ctrl) this.composerInsert(cleanInput(k.text));
     }
     this.render();
   }
@@ -1267,20 +1288,18 @@ export class ConsoleApp {
     }
     // transcript
     const shownHeight = this.shown?.height ?? 1;
-    let moved = false;
-    let explicit = false;
-    if (name === "UP") moved = this.stepMessage(-1);
-    else if (name === "DOWN") moved = this.stepMessage(1);
-    else if (name === "PAGE_UP") moved = this.scrollTranscript(-Math.max(1, shownHeight - 1));
-    else if (name === "PAGE_DOWN") moved = this.scrollTranscript(Math.max(1, shownHeight - 1));
-    else if (name === "HOME") moved = this.scrollTranscript(-Infinity);
+    if (name === "UP") this.stepMessage(-1);
+    else if (name === "DOWN") this.stepMessage(1);
+    else if (name === "PAGE_UP") this.scrollTranscript(-Math.max(1, shownHeight - 1));
+    else if (name === "PAGE_DOWN") this.scrollTranscript(Math.max(1, shownHeight - 1));
+    else if (name === "HOME") this.scrollTranscript(-Infinity);
     else if (name === "END") {
       const current = this.currentStream();
       if (current) {
         current.stream.viewport = { follow: true };
         current.stream.selectedId = undefined;
       }
-      explicit = true;
+      this.readHold = undefined;
     } else if (name === "ENTER") {
       const current = this.currentStream();
       const id = current?.stream.selectedId;
@@ -1290,7 +1309,6 @@ export class ConsoleApp {
       }
     } else if (name === "LEFT") this.focus = "list";
     this.render();
-    if (moved || explicit) await this.readIfReached();
   }
 
   private async escape(): Promise<void> {
@@ -1367,7 +1385,8 @@ export class ConsoleApp {
     if (name === "ESCAPE") this.form = undefined;
     else if (name === "TAB" || (name === "ENTER" && !field.multiline)) form.focus = (form.focus + 1) % form.fields.length;
     else if (name === "SHIFT_TAB") form.focus = (form.focus - 1 + form.fields.length) % form.fields.length;
-    else if (name === "CTRL_D") {
+    else if (NEWLINE_KEYS[name] && field.multiline) this.formInsert("\n");
+    else if (name === "CTRL_D" || name === "ENTER" || name === "KP_ENTER") {
       try {
         await form.submit(form.fields.map((x) => x.value));
         if (this.form === form) this.form = undefined;
@@ -1378,8 +1397,7 @@ export class ConsoleApp {
       field.value = name === "CTRL_U" ? "" : field.value.slice(0, stepGrapheme(field.value, field.value.length, -1));
       if (form.focus === 0 && form.binding) form.binding.edited = true;
       this.syncFormDraft(form);
-    } else if (name === "ENTER" && field.multiline) this.formInsert("\n");
-    else if (k.text && !k.ctrl) this.formInsert(cleanInput(k.text));
+    } else if (k.text && !k.ctrl) this.formInsert(cleanInput(k.text));
     this.render();
   }
 
@@ -1392,10 +1410,8 @@ export class ConsoleApp {
       else if (hit && (hit.target.kind === "entry" || hit.target.kind === "list")) return this.moveSelection(delta);
       else if (this.panel) this.panel.top = Math.max(0, Math.min(this.panel.rows - this.panel.height, this.panel.top + delta));
       else if (hit && (hit.target.kind === "message" || hit.target.kind === "transcript")) {
-        const moved = this.scrollTranscript(delta);
-        this.render();
-        if (moved && delta > 0) await this.readIfReached();
-        return;
+        this.focus = "transcript";
+        this.scrollTranscript(delta);
       }
       return this.render();
     }
