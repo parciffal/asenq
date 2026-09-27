@@ -75,6 +75,29 @@ asenq channels · asenq channel read <ch> · asenq channel send <ch> <text…>
 asenq daemon start|stop|status
 ```
 
+### Interactive human console
+
+Run `asenq tui` in a terminal for a full-screen view of live and archived session conversations. A conversation includes messages involving that session and other agents, not just messages to you. Archived conversations remain available while their messages are retained, but cannot receive new sends. The sidebar uses stable session identities: renaming preserves a conversation; reusing a removed name starts another one.
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Select a session |
+| `Enter` or `c` | Compose to the selected session (or edit the target to `human`) |
+| `Tab`, `Ctrl+D`, `Ctrl+U` | Next field, submit form, clear field |
+| `Enter` in a multiline field | Insert a newline |
+| `PageUp` / `PageDown`, `End` | Older/newer history; `End` marks a selected session or channel read when its newest eligible item is reached |
+| `u` | Mark the latest eligible item unread again |
+| `i`, `a`, `#`, `?` | Human inbox, activity, channels, full action menu |
+| `Esc`, `q` | Cancel/back, quit |
+
+The action menu also exposes advanced send fields, broadcasts, channel posts, held-message release/drop, rename, inbound policy, log lookup, setup, doctor and daemon controls. Broadcast displays its live target count and requires a matching confirmation. Drop, setup removal and daemon stop require confirmation; removal and stop exit the TUI. Draft text stays in the composer after a failed or uncertain send; check the log before retrying a timed-out send.
+
+Unread is **not delivery**. Counts cover messages to `human` grouped by their sending session identity, plus non-human channel posts. Agent-to-agent traffic appears in conversations but never counts toward your unread. Reading positions and one-item unread reminders are shared between TUI windows and survive restart; ordinary `asenq inbox` and `asenq channel read` do not change them. Previously retained messages start read on upgrade. A view does not mark new messages read merely by fetching or selecting them. If reconnect crosses pruned history, the TUI signals the gap and reloads retained state rather than claiming complete replay.
+
+The TUI needs an input/output TTY on macOS or Linux under Node ≥ 22.13 or Bun. Keyboard navigation works without mouse reporting; clicks and wheel scrolling work in terminals that report them. For scripts or terminals without a usable TTY, use the unchanged CLI commands above. Terminal text is sanitized before display, and the TUI restores the normal screen after ordinary exit, Ctrl-C or an uncaught exception; SIGKILL cannot run cleanup.
+
+When upgrading from v0.0.1, stop an already-running daemon with `asenq daemon stop` before using the new console. The protocol revision rejects a stale daemon and asks for a restart; stopping the daemon does not require a protocol connection. It restarts automatically on the next normal command.
+
 ## How delivery works
 
 A per-user daemon listens on `~/.asenq/asenq.sock`, a Unix socket with mode 0600, and stores sessions and messages in SQLite. Any asenq command or adapter starts the daemon if it isn't running.

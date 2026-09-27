@@ -103,8 +103,13 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           const e: TailEvent = p.event;
           if (e.type === "session") {
             out(`${hhmmss(Date.now())} session ${e.name} (${e.harness}) ${e.action}${e.oldName ? ` from ${e.oldName}` : ""}`);
-          } else {
+          } else if (e.type === "message") {
             out(msgLine({ ...e.msg, status: e.status, reason: e.reason }));
+          } else if (e.type === "retention") {
+            out(`${hhmmss(Date.now())} retention pruned older history`);
+          } else {
+            const stream = e.state.scope.scope === "session" ? e.state.scope.sessionId : `#${e.state.scope.channel}`;
+            out(`${hhmmss(Date.now())} read ${stream}: ${e.state.unread} unread`);
           }
         },
         onReconnect: async () => void (await tailClient.request("tail")),

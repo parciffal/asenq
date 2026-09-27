@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { claudeFrame, parseEnvelopeReply, replyAddr } from "../src/daemon/claude.js";
-import type { AsenqClient } from "../src/shared/client.js";
-import { GRACE_MS, type SendResult } from "../src/shared/protocol.js";
+import { Daemon } from "../src/daemon/daemon.js";
+import { AsenqClient } from "../src/shared/client.js";
+import { socketPath } from "../src/shared/paths.js";
+import { GRACE_MS, type SendResult, type StoredMessage } from "../src/shared/protocol.js";
 import { renderInbound } from "../src/shared/render.js";
+import { openDb } from "../src/shared/sqlite.js";
 import { isSession, isStatus, logOf, startEnv, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
@@ -66,6 +70,35 @@ async function fakeClaude(path: string): Promise<FakeClaude> {
     },
   };
 }
+
+test("client rejects an old daemon before requesting new history operations", async () => {
+  const home = mkdtempSync(join(tmpdir(), "asenq-old-protocol-"));
+  const previousHome = process.env.ASENQ_HOME;
+  process.env.ASENQ_HOME = home;
+  const server = net.createServer((sock) => {
+    sock.setEncoding("utf8");
+    let buffer = "";
+    sock.on("data", (chunk: string) => {
+      buffer += chunk;
+      const end = buffer.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(buffer.slice(0, end)) as { id: number; op: string };
+      assert.equal(request.op, "hello");
+      sock.write(JSON.stringify({ id: request.id, ok: true, protocol: 1 }) + "\n");
+    });
+  });
+  const client = new AsenqClient();
+  try {
+    await new Promise<void>((resolve) => server.listen(socketPath(), resolve));
+    await assert.rejects(client.sync(), /protocol mismatch; restart it/);
+  } finally {
+    client.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ASENQ_HOME;
+    else process.env.ASENQ_HOME = previousHome;
+  }
+});
 
 test("registration: slug names, collision suffix, takeover of a gone session keeps its queue", async () => {
   env = await startEnv();
@@ -250,6 +283,36 @@ test("envelope: sanitized sender name, escaped body, and replies route back to t
   assert.deepEqual([d.msg.from, d.msg.text], ["orch", "answer"]);
 });
 
+test("Claude peer failure updates retained delivery state and replay; unknown peer states do not masquerade as delivery", async () => {
+  env = await startEnv({ envelope: true });
+  const fake = await fakeClaude(join(env.home, "claude.sock"));
+  const human = env.human();
+  const started = await human.request("claude_hook", {
+    event: "start", key: join(env.home, "claude.sock"), socket: join(env.home, "claude.sock"),
+    sessionId: "s1", name: "orch",
+  });
+  const sent = (await send(human, "orch", "question"))[0];
+  assert.equal(sent.status, "delivered");
+  const frame = JSON.parse(await fake.nextLine()) as { from: string; msg_id: string };
+  const before = await human.sync();
+  const conn = net.createConnection(decodeURIComponent(frame.from.slice(4)));
+  const failed = await env.watch(isStatus(sent.msgId, "failed"));
+  conn.write(JSON.stringify({ type: "control", action: "peer_message_status", msg_id: frame.msg_id, status: "failed", reason: "peer unavailable" }) + "\n");
+  await failed.event;
+  assert.equal((await logOf(human, sent.msgId!)).status, "failed");
+  const session = started.session;
+  assert.ok(session && typeof session === "object" && "id" in session && typeof session.id === "string");
+  const history = await human.historyPage({ scope: "session", sessionId: session.id });
+  assert.deepEqual([history.messages.at(-1)?.status, history.messages.at(-1)?.reason], ["failed", "peer unavailable"]);
+  const replayed = await human.replay(before.watermark);
+  assert.ok(replayed.events.some(({ event }) => event.type === "message" && event.msg.id === sent.msgId && event.msg.status === "failed"));
+  conn.write(JSON.stringify({ type: "control", action: "peer_message_status", msg_id: frame.msg_id, status: "accepted" }) + "\n");
+  conn.end();
+  await new Promise<void>((resolve) => conn.on("close", resolve));
+  assert.equal((await logOf(human, sent.msgId!)).status, "failed");
+  await fake.stop();
+});
+
 test("channels are stored and read back, never pushed", async () => {
   env = await startEnv();
   const a = await env.adapter("omp", "a", "alpha");
@@ -260,4 +323,212 @@ test("channels are stored and read back, never pushed", async () => {
   assert.deepEqual(read.map((m) => [m.from, m.text]), [["human", "two"]]);
   assert.equal(a.deliveries.length, 0);
   await assert.rejects(human.request("channel_send", { channel: "Bad Name", text: "x" }), /invalid channel name/);
+});
+
+test("history pages use durable order across equal timestamps and concurrent arrivals", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  await human.sync();
+
+  const ids: string[] = [];
+  for (let index = 1; index <= 5; index++) {
+    ids.push((await human.sendToSession(alpha.session.id, `message ${index}`)).msgId!);
+  }
+
+  const newest = await human.historyPage({ scope: "session", sessionId: alpha.session.id, limit: 2 });
+  assert.equal(newest.hasMore, true);
+  assert.deepEqual(newest.messages.map((message) => message.id), ids.slice(3));
+  assert.ok(newest.messages[0].order < newest.messages[1].order);
+  assert.deepEqual(newest.messages.map((message) => message.status), ["delivered", "delivered"]);
+
+  const concurrent = (await human.sendToSession(alpha.session.id, "arrived after page one")).msgId!;
+  const middle = await human.historyPage({
+    scope: "session",
+    sessionId: alpha.session.id,
+    before: newest.messages[0].order,
+    limit: 2,
+  });
+  const oldest = await human.historyPage({
+    scope: "session",
+    sessionId: alpha.session.id,
+    before: middle.messages[0].order,
+    limit: 2,
+  });
+  assert.deepEqual([...oldest.messages, ...middle.messages, ...newest.messages].map((message) => message.id), ids);
+  assert.equal(oldest.hasMore, false);
+  assert.ok(![...oldest.messages, ...middle.messages].some((message) => message.id === concurrent));
+});
+
+test("renames preserve identity, removed history is archived, and same-name reuse stays distinct", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = await env.adapter("omp", "original-key", "alpha");
+  const originalMessage = await human.sendToSession(original.session.id, "before rename");
+  await human.request("rename", { from: "alpha", name: "beta" });
+  await original.client.request("unregister");
+
+  const replacement = await env.adapter("omp", "replacement-key", "beta");
+  assert.notEqual(replacement.session.id, original.session.id);
+  const snapshot = await human.sync();
+  const archived = snapshot.sessions.find((session) => session.id === original.session.id)!;
+  const live = snapshot.sessions.find((session) => session.id === replacement.session.id)!;
+  assert.deepEqual(
+    [archived.name, archived.previousNames, archived.state, live.name, live.state],
+    ["beta", ["alpha"], "removed", "beta", "live"],
+  );
+
+  const oldHistory = await human.historyPage({ scope: "session", sessionId: original.session.id });
+  const newHistory = await human.historyPage({ scope: "session", sessionId: replacement.session.id });
+  assert.deepEqual(oldHistory.messages.map((message) => message.id), [originalMessage.msgId]);
+  assert.deepEqual(newHistory.messages, []);
+  await assert.rejects(human.sendToSession(original.session.id, "must not retarget"), /removed or unknown/);
+  assert.equal((await human.sendToSession(replacement.session.id, "new identity")).status, "delivered");
+});
+
+test("sync watermark resumes missed status events and replay reports a pruned retention gap", async () => {
+  env = await startEnv({ historyDays: 7 });
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const synced = await human.sync();
+  human.close();
+
+  const sender = env.human();
+  const sent = await sender.sendToSession(alpha.session.id, "while disconnected");
+  const resumed = env.human();
+  const replay = await resumed.replay(synced.watermark);
+  const messageEvents = replay.events.filter(
+    (entry) => entry.event.type === "message" && entry.event.msg.id === sent.msgId,
+  );
+  assert.equal(replay.gap, false);
+  assert.deepEqual(messageEvents.map((entry) => entry.event.type === "message" && entry.event.status), ["queued", "delivered"]);
+  assert.ok(messageEvents.every((entry, index) => index === 0 || messageEvents[index - 1].position < entry.position));
+
+  env.clock.advance(8 * 86_400_000);
+  env.daemon.prune();
+  const afterPrune = await resumed.replay(0);
+  assert.ok(afterPrune.events.some((entry) => entry.event.type === "retention"));
+  assert.equal(afterPrune.gap, true);
+  assert.ok(afterPrune.eventFloor >= messageEvents.at(-1)!.position);
+  const history = await resumed.historyPage({ scope: "session", sessionId: alpha.session.id });
+  assert.deepEqual(history.messages, []);
+  assert.equal(history.hasMore, false);
+});
+
+test("shared read state keeps reminders against stale windows and excludes human channel posts", async () => {
+  env = await startEnv();
+  const first = env.human();
+  const second = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  await first.sync();
+  await second.sync();
+  const scope = { scope: "session" as const, sessionId: alpha.session.id };
+
+  const incoming = (await send(alpha.client, "human", "for the user"))[0];
+  const page = await first.historyPage({ scope: "inbox" });
+  const order = page.messages.find((message) => message.id === incoming.msgId)!.order;
+  const stale = await second.readState(scope);
+  assert.equal(stale.unread, 1);
+
+  const readChanged = await env.watch((event) => event.type === "read" && event.state.scope.scope === "session");
+  const reminder = await first.markUnread(scope, stale.version);
+  assert.equal(reminder.state.reminder, order);
+  assert.equal((await readChanged.event).type, "read");
+  const staleAdvance = await second.markRead(scope, order, stale.version);
+  assert.equal(staleAdvance.applied, false);
+  assert.equal(staleAdvance.state.reminder, order);
+  await assert.rejects(alpha.client.markUnread(scope), /only the user/);
+
+  const current = await second.readState(scope);
+  const cleared = await second.markRead(scope, order, current.version);
+  assert.deepEqual(
+    [cleared.applied, cleared.state.position, cleared.state.reminder, cleared.state.unread],
+    [true, order, null, 0],
+  );
+
+  await alpha.client.request("channel_send", { channel: "general", text: "first unread" });
+  assert.equal((await first.readState({ scope: "channel", channel: "general" })).unread, 1);
+  await first.request("channel_send", { channel: "general", text: "human post" });
+  assert.equal((await first.readState({ scope: "channel", channel: "general" })).unread, 1);
+  await alpha.client.request("channel_send", { channel: "general", text: "second unread" });
+  const channel = await first.readState({ scope: "channel", channel: "general" });
+  assert.equal(channel.unread, 2);
+});
+
+test("schema rollout orders old equal-time rows by rowid and initializes retained history read", async () => {
+  const home = mkdtempSync(join(tmpdir(), "asenq-migrate-"));
+  const previousHome = process.env.ASENQ_HOME;
+  process.env.ASENQ_HOME = home;
+  const db = await openDb(join(home, "asenq.db"));
+  db.exec(`
+    CREATE TABLE sessions(
+      id TEXT PRIMARY KEY, harness TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL UNIQUE,
+      cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
+      gone_at INTEGER, claude_socket TEXT, claude_session_ids TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL, UNIQUE(harness,key));
+    CREATE TABLE messages(
+      id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
+      channel TEXT, text TEXT NOT NULL, kind TEXT, thread TEXT, reply_to TEXT,
+      done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+  `);
+  db.run(
+    `INSERT INTO sessions(id,harness,key,name,cwd,inbound,state,created_at)
+     VALUES('s_old','omp','old-key','old-session','/old','accept','live',1)`,
+  );
+  for (const [id, text, fromName] of [
+    ["m_old_1", "first", "prior-session"],
+    ["m_old_2", "second", "old-session"],
+  ]) {
+    db.run(
+      `INSERT INTO messages(
+        id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,
+        done,status,reason,attempts,created_at,updated_at)
+       VALUES(?,?,'s_old','human',NULL,NULL,?,NULL,NULL,NULL,0,'posted',NULL,0,10,10)`,
+      id, fromName, text,
+    );
+  }
+  db.run(
+    `INSERT INTO messages(
+      id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,
+      done,status,reason,attempts,created_at,updated_at)
+     VALUES('m_orphan','human',NULL,'removed-session','s_removed',NULL,'archived',NULL,NULL,NULL,0,'delivered',NULL,0,11,12)`,
+  );
+
+  const daemon = new Daemon({
+    socket: socketPath(),
+    db,
+    replyDir: join(home, "replies"),
+    now: () => 20,
+    timers: false,
+    log: () => {},
+  });
+  const client = new AsenqClient();
+  try {
+    await daemon.listen();
+    const page = await client.historyPage({ scope: "inbox" });
+    assert.deepEqual(page.messages.map((message: StoredMessage) => [message.id, message.order]), [
+      ["m_old_1", 1],
+      ["m_old_2", 2],
+    ]);
+    const state = await client.readState({ scope: "session", sessionId: "s_old" });
+    assert.deepEqual([state.position, state.unread], [2, 0]);
+    const snapshot = await client.sync();
+    const active = snapshot.sessions.find((session) => session.id === "s_old");
+    assert.deepEqual(active?.previousNames, ["prior-session"]);
+    const recovered = snapshot.sessions.find((session) => session.id === "s_removed");
+    assert.deepEqual(
+      recovered && [recovered.name, recovered.harness, recovered.state, recovered.removedAt],
+      ["removed-session", "unknown", "removed", 12],
+    );
+    const archived = await client.historyPage({ scope: "session", sessionId: "s_removed" });
+    assert.deepEqual(archived.messages.map((message) => message.id), ["m_orphan"]);
+  } finally {
+    client.close();
+    await daemon.close();
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ASENQ_HOME;
+    else process.env.ASENQ_HOME = previousHome;
+  }
 });

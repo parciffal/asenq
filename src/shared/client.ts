@@ -4,7 +4,11 @@ import net from "node:net";
 import { basename } from "node:path";
 import { readConfig } from "./config.js";
 import { logPath, socketPath } from "./paths.js";
-import { AsenqError, PROTOCOL, type ErrCode, type Push } from "./protocol.js";
+import {
+  AsenqError, PROTOCOL,
+  type ErrCode, type HistoryPage, type HistoryPageRequest, type Push, type ReadMutationResult,
+  type ReadScope, type ReadState, type ReplayResult, type SendOptions, type SendResult, type SyncResult,
+} from "./protocol.js";
 
 export type ClientOpts = {
   onPush?(p: Push): void;
@@ -189,6 +193,47 @@ export class AsenqClient {
   async request(op: string, params: Record<string, unknown> = {}): Promise<Reply> {
     if (!this.inHook) await this.connect();
     return this.raw(op, params);
+  }
+
+  /** Atomically subscribes this connection and returns the matching human-view snapshot. */
+  async sync(): Promise<SyncResult> {
+    return await this.request("sync") as SyncResult;
+  }
+
+  /** Returns retained events strictly after `position`. */
+  async replay(position: number, limit?: number): Promise<ReplayResult> {
+    return await this.request("replay", { position, ...(limit === undefined ? {} : { limit }) }) as ReplayResult;
+  }
+
+  /** Returns a chronological retained-history page; `before` is an exclusive durable message order. */
+  async historyPage(params: HistoryPageRequest): Promise<HistoryPage> {
+    return await this.request("history_page", params) as HistoryPage;
+  }
+
+  async readState(): Promise<ReadState[]>;
+  async readState(scope: ReadScope): Promise<ReadState>;
+  async readState(scope?: ReadScope): Promise<ReadState | ReadState[]> {
+    const reply = await this.request("read_state", scope ?? {});
+    return scope ? reply.state as ReadState : reply.states as ReadState[];
+  }
+
+  /** Advances ordinary read position only if the caller's view of the marker is current. */
+  async markRead(scope: ReadScope, through: number, expectedVersion: number): Promise<ReadMutationResult> {
+    return await this.request("mark_read", { ...scope, through, expectedVersion }) as ReadMutationResult;
+  }
+
+  /** Creates a one-item reminder; omitting the version deliberately applies to the latest state. */
+  async markUnread(scope: ReadScope, expectedVersion?: number): Promise<ReadMutationResult> {
+    return await this.request("mark_unread", {
+      ...scope,
+      ...(expectedVersion === undefined ? {} : { expectedVersion }),
+    }) as ReadMutationResult;
+  }
+
+  /** Sends as the human to one stable live/gone session identity, immune to name reuse races. */
+  async sendToSession(sessionId: string, text: string, options: SendOptions = {}): Promise<SendResult> {
+    const reply = await this.request("send", { toSessionId: sessionId, text, ...options });
+    return (reply.results as SendResult[])[0];
   }
 
   close(): void {

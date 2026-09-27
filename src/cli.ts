@@ -20,6 +20,7 @@ const USAGE = `usage: asenq <command>
   channels | channel read <ch> [--limit n] | channel send <ch> <text…>
   daemon run|start|stop|status
   setup [--remove]
+  tui                                  interactive human messaging console
   doctor`;
 
 async function main(argv: string[]): Promise<number> {
@@ -49,6 +50,11 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === "doctor") {
     const { doctor } = await import("./doctor.js");
     return doctor();
+  }
+  if (cmd === "tui") {
+    // Lazy by design: hook and MCP invocations must not initialize terminal input or renderer dependencies.
+    const { runTui } = await import("./tui/app.js");
+    return runTui();
   }
   const { runCommand } = await import("./cli/commands.js");
   return runCommand(cmd, argv.slice(1), USAGE);

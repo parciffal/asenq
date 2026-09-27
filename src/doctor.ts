@@ -6,6 +6,7 @@ import { claudeHookInstalled, CLAUDE_EVENTS, claudeDir, hookCommand, ompAgentDir
 import { isObj, readJson } from "./setup/jsonfile.js";
 import { AsenqClient } from "./shared/client.js";
 import { readConfig } from "./shared/config.js";
+import { PROTOCOL } from "./shared/protocol.js";
 
 type Level = "ok" | "warn" | "fail";
 
@@ -54,7 +55,7 @@ export async function doctor(): Promise<number> {
   if (cfg) {
     const client = new AsenqClient({ autoStart: true });
     try {
-      const hello = await client.request("hello", { protocol: 1 });
+      const hello = await client.request("hello", { protocol: PROTOCOL });
       line("ok", `daemon running (asenq ${String(hello.version)})`);
       sessions = (await client.request("list")).sessions as typeof sessions;
     } catch (e) {

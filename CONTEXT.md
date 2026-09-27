@@ -15,6 +15,10 @@ _Avoid_: Agent, worker
 The unique address by which other participants reach a session. A temporarily disconnected session can retain its name while awaiting reconnection.
 _Avoid_: Harness name
 
+**Session identity**:
+The durable identity of a session across name changes and temporary disconnections. A later session reusing its name has a different identity.
+_Avoid_: Session name
+
 **Human**:
 The person who sends direct messages and receives replies at a reserved address, rather than as a registered session.
 _Avoid_: Human session
@@ -40,6 +44,22 @@ _Avoid_: Direct message
 **Inbox**:
 A participant's view of recent direct messages addressed to it, distinct from channel history.
 _Avoid_: Channel
+
+**Session conversation**:
+The chronological direct-message history involving one session identity, including its exchanges with the human and with other sessions. It is not a thread.
+_Avoid_: Thread
+
+**Archived conversation**:
+A removed session's conversation, readable while its messages are retained but unable to receive new messages.
+_Avoid_: Gone session
+
+**Read marker**:
+The human's shared reading position for incoming messages from one session or posts in one channel, independent of delivery status.
+_Avoid_: Delivery receipt
+
+**Unread reminder**:
+One eligible message deliberately marked unread without moving the read marker back across the rest of the conversation or channel.
+_Avoid_: Queued message
 
 ## Message meaning and delivery
 
