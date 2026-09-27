@@ -102,6 +102,11 @@ const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
 const ENABLE_BRACKETED_PASTE = "\u001b[?2004h";
 const DISABLE_BRACKETED_PASTE = "\u001b[?2004l";
+/** Kitty keyboard protocol, "disambiguate" flag: lets Shift+Enter differ from Enter. Pop restores the prior mode. */
+const ENABLE_KEYBOARD_PROTOCOL = "\u001b[>1u";
+const DISABLE_KEYBOARD_PROTOCOL = "\u001b[<u";
+/** Kitty `CSI code[;mods]u` and xterm modifyOtherKeys `CSI 27;mods;code~` key reports. */
+const KEY_REPORT = /\u001b\[(?:(\d+)(?:;(\d+))?u|27;(\d+);(\d+)~)/g;
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 const SINGLE_LINE_CONTROLS = /[\u0000-\u001f\u007f-\u009f]/g;
 const MULTILINE_CONTROLS = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g;
@@ -312,6 +317,46 @@ export function changedTerminalRows(
   return diffRowKeys(previous && frameRowKeys(previous, size, true).keys, frameRowKeys(next, size, true));
 }
 
+export type KeyboardSegment = { text: string } | { key: "SHIFT_ENTER" };
+
+/**
+ * Rewrites protocol key reports into the legacy bytes terminal-kit understands (Esc, Ctrl+letter,
+ * Alt+key, Shift+Tab…). Shift+Enter has no legacy byte, so it becomes its own key segment.
+ */
+export function translateKeyboardInput(input: string): KeyboardSegment[] {
+  const segments: KeyboardSegment[] = [];
+  let text = "";
+  let last = 0;
+  for (const match of input.matchAll(KEY_REPORT)) {
+    text += input.slice(last, match.index);
+    last = match.index + match[0].length;
+    const code = Number(match[1] ?? match[4]);
+    const modifiers = Number(match[2] ?? match[3] ?? 1) - 1;
+    const shift = (modifiers & 1) !== 0;
+    const alt = (modifiers & 2) !== 0;
+    const ctrl = (modifiers & 4) !== 0;
+    if (code === 13 && shift && !alt && !ctrl) {
+      if (text) segments.push({ text });
+      text = "";
+      segments.push({ key: "SHIFT_ENTER" });
+      continue;
+    }
+    let bytes: string;
+    if (code === 13) bytes = "\r";
+    else if (code === 9) bytes = shift ? "\u001b[Z" : "\t";
+    else if (code === 127 || code === 8) bytes = "\u007f";
+    else if (code === 27) bytes = "\u001b";
+    else if (ctrl && code === 32) bytes = "\u0000";
+    else if (ctrl && ((code >= 97 && code <= 122) || (code >= 64 && code <= 95))) bytes = String.fromCharCode(code & 0x1f);
+    else if (code >= 32 && code < 0xe000) bytes = String.fromCodePoint(shift && code >= 97 && code <= 122 ? code - 32 : code);
+    else continue; // private-use functional keys (keypad, media, lone modifiers) have no legacy form
+    text += alt ? `\u001b${bytes}` : bytes;
+  }
+  text += input.slice(last);
+  if (text) segments.push({ text });
+  return segments;
+}
+
 type KeyDetails = { isCharacter?: boolean; meta?: string };
 type MouseDetails = {
   x?: number;
@@ -372,7 +417,7 @@ export class TerminalAdapter {
 
     this.#state = "running";
     this.#rows = undefined;
-    process.stdin.prependListener("data", this.#onRawData);
+    process.stdin.on("data", this.#onInput);
     this.#terminal.on("key", this.#onKey);
     this.#terminal.on("mouse", this.#onMouse);
     this.#terminal.on("resize", this.#onResize);
@@ -383,6 +428,9 @@ export class TerminalAdapter {
     this.#terminal.hideCursor();
     process.stdout.write(ENABLE_BRACKETED_PASTE);
     this.#terminal.grabInput({ mouse: this.#options.mouse ?? "button", safe: true });
+    // Route terminal-kit's input through the keyboard-protocol translator instead of raw stdin.
+    process.stdin.removeListener("data", this.#kitStdin);
+    process.stdout.write(ENABLE_KEYBOARD_PROTOCOL);
   }
 
   render(frame: TerminalFrame): void {
@@ -422,7 +470,8 @@ export class TerminalAdapter {
     clearTimeout(this.#candidateTimer);
     this.#state = "closed";
 
-    process.stdin.removeListener("data", this.#onRawData);
+    process.stdin.removeListener("data", this.#onInput);
+    process.stdout.write(DISABLE_KEYBOARD_PROTOCOL);
     this.#terminal.off("key", this.#onKey);
     this.#terminal.off("mouse", this.#onMouse);
     this.#terminal.off("resize", this.#onResize);
@@ -442,6 +491,23 @@ export class TerminalAdapter {
     this.#pendingEscape = undefined;
     this.#standaloneEscape = false;
   }
+
+  get #kitStdin(): (chunk: Buffer) => void {
+    return (this.#terminal as unknown as { onStdin(chunk: Buffer): void }).onStdin;
+  }
+
+  readonly #onInput = (chunk: Buffer | string): void => {
+    const text = typeof chunk === "string" ? chunk : this.#decoder.write(chunk);
+    for (const segment of translateKeyboardInput(text)) {
+      if (this.#state !== "running") return;
+      if ("key" in segment) {
+        this.#onKey(segment.key, [segment.key], {});
+        continue;
+      }
+      this.#onRawData(segment.text);
+      this.#kitStdin(Buffer.from(segment.text, "utf8"));
+    }
+  };
 
   #deliverEscape(): void {
     const pending = this.#pendingEscape;
@@ -514,8 +580,7 @@ export class TerminalAdapter {
     this.cleanup();
   };
 
-  readonly #onRawData = (chunk: Buffer | string): void => {
-    const text = typeof chunk === "string" ? chunk : this.#decoder.write(chunk);
+  readonly #onRawData = (text: string): void => {
     const pasteStart = text.indexOf(BRACKETED_PASTE_START);
     const lastEscape = text.lastIndexOf("\u001b");
     const candidateStart = pasteStart >= 0 ? pasteStart

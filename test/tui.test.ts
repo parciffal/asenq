@@ -4,7 +4,7 @@ import type { AsenqClient } from "../src/shared/client.js";
 import { ConsoleApp } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
-  changedTerminalRows, normalizeTerminalLine, terminalTextWidth, truncateTerminalText, wrapTerminalText,
+  changedTerminalRows, normalizeTerminalLine, terminalTextWidth, translateKeyboardInput, truncateTerminalText, wrapTerminalText,
   type TerminalAdapterOptions, type TerminalFrame, type TerminalLine, type TerminalSize,
 } from "../src/tui/terminal.js";
 import { startEnv, type TestEnv } from "./helpers.js";
@@ -125,6 +125,13 @@ test("normalized rows clip at a grapheme boundary and merge equal styles", () =>
   ]);
 });
 
+test("keyboard protocol reports become legacy keys, and Shift+Enter its own key", () => {
+  assert.deepEqual(translateKeyboardInput("a\u001b[13;2ub"), [{ text: "a" }, { key: "SHIFT_ENTER" }, { text: "b" }]);
+  assert.deepEqual(translateKeyboardInput("\u001b[27;2;13~"), [{ key: "SHIFT_ENTER" }]);
+  assert.deepEqual(translateKeyboardInput("\u001b[99;5u\u001b[27u\u001b[9;2u\u001b[97;3u\u001b[13u"), [{ text: "\u0003\u001b\u001b[Z\u001ba\r" }]);
+  assert.deepEqual(translateKeyboardInput("\u001b[57399u\u001b[200~x\u001b[1;2A"), [{ text: "\u001b[200~x\u001b[1;2A" }]);
+});
+
 test("frame diff reports only rows whose visible text or style changed", () => {
   const first: TerminalFrame = { lines: ["header", [{ text: "status", style: { foreground: "green" } }], "body"] };
   assert.deepEqual(changedTerminalRows(undefined, first, size), [0, 1, 2, 3]);
@@ -164,6 +171,7 @@ test("wide console lists live sessions by recent activity, collapses the archive
 
   await ui.press("DOWN");
   await ui.until(() => ui.rows().some((row) => row.includes("end-of-alpha")), "alpha conversation");
+  assert.equal(await unread(human, alpha.session.id), 1, "moving through the list does not mark a conversation read");
   rows = ui.rows();
   assertWithin(ui);
   for (const row of rows.slice(1, -1)) {
@@ -181,21 +189,26 @@ test("wide console lists live sessions by recent activity, collapses the archive
   assert.equal(ui.rows().findIndex((row) => row.includes("retired")), -1, "clearing search collapses the archive again");
 });
 
-test("narrow console reaches every wrapped row and marks read only when the last incoming row is shown", async () => {
+test("narrow console reaches every wrapped row and marks an open conversation read only once its last incoming row is shown", async () => {
   env = await startEnv();
   const human = env.human();
   const alpha = await env.adapter("omp", "alpha-key", "alpha");
-  const paragraphs = Array.from({ length: 12 }, (_, index) => `paragraph ${index + 1} carries enough words to wrap twice here`);
-  const text = [...paragraphs, "", "final-row-marker"].join("\n");
-  await alpha.client.request("send", { to: "human", text });
+  const lines = (label: string) => Array.from({ length: 12 }, (_, index) => `${label} ${index + 1} carries enough words to wrap twice here`);
+  await alpha.client.request("send", { to: "human", text: lines("intro").join("\n") });
 
   const ui = await startConsole(40, 12);
   await ui.until(() => ui.rows().some((row) => row.includes("alpha")), "picker");
+  assert.equal(await unread(human, alpha.session.id), 1, "the picker alone does not mark anything read");
   await ui.press("ENTER");
-  assert.equal(await unread(human, alpha.session.id), 1, "opening a conversation does not mark it read");
+  await ui.until(async () => await unread(human, alpha.session.id) === 0, "opening shows the newest row and reads it");
+
   await ui.press("HOME");
+  const paragraphs = lines("paragraph");
+  const text = [...paragraphs, "", "final-row-marker"].join("\n");
+  await alpha.client.request("send", { to: "human", text });
+  await ui.until(async () => await unread(human, alpha.session.id) === 1, "arrival while scrolled up stays unread");
   const seen = new Set<string>();
-  for (let step = 0; step < 80; step++) {
+  for (let step = 0; step < 120; step++) {
     assertWithin(ui);
     for (const row of ui.rows()) seen.add(row.trim());
     const reached = ui.rows().some((row) => row.includes("final-row-marker"));
@@ -209,6 +222,13 @@ test("narrow console reaches every wrapped row and marks read only when the last
   }
   assert.ok(ui.rows().some((row) => row.includes("final-row-marker")), "the last row became reachable");
   for (const row of wrapTerminalText(text, 38)) assert.ok(seen.has(row.trim()), `reached: ${row}`);
+
+  await ui.press("u");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await ui.app.idle();
+  assert.equal(await unread(human, alpha.session.id), 1, "a u reminder survives while the conversation stays open");
+  await ui.press("END");
+  await ui.until(async () => await unread(human, alpha.session.id) === 0, "End reads the reminder");
 });
 
 test("new arrivals keep a scrolled reader in place, and the composer sends once by stable identity", async () => {
@@ -229,10 +249,10 @@ test("new arrivals keep a scrolled reader in place, and the composer sends once 
 
   await ui.press("c");
   await ui.type("hello");
-  await ui.press("ENTER");
+  await ui.press("SHIFT_ENTER");
   await ui.type("there");
   const pending = alpha.deliveries.length;
-  await ui.press("CTRL_D");
+  await ui.press("ENTER");
   await ui.until(() => alpha.deliveries.length > pending, "delivery");
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(alpha.deliveries.length, pending + 1, "sent exactly once");
