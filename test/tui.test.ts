@@ -67,7 +67,7 @@ async function startConsole(columns: number, rows: number): Promise<Console> {
     },
   };
   open = ui;
-  await ui.until(() => ui.rows()[0]?.includes("connected") ?? false, "connection");
+  await ui.until(() => ui.rows()[0]?.includes("●") ?? false, "connection");
   return ui;
 }
 
