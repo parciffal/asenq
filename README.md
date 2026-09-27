@@ -77,26 +77,32 @@ asenq daemon start|stop|status
 
 ### Interactive human console
 
-Run `asenq tui` in a terminal for a full-screen view of live and archived session conversations. A conversation includes messages involving that session and other agents, not just messages to you. Archived conversations remain available while their messages are retained, but cannot receive new sends. The sidebar uses stable session identities: renaming preserves a conversation; reusing a removed name starts another one.
+Run `asenq tui` in a terminal for a full-screen view of live and archived session conversations. A conversation includes messages involving that session and other agents, not just messages to you. Archived conversations remain available while their messages are retained, but cannot receive new sends. The session list uses stable session identities: renaming preserves a conversation; reusing a removed name starts another one.
+
+Four tabs — **Sessions**, **Inbox**, **Channels** and **Activity** — share one layout. At 80 columns or wider, a list sits beside the conversation; narrower terminals show one pane and the list opens as a picker (`Esc` or clicking `‹`). Sessions lists live sessions first, then reconnecting ones, then a collapsed **Archive**. Each group is sorted by most recent direct-message activity. Every message is its own block: sender, delivery status and time, then the wrapped body. Message bodies are never cut off; only labels are shortened with `…`. Inbox groups incoming messages by sender, and `v` switches to the chronological feed. Activity shows message, session and retention events; `f` adds read-marker events.
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` | Select a session |
-| `Enter` or `c` | Compose to the selected session (or edit the target to `human`) |
-| `Tab`, `Ctrl+D`, `Ctrl+U` | Next field, submit form, clear field |
-| `Enter` in a multiline field | Insert a newline |
-| `PageUp` / `PageDown`, `End` | Older/newer history; `End` marks a selected session or channel read when its newest eligible item is reached |
+| `Tab` / `Shift+Tab` | Move focus: tabs → list → conversation → composer |
+| `↑` / `↓`, `Enter` | In a list: move and open. In a conversation: select messages (long ones scroll row by row) and show a message's full details inline |
+| `/` | Search sessions by current or former name, archive included |
+| `PageUp` / `PageDown`, `Home`, `End` | Scroll; scrolling to the top loads older history; `End` jumps to the latest message |
+| `c` | Write in the inline composer: `Enter` inserts a newline, `Ctrl+D` sends, `Esc` leaves (the draft is kept) |
+| `Ctrl+E` | Full editor with kind, thread, reply-to and done fields |
 | `u` | Mark the latest eligible item unread again |
-| `i`, `a`, `#`, `?` | Human inbox, activity, channels, full action menu |
-| `Esc`, `q` | Cancel/back, quit |
+| `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity |
+| `?` | Searchable action palette, including help |
+| `Esc`, `q` | Dismiss an error or close a panel/back, quit |
 
-The action menu also exposes advanced send fields, broadcasts, channel posts, held-message release/drop, rename, inbound policy, log lookup, setup, doctor and daemon controls. Broadcast displays its live target count and requires a matching confirmation. Drop, setup removal and daemon stop require confirmation; removal and stop exit the TUI. Draft text stays in the composer after a failed or uncertain send; check the log before retrying a timed-out send.
+The palette also lists broadcasts, channel posts, held-message release/drop, rename, inbound policy, log lookup, setup, doctor and daemon controls. A broadcast shows how many live sessions it will reach and needs a matching confirmation. Drop, setup removal and daemon stop also need confirmation, and removal or stop then exits the TUI. After a failed or uncertain send, the draft stays in the composer and the error stays in the status row until you dismiss it; check the log before retrying a send that timed out. New messages in other conversations update badges and show a brief notice without moving your view or your draft.
 
-Unread is **not delivery**. Counts cover messages to `human` grouped by their sending session identity, plus non-human channel posts. Agent-to-agent traffic appears in conversations but never counts toward your unread. Reading positions and one-item unread reminders are shared between TUI windows and survive restart; ordinary `asenq inbox` and `asenq channel read` do not change them. Previously retained messages start read on upgrade. A view does not mark new messages read merely by fetching or selecting them. If reconnect crosses pruned history, the TUI signals the gap and reloads retained state rather than claiming complete replay.
+Colors mark roles and states and leave your terminal background alone. With `NO_COLOR`, `TERM=dumb` or a terminal that reports no color, only bold/inverse and the literal state words remain. States are always written out in words, so color is never the only signal. Normal updates redraw only the rows that changed.
+
+Unread is **not delivery**. Counts cover messages to `human` grouped by their sending session identity, plus non-human channel posts. Agent-to-agent traffic appears in conversations but never counts toward your unread. Reading positions and one-item unread reminders are shared between TUI windows and survive restart; ordinary `asenq inbox` and `asenq channel read` do not change them. Previously retained messages start read on upgrade. Opening, selecting or receiving messages never marks them read. A conversation is marked read only when you scroll or press `End` and the last row of its newest incoming message comes into view. If reconnect crosses pruned history, the TUI signals the gap and reloads retained state rather than claiming complete replay.
 
 The TUI needs an input/output TTY on macOS or Linux under Node ≥ 22.13 or Bun. Keyboard navigation works without mouse reporting; clicks and wheel scrolling work in terminals that report them. For scripts or terminals without a usable TTY, use the unchanged CLI commands above. Terminal text is sanitized before display, and the TUI restores the normal screen after ordinary exit, Ctrl-C or an uncaught exception; SIGKILL cannot run cleanup.
 
-When upgrading from v0.0.1, stop an already-running daemon with `asenq daemon stop` before using the new console. The protocol revision rejects a stale daemon and asks for a restart; stopping the daemon does not require a protocol connection. It restarts automatically on the next normal command.
+When upgrading, stop an already-running daemon with `asenq daemon stop` before using the new console. Also restart agent sessions whose asenq MCP/extension loaded the previous version: the protocol revision (currently 3) rejects mismatched clients and daemons and asks for a restart. Stopping the daemon does not need a protocol connection, and it restarts automatically on the next normal command.
 
 ## How delivery works
 

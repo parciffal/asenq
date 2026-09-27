@@ -430,10 +430,12 @@ export class ConsoleApp {
     return { text: "archived", style: theme.dim };
   }
 
-  private unreadSpans(key: string): TerminalSpan[] {
+  /** Unread badge: compact `+N · ` in lists, `N unread · ` in titles; `!` marks a reminder. */
+  private unreadSpans(key: string, long = false): TerminalSpan[] {
     const state = this.readStates.get(key);
     if (!state?.unread) return [];
-    return [{ text: `+${state.unread}${state.reminder !== null ? "!" : ""} `, style: theme.unread }];
+    const reminder = state.reminder !== null ? "!" : "";
+    return [{ text: long ? `${state.unread} unread${reminder} · ` : `+${state.unread}${reminder} · `, style: theme.unread }];
   }
 
   private marker(selected: boolean): TerminalSpan {
@@ -491,7 +493,7 @@ export class ConsoleApp {
             return [
               justify(
                 [this.marker(selected), { text: summary.name, style: theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
-                [...this.unreadSpans(unreadKey), { text: formatTime(summary.latest.createdAt), style: theme.dim }],
+                [...this.unreadSpans(unreadKey), { text: formatTime(summary.latest.createdAt, Date.now(), true), style: theme.dim }],
                 width, pick(selected, focused),
               ),
               padSpans([{ text: "  " }, { text: ellipsize(preview, Math.max(0, width - 2)), style: theme.dim }], width, pick(selected, focused)),
@@ -505,7 +507,7 @@ export class ConsoleApp {
         key: `c:${channel.name}`,
         rows: (width, selected, focused) => [justify(
           [this.marker(selected), { text: `#${channel.name}`, style: theme.accentBold }],
-          [...this.unreadSpans(`c:${channel.name}`), { text: `${channel.count}`, style: theme.dim }],
+          this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
           width, pick(selected, focused),
         )],
       }));
@@ -645,12 +647,13 @@ export class ConsoleApp {
       : this.connection === "offline" ? { text: "○ offline", style: theme.bad } : { text: "◌ connecting", style: theme.warn };
     const brand: TerminalSpan = { text: " asenq ", style: { ...theme.brand, inverse: true } };
     const build = (short: boolean): { spans: TerminalSpan[]; hits: Hit[] } => {
+      // Narrow terminals keep the active tab's full name and abbreviate the others.
       const spans: TerminalSpan[] = [brand, { text: " " }];
       const hits: Hit[] = [];
       let column = terminalTextWidth(brand.text) + 1;
       for (const [tab, label] of TABS) {
-        const text = ` ${short ? label[0] : label}${badge(tab)} `;
         const active = tab === this.tab;
+        const text = ` ${short && !active ? label[0] : label}${badge(tab)} `;
         const style = active ? (this.focus === "tabs" ? { ...theme.accentBold, inverse: true } : theme.focused) : theme.dim;
         spans.push({ text, style });
         hits.push({ row: 0, start: column, end: column + terminalTextWidth(text), target: { kind: "tab", tab } });
@@ -658,11 +661,13 @@ export class ConsoleApp {
       }
       return { spans, hits };
     };
+    const used = (spans: TerminalSpan[]): number => spans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
     let bar = build(false);
-    const used = bar.spans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-    if (used + terminalTextWidth(connection.text) + 1 > width) bar = build(true);
+    if (used(bar.spans) + terminalTextWidth(connection.text) + 1 > width) bar = build(true);
+    // The symbol alone still distinguishes the states (● ○ ◌) when there is no room for the word.
+    const status = used(bar.spans) + terminalTextWidth(connection.text) + 1 > width ? { ...connection, text: connection.text.slice(0, 1) } : connection;
     this.hits.push(...bar.hits);
-    return justify(bar.spans, [connection], width);
+    return justify(bar.spans, [status], width);
   }
 
   private footer(width: number): TerminalLine {
@@ -780,13 +785,13 @@ export class ConsoleApp {
     }
     if (scope.scope === "channel") {
       const count = this.channels.find((c) => c.name === scope.channel)?.count ?? 0;
-      return justify([...back, { text: `#${scope.channel}`, style: theme.accentBold }], [...this.unreadSpans(keyOf(scope)), { text: `${count} retained`, style: theme.dim }], width);
+      return justify([...back, { text: `#${scope.channel}`, style: theme.accentBold }], [...this.unreadSpans(keyOf(scope), true), { text: `${count} retained`, style: theme.dim }], width);
     }
     const session = this.session(scope.sessionId);
     const left: TerminalSpan[] = [...back, { text: session?.name ?? scope.sessionId, style: theme.accentBold }];
     if (session?.previousNames.length) left.push({ text: ` formerly ${session.previousNames.join(", ")}`, style: theme.dim });
     if (session?.harness && session.harness !== "unknown") left.push({ text: ` · ${session.harness}`, style: theme.dim });
-    const right: TerminalSpan[] = [...this.unreadSpans(keyOf(scope))];
+    const right: TerminalSpan[] = [...this.unreadSpans(keyOf(scope), true)];
     if (session) right.push(session.state === "removed" ? { text: "archived · read only", style: theme.dim } : this.stateLabel(session));
     return justify(left, right, width);
   }
@@ -861,7 +866,7 @@ export class ConsoleApp {
     }
     const focused = this.focus === "composer";
     const label = target.kind === "session" ? `to ${target.name}` : `#${target.name}`;
-    const hint = focused ? "Ctrl+D send · Ctrl+E editor" : "c write";
+    const hint = focused ? "Ctrl+D send" : "c write";
     const rows: TerminalLine[] = [];
     const layout = editorLayout(text, this.cursor, Math.max(1, width - 2));
     const count = Math.min(maxRows, Math.max(1, layout.rows.length));

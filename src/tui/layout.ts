@@ -92,11 +92,13 @@ export function paneWidths(columns: number): Panes {
   return { list, conversation: columns - list - 1 };
 }
 
-export function formatTime(at: number, now = Date.now()): string {
+/** Local time for today's items, otherwise the date too; `compact` drops the time for older items. */
+export function formatTime(at: number, now = Date.now(), compact = false): string {
   const date = new Date(at);
   const time = date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   if (new Date(now).toDateString() === date.toDateString()) return time;
-  return `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
+  const day = date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return compact ? day : `${day} ${time}`;
 }
 
 const wrapCache = new Map<string, string[]>();
@@ -139,10 +141,10 @@ function headerSpans(message: StoredMessage, now: number): TerminalSpan[] {
   if (message.channel) spans.push({ text: ` in #${message.channel}`, style: theme.dim });
   else if (message.to !== "human" && !human) spans.push({ text: ` → ${message.to}`, style: theme.agent });
   else if (human) spans.push({ text: ` → ${message.to === "human" ? "you" : message.to}`, style: theme.dim });
-  spans.push({ text: `  ${formatTime(message.createdAt, now)}  `, style: theme.dim });
-  spans.push({ text: message.status, style: statusStyle(message.status) });
+  spans.push({ text: "  " }, { text: message.status, style: statusStyle(message.status) });
   if (message.kind && message.kind !== "chat") spans.push({ text: ` · ${message.kind}`, style: theme.dim });
   if (message.done) spans.push({ text: " · done", style: theme.dim });
+  spans.push({ text: `  ${formatTime(message.createdAt, now)}`, style: theme.dim });
   return spans;
 }
 
@@ -166,6 +168,7 @@ export function layoutTranscript(messages: readonly StoredMessage[], options: Tr
   const bodyWidth = Math.max(1, width - 2);
   const now = options.now ?? Date.now();
   const rows: TerminalLine[] = [...(options.leading ?? [])];
+  if (rows.length && messages.length) rows.push("");
   const ranges = new Map<string, MessageRange>();
   const order: string[] = [];
   if (!messages.length && options.empty) rows.push([{ text: ellipsize(options.empty, width), style: theme.dim }]);
