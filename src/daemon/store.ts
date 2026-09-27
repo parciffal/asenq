@@ -1,5 +1,5 @@
 import type {
-  ChannelSummary, Harness, Inbound, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
+  ChannelSummary, Harness, Inbound, InboxSummary, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
   SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
 } from "../shared/protocol.js";
 import type { Db } from "../shared/sqlite.js";
@@ -373,6 +373,45 @@ export class Store {
       `SELECT channel AS name,count(*) AS count,max(created_at) AS lastAt,max(ord) AS lastOrder
        FROM messages WHERE channel IS NOT NULL GROUP BY channel ORDER BY lastOrder DESC`,
     );
+  }
+
+  /** Latest retained direct-message order touching each stable identity, as sender or recipient. */
+  sessionLastOrders(): Record<string, number> {
+    const orders: Record<string, number> = {};
+    for (const row of this.db.all<{ id: string; ord: number }>(
+      `SELECT id,max(ord) AS ord FROM (
+         SELECT from_session AS id,ord FROM messages WHERE channel IS NULL AND from_session IS NOT NULL
+         UNION ALL
+         SELECT to_session AS id,ord FROM messages WHERE channel IS NULL AND to_session IS NOT NULL
+       ) GROUP BY id`,
+    )) orders[row.id] = Number(row.ord);
+    return orders;
+  }
+
+  /** Newest incoming human-inbox message per sender identity (legacy senders group by name), newest first. */
+  inboxSummaries(): InboxSummary[] {
+    return this.db.all<MsgRow>(
+      `SELECT m.* FROM messages m JOIN (
+         SELECT max(ord) AS ord FROM messages
+         WHERE channel IS NULL AND to_name='human' AND from_name!='human'
+         GROUP BY COALESCE('s:' || from_session, 'n:' || from_name)
+       ) latest ON latest.ord=m.ord ORDER BY m.ord DESC`,
+    ).map((row) => {
+      const identity = row.from_session ? this.identity(row.from_session) : undefined;
+      return {
+        ...(identity ? { sessionId: identity.id } : {}),
+        name: identity?.name ?? row.from_name,
+        latest: toStored(row),
+      };
+    });
+  }
+
+  /** The newest `limit` retained protocol events in ascending position order. */
+  recentEvents(limit: number): PositionedEvent[] {
+    return this.db.all<{ position: number; event_json: string }>(
+      "SELECT * FROM (SELECT position,event_json FROM protocol_events ORDER BY position DESC LIMIT ?) ORDER BY position",
+      limit,
+    ).map((row) => ({ position: row.position, event: JSON.parse(row.event_json) as TailEvent }));
   }
 
   ensureRead(scope: ReadScope): ReadState {

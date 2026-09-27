@@ -6,8 +6,9 @@ import { readConfig } from "./config.js";
 import { logPath, socketPath } from "./paths.js";
 import {
   AsenqError, PROTOCOL,
-  type ErrCode, type HistoryPage, type HistoryPageRequest, type Push, type ReadMutationResult,
-  type ReadScope, type ReadState, type ReplayResult, type SendOptions, type SendResult, type SyncResult,
+  type ErrCode, type HistoryPage, type HistoryPageRequest, type InboxSummary, type PositionedEvent, type Push,
+  type ReadMutationResult, type ReadScope, type ReadState, type RecentEventsResult, type ReplayResult,
+  type SendOptions, type SendResult, type SyncResult,
 } from "./protocol.js";
 
 export type ClientOpts = {
@@ -208,6 +209,17 @@ export class AsenqClient {
   /** Returns a chronological retained-history page; `before` is an exclusive durable message order. */
   async historyPage(params: HistoryPageRequest): Promise<HistoryPage> {
     return await this.request("history_page", params) as HistoryPage;
+  }
+
+  /** Newest incoming human-inbox message per sender, newest first. */
+  async inboxSummaries(): Promise<InboxSummary[]> {
+    return (await this.request("inbox_summaries")).summaries as InboxSummary[];
+  }
+
+  /** Newest retained protocol events (at most 200) in ascending position order. */
+  async recentEvents(limit?: number): Promise<PositionedEvent[]> {
+    const reply = await this.request("recent_events", limit === undefined ? {} : { limit });
+    return (reply as unknown as RecentEventsResult).events;
   }
 
   async readState(): Promise<ReadState[]>;

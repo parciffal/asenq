@@ -1,4 +1,4 @@
-export const PROTOCOL = 2;
+export const PROTOCOL = 3;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -98,7 +98,18 @@ export type SyncResult = {
   sessions: SessionIdentity[];
   channels: ChannelSummary[];
   readStates: ReadState[];
+  /** Latest retained non-channel message order per stable session identity; absent means zero. */
+  sessionLastOrders: Record<string, number>;
 };
+
+/** Latest incoming human-inbox message from one sender; `sessionId` is absent for legacy name-only senders. */
+export type InboxSummary = {
+  sessionId?: string;
+  name: string;
+  latest: StoredMessage;
+};
+
+export type RecentEventsResult = { events: PositionedEvent[]; watermark: number; eventFloor: number };
 
 export type HistoryPage = { messages: StoredMessage[]; hasMore: boolean };
 
