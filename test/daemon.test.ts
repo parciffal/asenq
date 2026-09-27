@@ -532,3 +532,92 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
     else process.env.ASENQ_HOME = previousHome;
   }
 });
+
+test("activity orders and inbox summaries follow stable identities across renames, reuse and retention", async () => {
+  env = await startEnv({ historyDays: 7 });
+  const human = env.human();
+  const original = await env.adapter("omp", "original-key", "alpha");
+  const busy = await env.adapter("omp", "busy-key", "busy");
+  const quiet = await env.adapter("omp", "quiet-key", "quiet");
+
+  await send(original.client, "human", "from the original alpha");
+  let busyLatest = "";
+  for (let index = 1; index <= 65; index++) {
+    env.clock.advance(2_100); // stay under the per-sender rate limit
+    busyLatest = `busy ${index}`;
+    assert.equal((await send(busy.client, "human", busyLatest))[0].status, "posted");
+  }
+  await human.request("rename", { from: "alpha", name: "gamma" });
+  await send(original.client, "human", "original after rename");
+  await original.client.request("unregister");
+  const replacement = await env.adapter("omp", "replacement-key", "alpha");
+  await send(replacement.client, "human", "from the new alpha");
+  await send(human, "human", "note to self");
+  const toBusy = await human.sendToSession(busy.session.id, "reply to busy");
+  await original.client.request("channel_send", { channel: "general", text: "channel posts are not direct activity" });
+
+  const summaries = await human.inboxSummaries();
+  assert.deepEqual(
+    summaries.map((summary) => [summary.sessionId, summary.name, summary.latest.text]),
+    [
+      [replacement.session.id, "alpha", "from the new alpha"],
+      [original.session.id, "gamma", "original after rename"],
+      [busy.session.id, "busy", busyLatest],
+    ],
+  );
+
+  const snapshot = await human.sync();
+  const busyPage = await human.historyPage({ scope: "session", sessionId: busy.session.id, limit: 1 });
+  assert.equal(busyPage.messages[0].id, toBusy.msgId);
+  assert.equal(snapshot.sessionLastOrders[busy.session.id], busyPage.messages[0].order);
+  assert.equal(snapshot.sessionLastOrders[replacement.session.id], summaries[0].latest.order);
+  assert.equal(snapshot.sessionLastOrders[original.session.id], summaries[1].latest.order);
+  assert.equal(snapshot.sessionLastOrders[quiet.session.id], undefined);
+
+  env.clock.advance(8 * 86_400_000);
+  env.daemon.prune();
+  const pruned = await human.sync();
+  assert.deepEqual(pruned.sessionLastOrders, {});
+  assert.deepEqual(await human.inboxSummaries(), []);
+  assert.ok(!pruned.sessions.some((session) => session.id === original.session.id));
+});
+
+test("recent events return the newest bounded window in ascending order, including after restart", async () => {
+  const previousHome = process.env.ASENQ_HOME;
+  const home = mkdtempSync(join(tmpdir(), "asenq-events-"));
+  process.env.ASENQ_HOME = home;
+  const db = await openDb(join(home, "asenq.db"));
+  const options = { socket: socketPath(), db, replyDir: join(home, "replies"), now: () => 1, timers: false, log: () => {} };
+  let daemon = new Daemon(options);
+  let client = new AsenqClient();
+  try {
+    await daemon.listen();
+    const empty = new AsenqClient();
+    assert.deepEqual(await empty.recentEvents(), []);
+    empty.close();
+    for (let index = 1; index <= 210; index++) await send(client, "human", `note ${index}`);
+    const recent = await client.recentEvents();
+    assert.equal(recent.length, 200);
+    assert.ok(recent.every((entry, index) => index === 0 || recent[index - 1].position < entry.position));
+    const last = recent.at(-1)!;
+    assert.equal(last.event.type === "message" && last.event.msg.text, "note 210");
+    assert.deepEqual((await client.recentEvents(3)).map((entry) => entry.position), recent.slice(-3).map((entry) => entry.position));
+
+    client.close();
+    await daemon.close();
+    daemon = new Daemon(options);
+    await daemon.listen();
+    client = new AsenqClient();
+    await send(client, "human", "after restart");
+    const resumed = await client.recentEvents(2);
+    assert.deepEqual(resumed.map((entry) => entry.position), [last.position, last.position + 1]);
+    assert.equal(resumed[1].event.type === "message" && resumed[1].event.msg.text, "after restart");
+  } finally {
+    client.close();
+    await daemon.close();
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ASENQ_HOME;
+    else process.env.ASENQ_HOME = previousHome;
+  }
+});

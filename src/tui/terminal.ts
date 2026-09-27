@@ -89,6 +89,8 @@ export interface TerminalAdapterOptions {
   /** Called after terminal state has been restored. */
   onInterrupt?: () => void;
   mouse?: "button" | "drag" | "motion";
+  /** Overrides color detection (`NO_COLOR`, `TERM=dumb`, stdout color depth). */
+  color?: boolean;
 }
 
 export interface SanitizeTerminalTextOptions {
@@ -170,6 +172,146 @@ export function truncateTerminalText(text: string, width: number): string {
   return result;
 }
 
+/**
+ * Wrap text into rows no wider than `width` cells. Explicit newlines and blank lines are
+ * kept; words longer than a row split at grapheme boundaries, so no text is lost.
+ */
+export function wrapTerminalText(text: string, width: number): string[] {
+  if (!Number.isFinite(width) || width < 1) return [];
+  const maxWidth = Math.floor(width);
+  const rows: string[] = [];
+  for (const paragraph of sanitizeTerminalText(text, { multiline: true }).split("\n")) {
+    let line = "";
+    let lineWidth = 0;
+    let wrapped = false;
+    const flush = (): void => {
+      rows.push(line.trimEnd());
+      line = "";
+      lineWidth = 0;
+      wrapped = true;
+    };
+    for (const token of paragraph.split(/( +)/)) {
+      if (!token) continue;
+      const tokenWidth = displayWidth(token);
+      if (token.startsWith(" ")) {
+        // Leading indentation survives on a paragraph's first row; spaces at a wrap point do not.
+        if (line === "" && wrapped) continue;
+        if (lineWidth + tokenWidth > maxWidth) {
+          if (line !== "") flush();
+          continue;
+        }
+      } else if (lineWidth + tokenWidth > maxWidth) {
+        if (tokenWidth > maxWidth) {
+          // Longer than a whole row: fill the current row, then continue at grapheme boundaries.
+          for (const { segment } of GRAPHEMES.segment(token)) {
+            let glyph = segment;
+            let glyphWidth = graphemeWidth(segment);
+            if (glyphWidth > maxWidth) {
+              glyph = "\u2026";
+              glyphWidth = 1;
+            }
+            if (lineWidth + glyphWidth > maxWidth) flush();
+            line += glyph;
+            lineWidth += glyphWidth;
+          }
+          continue;
+        }
+        if (line.trim() !== "") flush();
+        else {
+          line = "";
+          lineWidth = 0;
+        }
+      }
+      line += token;
+      lineWidth += tokenWidth;
+    }
+    rows.push(line.trimEnd());
+  }
+  return rows;
+}
+
+/** Whether stdout can show ANSI colors; honors `NO_COLOR`, `TERM=dumb` and reported depth. */
+export function terminalSupportsColor(): boolean {
+  const stdout = process.stdout as NodeJS.WriteStream;
+  return typeof stdout.getColorDepth === "function" && stdout.getColorDepth() >= 4;
+}
+
+const SGR_COLORS: Record<TerminalColor, number> = {
+  black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35, cyan: 36, white: 37,
+  brightBlack: 90, brightRed: 91, brightGreen: 92, brightYellow: 93,
+  brightBlue: 94, brightMagenta: 95, brightCyan: 96, brightWhite: 97,
+};
+
+function sgr(style: TerminalStyle | undefined): string {
+  if (!style) return "";
+  const codes: number[] = [];
+  if (style.bold) codes.push(1);
+  if (style.dim) codes.push(2);
+  if (style.italic) codes.push(3);
+  if (style.underline) codes.push(4);
+  if (style.inverse) codes.push(7);
+  if (style.foreground) codes.push(SGR_COLORS[style.foreground]);
+  if (style.background) codes.push(SGR_COLORS[style.background] + 10);
+  return codes.length ? `\u001b[${codes.join(";")}m` : "";
+}
+
+/** Sanitized spans clipped to `columns` cells; colors are dropped when `color` is false. */
+export function normalizeTerminalLine(
+  line: TerminalLine | undefined,
+  columns: number,
+  color = true,
+): TerminalSpan[] {
+  const spans: readonly TerminalSpan[] = line === undefined ? [] : typeof line === "string" ? [{ text: line }] : line;
+  const result: TerminalSpan[] = [];
+  let used = 0;
+  for (const span of spans) {
+    if (used >= columns) break;
+    const text = truncateTerminalText(span.text, columns - used);
+    if (!text) continue;
+    used += displayWidth(text);
+    let style = span.style;
+    if (style && !color) {
+      const { foreground: _foreground, background: _background, ...rest } = style;
+      style = rest;
+    }
+    const styleKey = sgr(style);
+    const previous = result.at(-1);
+    if (previous && sgr(previous.style) === styleKey) previous.text += text;
+    else result.push(styleKey ? { text, style: style! } : { text });
+  }
+  return result;
+}
+
+type FrameRows = { keys: string[]; spans: TerminalSpan[][] };
+
+function frameRowKeys(frame: TerminalFrame, size: TerminalSize, color: boolean): FrameRows {
+  const keys: string[] = [];
+  const spans: TerminalSpan[][] = [];
+  for (let row = 0; row < size.rows; row += 1) {
+    const normalized = normalizeTerminalLine(frame.lines[row], size.columns, color);
+    spans.push(normalized);
+    keys.push(normalized.map((span) => sgr(span.style) + "\u0000" + span.text).join("\u0001"));
+  }
+  return { keys, spans };
+}
+
+function diffRowKeys(previous: readonly string[] | undefined, next: FrameRows): number[] {
+  const changed: number[] = [];
+  for (let row = 0; row < next.keys.length; row += 1) {
+    if (previous?.[row] !== next.keys[row]) changed.push(row);
+  }
+  return changed;
+}
+
+/** Zero-based screen rows whose visible text or style differ; every row when `previous` is absent. */
+export function changedTerminalRows(
+  previous: TerminalFrame | undefined,
+  next: TerminalFrame,
+  size: TerminalSize,
+): number[] {
+  return diffRowKeys(previous && frameRowKeys(previous, size, true).keys, frameRowKeys(next, size, true));
+}
+
 type KeyDetails = { isCharacter?: boolean; meta?: string };
 type MouseDetails = {
   x?: number;
@@ -201,9 +343,19 @@ export class TerminalAdapter {
   #escapeTimer?: NodeJS.Timeout;
   #candidateTimer?: NodeJS.Timeout;
   #clearSuppressionQueued = false;
+  readonly #color: boolean;
+  /** Normalized keys of the rows currently on screen; undefined forces a full repaint. */
+  #rows?: string[];
+  #size?: TerminalSize;
 
   constructor(options: TerminalAdapterOptions = {}) {
     this.#options = options;
+    this.#color = options.color ?? terminalSupportsColor();
+  }
+
+  /** Whether semantic colors are drawn; otherwise only bold/dim/inverse/underline survive. */
+  get color(): boolean {
+    return this.#color;
   }
 
   get size(): TerminalSize {
@@ -219,6 +371,7 @@ export class TerminalAdapter {
     if (!process.stdin.isTTY || !process.stdout.isTTY) throw new TerminalUnavailableError();
 
     this.#state = "running";
+    this.#rows = undefined;
     process.stdin.prependListener("data", this.#onRawData);
     this.#terminal.on("key", this.#onKey);
     this.#terminal.on("mouse", this.#onMouse);
@@ -235,38 +388,32 @@ export class TerminalAdapter {
   render(frame: TerminalFrame): void {
     if (this.#state !== "running") throw new Error("TerminalAdapter.start() must be called before render().");
 
-    const { columns, rows } = this.size;
-    this.#terminal.styleReset();
-    this.#terminal.moveTo(1, 1);
-    this.#terminal.eraseDisplay();
+    const size = this.size;
+    if (!this.#size || this.#size.columns !== size.columns || this.#size.rows !== size.rows) this.#rows = undefined;
+    const rows = frameRowKeys(frame, size, this.#color);
+    const changed = diffRowKeys(this.#rows, rows);
+    this.#rows = rows.keys;
+    this.#size = size;
 
-    for (let row = 0; row < Math.min(rows, frame.lines.length); row += 1) {
-      const line = frame.lines[row];
-      const spans: readonly TerminalSpan[] = typeof line === "string" ? [{ text: line }] : line;
-      let column = 0;
-
-      for (const span of spans) {
-        if (column >= columns) break;
-        const text = truncateTerminalText(span.text, columns - column);
-        if (!text) continue;
-        this.#terminal.moveTo(column + 1, row + 1);
-        this.#applyStyle(span.style);
-        this.#terminal.noFormat(text);
-        this.#terminal.styleReset();
-        column += displayWidth(text);
+    // One buffered write per frame, wrapped in synchronized-output mode where supported:
+    // only changed rows are rewritten, and each rewrite clears only its stale tail.
+    let output = "\u001b[?2026h\u001b[?25l";
+    for (const row of changed) {
+      output += `\u001b[${row + 1};1H`;
+      let width = 0;
+      for (const span of rows.spans[row]) {
+        output += `${sgr(span.style)}${span.text}\u001b[0m`;
+        width += displayWidth(span.text);
       }
+      if (width < size.columns) output += "\u001b[K";
     }
-
     const cursor = frame.cursor;
-    if (!cursor || cursor.visible === false) {
-      this.#terminal.hideCursor();
-      return;
+    if (cursor && cursor.visible !== false) {
+      const column = Math.min(size.columns - 1, Math.max(0, Math.floor(cursor.column)));
+      const row = Math.min(size.rows - 1, Math.max(0, Math.floor(cursor.row)));
+      output += `\u001b[${row + 1};${column + 1}H\u001b[?25h`;
     }
-
-    const column = Math.min(columns - 1, Math.max(0, Math.floor(cursor.column)));
-    const row = Math.min(rows - 1, Math.max(0, Math.floor(cursor.row)));
-    this.#terminal.moveTo(column + 1, row + 1);
-    this.#terminal.hideCursor(false);
+    process.stdout.write(output + "\u001b[?2026l");
   }
 
   cleanup(): void {
@@ -287,17 +434,6 @@ export class TerminalAdapter {
     this.#terminal.styleReset();
     this.#terminal.hideCursor(false);
     this.#terminal.fullscreen(false);
-  }
-
-  #applyStyle(style: TerminalStyle | undefined): void {
-    if (!style) return;
-    if (style.foreground) this.#terminal.color(style.foreground);
-    if (style.background) this.#terminal.bgColor(style.background);
-    if (style.bold) this.#terminal.bold();
-    if (style.dim) this.#terminal.dim();
-    if (style.italic) this.#terminal.italic();
-    if (style.underline) this.#terminal.underline();
-    if (style.inverse) this.#terminal.inverse();
   }
 
   #cancelEscape(): void {
@@ -365,6 +501,7 @@ export class TerminalAdapter {
   };
 
   readonly #onResize = (columns: number, rows: number): void => {
+    this.#rows = undefined;
     this.#options.onResize?.({ columns, rows });
   };
 

@@ -307,6 +307,16 @@ export class Daemon {
       case "history_page":
         this.requireHuman(this.sender(c, p), "read retained history");
         return this.opHistoryPage(p);
+      case "inbox_summaries":
+        this.requireHuman(this.sender(c, p), "read inbox summaries");
+        return { summaries: this.store.inboxSummaries() };
+      case "recent_events":
+        this.requireHuman(this.sender(c, p), "read recent events");
+        return {
+          events: this.store.recentEvents(limitParam(p, 200, 200)),
+          watermark: this.store.eventWatermark(),
+          eventFloor: this.store.eventFloor(),
+        };
       case "read_state":
         this.requireHuman(this.sender(c, p), "read human markers");
         return this.opReadState(p);
@@ -407,6 +417,7 @@ export class Daemon {
       sessions,
       channels,
       readStates: this.store.readStates(),
+      sessionLastOrders: this.store.sessionLastOrders(),
     };
   }
 
