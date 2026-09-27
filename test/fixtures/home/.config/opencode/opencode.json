@@ -1,0 +1,18 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "cwa": {
+      "type": "local",
+      "command": [
+        "cwa"
+      ]
+    },
+    "messenger": {
+      "type": "local",
+      "command": [
+        "python3",
+        "server.py"
+      ]
+    }
+  }
+}

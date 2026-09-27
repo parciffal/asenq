@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "messenger": {
+      "command": "python3",
+      "args": [
+        "/home/u/.local/share/mcp-messenger/server.py"
+      ]
+    }
+  }
+}

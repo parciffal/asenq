@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "strict": true,
+    "rootDir": ".",
+    "outDir": "dist",
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": false,
+    "lib": [
+      "ES2024"
+    ]
+  },
+  "include": [
+    "src",
+    "test"
+  ]
+}
