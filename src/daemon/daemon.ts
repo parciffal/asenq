@@ -5,13 +5,14 @@ import { join } from "node:path";
 import {
   ACK_TIMEOUT_MS, AsenqError, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, NAME_RE, PROBE_MS,
   PROTOCOL, RESERVED, RETRY_MS, slug,
-  type Harness, type Inbound, type Kind, type MsgStatus, type Push, type Req, type SendResult, type TailEvent,
+  type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
+  type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
-import type { Db, Param } from "../shared/sqlite.js";
+import type { Db } from "../shared/sqlite.js";
 import { version } from "../shared/version.js";
 import { claudeFrame, parseEnvelopeReply, probe, replyAddr, writeLine } from "./claude.js";
-import { Store, toWire, type MsgRow, type SessionRow } from "./store.js";
+import { Store, toStored, toWire, type MsgRow, type SessionRow } from "./store.js";
 
 export type DaemonOpts = {
   socket: string;
@@ -78,6 +79,25 @@ function limitParam(p: Params, def: number, max: number): number {
   return Math.min(v, max);
 }
 
+function integerParam(p: Params, key: string, required = false): number | undefined {
+  const value = p[key];
+  if (value === undefined || value === null) {
+    if (required) throw new AsenqError("bad_request", `missing "${key}"`);
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new AsenqError("bad_request", `"${key}" must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function readScope(p: Params): ReadScope {
+  const scope = str(p, "scope", true);
+  if (scope === "session") return { scope, sessionId: str(p, "sessionId", true) };
+  if (scope === "channel") return { scope, channel: str(p, "channel", true) };
+  throw new AsenqError("bad_request", 'scope must be "session" or "channel"');
+}
+
 const newId = (prefix: string): string => prefix + randomBytes(6).toString("hex");
 
 export class Daemon {
@@ -108,7 +128,9 @@ export class Daemon {
     this.graceMs = opts.graceMs ?? GRACE_MS;
     this.startedAt = this.now();
     // Adapters get the grace window to reconnect after a daemon restart; Claude rows are probed instead.
-    opts.db.run("UPDATE sessions SET state='gone', gone_at=? WHERE harness!='claude' AND state='live'", this.startedAt);
+    for (const row of this.store.db.all<SessionRow>(
+      "SELECT * FROM sessions WHERE harness!='claude' AND state='live'",
+    )) this.markGone(row);
   }
 
   private log(line: string): void {
@@ -262,6 +284,8 @@ export class Daemon {
         if (!INBOUND.includes(mode)) throw new AsenqError("bad_request", "mode must be accept, hold or refuse");
         const row = this.mustSession(str(p, "name", true));
         this.store.db.run("UPDATE sessions SET inbound=? WHERE id=?", mode, row.id);
+        this.store.setIdentityInbound(row.id, mode);
+        this.emitSession("updated", { ...row, inbound: mode });
         return {};
       }
       case "send":
@@ -274,15 +298,33 @@ export class Daemon {
         else if (ack.ok && this.store.msg(msgId)?.status === "queued") this.setStatus(msgId, "delivered");
         return {};
       }
+      case "sync":
+        this.requireHuman(this.sender(c, p), "synchronize human state");
+        return this.opSync(c);
+      case "replay":
+        this.requireHuman(this.sender(c, p), "replay human state");
+        return this.opReplay(p);
+      case "history_page":
+        this.requireHuman(this.sender(c, p), "read retained history");
+        return this.opHistoryPage(p);
+      case "read_state":
+        this.requireHuman(this.sender(c, p), "read human markers");
+        return this.opReadState(p);
+      case "mark_read":
+        this.requireHuman(this.sender(c, p), "mark human streams read");
+        return this.opMarkRead(p);
+      case "mark_unread":
+        this.requireHuman(this.sender(c, p), "mark human streams unread");
+        return this.opMarkUnread(p);
       case "inbox": {
         const s = this.sender(c, p);
         const limit = limitParam(p, 20, 200);
         const rows = s.kind === "agent" && str(p, "name") !== "human"
           ? this.store.db.all<MsgRow>(
-            "SELECT * FROM (SELECT *, rowid AS r FROM messages WHERE to_session=? AND status IN ('delivered','queued') ORDER BY created_at DESC, r DESC LIMIT ?) ORDER BY created_at, r",
+            "SELECT * FROM (SELECT * FROM messages WHERE to_session=? AND status IN ('delivered','queued') ORDER BY ord DESC LIMIT ?) ORDER BY ord",
             s.session.id, limit)
           : this.store.db.all<MsgRow>(
-            "SELECT * FROM (SELECT *, rowid AS r FROM messages WHERE to_name='human' AND channel IS NULL ORDER BY created_at DESC, r DESC LIMIT ?) ORDER BY created_at, r",
+            "SELECT * FROM (SELECT * FROM messages WHERE to_name='human' AND channel IS NULL ORDER BY ord DESC LIMIT ?) ORDER BY ord",
             limit);
         return { messages: rows.map((r) => ({ ...toWire(r), status: r.status })) };
       }
@@ -300,20 +342,17 @@ export class Daemon {
       case "channel_read": {
         const channel = str(p, "channel", true);
         const rows = this.store.db.all<MsgRow>(
-          "SELECT * FROM (SELECT *, rowid AS r FROM messages WHERE channel=? ORDER BY created_at DESC, r DESC LIMIT ?) ORDER BY created_at, r",
+          "SELECT * FROM (SELECT * FROM messages WHERE channel=? ORDER BY ord DESC LIMIT ?) ORDER BY ord",
           channel, limitParam(p, 20, 100));
         return { messages: rows.map(toWire) };
       }
       case "channel_list":
-        return {
-          channels: this.store.db.all(
-            "SELECT channel AS name, count(*) AS count, max(created_at) AS lastAt FROM messages WHERE channel IS NOT NULL GROUP BY channel ORDER BY lastAt DESC"),
-        };
+        return { channels: this.store.channelSummaries() };
       case "held": {
         const name = str(p, "name");
         const rows = name
-          ? this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' AND to_name=? ORDER BY created_at", name)
-          : this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' ORDER BY created_at");
+          ? this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' AND to_name=? ORDER BY ord", name)
+          : this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' ORDER BY ord");
         return { messages: rows.map((r) => ({ ...toWire(r), status: r.status })) };
       }
       case "release": {
@@ -338,6 +377,130 @@ export class Daemon {
     }
   }
 
+  private validateReadScope(scope: ReadScope): void {
+    if (scope.scope === "session") {
+      if (!this.store.identity(scope.sessionId)) {
+        throw new AsenqError("no_session", `no retained session ${scope.sessionId}`);
+      }
+      return;
+    }
+    if (!NAME_RE.test(scope.channel)) {
+      throw new AsenqError("invalid_name", `invalid channel name "${scope.channel}"`);
+    }
+    const exists = this.store.db.get<{ one: number }>(
+      `SELECT 1 AS one FROM messages WHERE channel=?
+       UNION ALL SELECT 1 AS one FROM human_read_positions WHERE scope='channel' AND stream_key=? LIMIT 1`,
+      scope.channel, scope.channel,
+    );
+    if (!exists) throw new AsenqError("bad_request", `no retained channel ${scope.channel}`);
+  }
+
+  private opSync(c: Conn): Result {
+    c.tail = true;
+    const sessions = this.store.identities();
+    const channels = this.store.channelSummaries();
+    for (const session of sessions) this.store.ensureRead({ scope: "session", sessionId: session.id });
+    for (const channel of channels) this.store.ensureRead({ scope: "channel", channel: channel.name });
+    return {
+      watermark: this.store.eventWatermark(),
+      eventFloor: this.store.eventFloor(),
+      sessions,
+      channels,
+      readStates: this.store.readStates(),
+    };
+  }
+
+  private opReplay(p: Params): Result {
+    const position = integerParam(p, "position", true)!;
+    const limit = limitParam(p, 500, 1000);
+    const eventFloor = this.store.eventFloor();
+    const watermark = this.store.eventWatermark();
+    const rows = this.store.eventsAfter(Math.max(position, eventFloor), limit + 1);
+    return {
+      events: rows.slice(0, limit),
+      gap: position < eventFloor,
+      hasMore: rows.length > limit,
+      eventFloor,
+      watermark,
+    };
+  }
+
+  private opHistoryPage(p: Params): Result {
+    const scope = str(p, "scope", true) as HistoryPageRequest["scope"];
+    const before = integerParam(p, "before") ?? Number.MAX_SAFE_INTEGER;
+    const limit = limitParam(p, 50, 200);
+    let rows: MsgRow[];
+    if (scope === "session") {
+      const sessionId = str(p, "sessionId", true);
+      if (!this.store.identity(sessionId)) throw new AsenqError("no_session", `no retained session ${sessionId}`);
+      rows = this.store.db.all<MsgRow>(
+        `SELECT * FROM messages WHERE channel IS NULL AND ord<?
+         AND (from_session=? OR to_session=?) ORDER BY ord DESC LIMIT ?`,
+        before, sessionId, sessionId, limit + 1,
+      );
+    } else if (scope === "inbox") {
+      rows = this.store.db.all<MsgRow>(
+        "SELECT * FROM messages WHERE channel IS NULL AND to_name='human' AND ord<? ORDER BY ord DESC LIMIT ?",
+        before, limit + 1,
+      );
+    } else if (scope === "channel") {
+      const channel = str(p, "channel", true);
+      if (!NAME_RE.test(channel)) throw new AsenqError("invalid_name", `invalid channel name "${channel}"`);
+      rows = this.store.db.all<MsgRow>(
+        "SELECT * FROM messages WHERE channel=? AND ord<? ORDER BY ord DESC LIMIT ?",
+        channel, before, limit + 1,
+      );
+    } else {
+      throw new AsenqError("bad_request", 'scope must be "session", "inbox" or "channel"');
+    }
+    const hasMore = rows.length > limit;
+    if (hasMore) rows.length = limit;
+    rows.reverse();
+    return { messages: rows.map(toStored), hasMore };
+  }
+
+  private opReadState(p: Params): Result {
+    if (p.scope === undefined || p.scope === null) return { states: this.store.readStates() };
+    const scope = readScope(p);
+    this.validateReadScope(scope);
+    return { state: this.store.ensureRead(scope) };
+  }
+
+  private opMarkRead(p: Params): ReadMutationResult {
+    const scope = readScope(p);
+    this.validateReadScope(scope);
+    const through = integerParam(p, "through", true)!;
+    const expectedVersion = integerParam(p, "expectedVersion", true)!;
+    const current = this.store.ensureRead(scope);
+    if (current.version !== expectedVersion) return { applied: false, state: current };
+    if (through !== 0 && !this.store.isEligible(scope, through)) {
+      throw new AsenqError("bad_request", `"through" is not an eligible retained message in this stream`);
+    }
+    const position = Math.max(current.position, through);
+    const reminder = current.reminder !== null && current.reminder <= through ? null : current.reminder;
+    if (position === current.position && reminder === current.reminder) return { applied: true, state: current };
+    this.store.updateRead(scope, position, reminder, current.version + 1);
+    const state = this.store.ensureRead(scope);
+    this.emit({ type: "read", state });
+    return { applied: true, state };
+  }
+
+  private opMarkUnread(p: Params): ReadMutationResult {
+    const scope = readScope(p);
+    this.validateReadScope(scope);
+    const expectedVersion = integerParam(p, "expectedVersion");
+    const current = this.store.ensureRead(scope);
+    if (expectedVersion !== undefined && current.version !== expectedVersion) {
+      return { applied: false, state: current };
+    }
+    const reminder = this.store.latestEligible(scope) || null;
+    if (reminder === current.reminder) return { applied: true, state: current };
+    this.store.updateRead(scope, current.position, reminder, current.version + 1);
+    const state = this.store.ensureRead(scope);
+    this.emit({ type: "read", state });
+    return { applied: true, state };
+  }
+
   private mustSession(name: string): SessionRow {
     const row = this.store.sessionByName(name);
     if (!row) throw this.unknownTarget(name);
@@ -358,13 +521,30 @@ export class Daemon {
 
   // ---------------------------------------------------------------- sessions
 
-  private emit(event: TailEvent): void {
-    const push: Push = { push: "event", event };
+  private publish(positioned: PositionedEvent): void {
+    const push: Push = { push: "event", ...positioned };
     for (const c of this.conns) if (c.tail) c.write(push);
   }
 
-  private emitSession(action: "registered" | "renamed" | "gone" | "removed", r: SessionRow, oldName?: string): void {
-    this.emit({ type: "session", action, name: r.name, harness: r.harness, ...(r.cwd ? { cwd: r.cwd } : {}), ...(oldName ? { oldName } : {}) });
+  private emit(event: TailEvent): void {
+    this.publish(this.store.appendEvent(event, this.now()));
+  }
+
+  private emitSession(
+    action: "registered" | "renamed" | "gone" | "removed" | "updated",
+    row: SessionRow,
+    oldName?: string,
+  ): void {
+    const session = this.store.identity(row.id) ?? this.store.syncIdentity(row);
+    this.emit({
+      type: "session",
+      action,
+      name: session.name,
+      harness: session.harness,
+      ...(session.cwd ? { cwd: session.cwd } : {}),
+      ...(oldName ? { oldName } : {}),
+      session,
+    });
   }
 
   /**
@@ -377,7 +557,9 @@ export class Daemon {
     if (existing) {
       this.store.db.run("UPDATE sessions SET state='live', gone_at=NULL, cwd=COALESCE(?, cwd) WHERE id=?", cwd ?? null, existing.id);
       const row = this.store.session(existing.id)!;
+      this.store.syncIdentity(row);
       if (existing.state !== "live") this.emitSession("registered", row);
+      else if (cwd !== undefined && cwd !== existing.cwd) this.emitSession("updated", row);
       return row;
     }
     let base = slug(name ?? "");
@@ -388,6 +570,7 @@ export class Daemon {
     if (holder && holder.state === "gone" && holder.harness === harness && (holder.cwd ?? null) === (cwd ?? null)) {
       this.store.db.run("UPDATE sessions SET key=?, state='live', gone_at=NULL WHERE id=?", key, holder.id);
       const row = this.store.session(holder.id)!;
+      this.store.syncIdentity(row);
       this.emitSession("registered", row);
       return row;
     }
@@ -401,6 +584,7 @@ export class Daemon {
       "INSERT INTO sessions(id,harness,key,name,cwd,state,created_at) VALUES(?,?,?,?,?,'live',?)",
       id, harness, key, chosen, cwd ?? null, now);
     const row = this.store.session(id)!;
+    this.store.syncIdentity(row);
     this.emitSession("registered", row);
     return row;
   }
@@ -419,15 +603,19 @@ export class Daemon {
   }
 
   private markGone(row: SessionRow): void {
-    this.store.db.run("UPDATE sessions SET state='gone', gone_at=? WHERE id=?", this.now(), row.id);
+    const goneAt = this.now();
+    this.store.db.run("UPDATE sessions SET state='gone', gone_at=? WHERE id=?", goneAt, row.id);
+    const gone = { ...row, state: "gone" as const, gone_at: goneAt };
+    this.store.syncIdentity(gone);
     this.delivery.delete(row.id);
-    this.emitSession("gone", row);
+    this.emitSession("gone", gone);
   }
 
   /** Deletes the session and expires everything still waiting for it. */
   private removeSession(row: SessionRow, reason: string): void {
     const pending = this.store.db.all<MsgRow>(
-      "SELECT * FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY created_at", row.id);
+      "SELECT * FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY ord", row.id);
+    this.store.setIdentityState(row.id, "removed", this.now());
     this.store.db.run("DELETE FROM sessions WHERE id=?", row.id);
     this.delivery.delete(row.id);
     this.lastSeen.delete(row.id);
@@ -458,6 +646,7 @@ export class Daemon {
     if (name === target.name) return { name };
     if (this.store.sessionByName(name)) throw new AsenqError("name_taken", `name "${name}" is taken`);
     this.store.db.run("UPDATE sessions SET name=? WHERE id=?", name, target.id);
+    this.store.renameIdentity(target.id, target.name, name);
     this.emitSession("renamed", { ...target, name }, target.name);
     return { name };
   }
@@ -542,7 +731,7 @@ export class Daemon {
         this.log(`peer_message_status ${String(frame.msg_id)} ${String(frame.status)} ${String(frame.reason ?? "")}`);
         if (row) {
           this.emit({
-            type: "message", msg: toWire(row), status: String(frame.status) as MsgStatus,
+            type: "message", msg: toStored(row), status: String(frame.status) as MsgStatus,
             ...(frame.reason ? { reason: String(frame.reason) } : {}),
           });
         }
@@ -567,19 +756,31 @@ export class Daemon {
   }
 
   async send(s: Sender, p: Params): Promise<SendResult[]> {
-    const to = str(p, "to", true);
+    const targetSessionId = str(p, "toSessionId");
+    let to = str(p, "to");
     const text = str(p, "text", true);
     if (text.length === 0) throw new AsenqError("bad_request", "text is empty");
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);
     const kind = str(p, "kind") as Kind | undefined;
     if (kind !== undefined && !KINDS.includes(kind)) throw new AsenqError("bad_request", `kind must be one of ${KINDS.join(", ")}`);
     if (p.done !== undefined && typeof p.done !== "boolean") throw new AsenqError("bad_request", '"done" must be a boolean');
+    let stableTarget: SessionRow | undefined;
+    if (targetSessionId !== undefined) {
+      this.requireHuman(s, "send by stable session identity");
+      stableTarget = this.store.session(targetSessionId);
+      if (!stableTarget) throw new AsenqError("unknown_target", `session ${targetSessionId} is removed or unknown`);
+      if (to !== undefined && to !== stableTarget.name) {
+        throw new AsenqError("unknown_target", `session ${targetSessionId} is now named ${stableTarget.name}, not ${to}`);
+      }
+      to = stableTarget.name;
+    }
+    if (to === undefined) throw new AsenqError("bad_request", 'missing "to"');
     const now = this.now();
     const base: MsgRow = {
       id: "", from_name: this.senderName(s), from_session: s.kind === "agent" ? s.session.id : null,
       to_name: "", to_session: null, channel: null, text, kind: kind ?? null, thread: str(p, "thread") ?? null,
       reply_to: str(p, "replyTo") ?? null, done: p.done === true ? 1 : 0, status: "queued", reason: null, attempts: 0,
-      created_at: now, updated_at: now,
+      created_at: now, updated_at: now, ord: 0,
     };
     if (to === "human") {
       const row = { ...base, id: newId("m_"), to_name: "human", status: "posted" as const };
@@ -587,7 +788,9 @@ export class Daemon {
       return [{ to, msgId: row.id, status: "posted" }];
     }
     let targets: SessionRow[];
-    if (to === "*") {
+    if (stableTarget) {
+      targets = [stableTarget];
+    } else if (to === "*") {
       const self = s.kind === "agent" ? s.session.id : undefined;
       targets = this.store.live().filter((r) => r.id !== self);
     } else {
@@ -628,15 +831,41 @@ export class Daemon {
   }
 
   private insert(row: MsgRow): void {
-    this.store.insertMsg(row);
-    this.emit({ type: "message", msg: toWire(row), status: row.status, ...(row.reason ? { reason: row.reason } : {}) });
+    const positioned = this.store.transaction(() => {
+      this.store.insertMsg(row);
+      const event: TailEvent = {
+        type: "message",
+        msg: toStored(row),
+        status: row.status,
+        ...(row.reason ? { reason: row.reason } : {}),
+      };
+      return this.store.appendEvent(event, this.now());
+    });
+    this.publish(positioned);
+    let scope: ReadScope | undefined;
+    if (row.channel && row.from_name !== "human") scope = { scope: "channel", channel: row.channel };
+    else if (!row.channel && row.to_name === "human" && row.from_session && this.store.identity(row.from_session)) {
+      scope = { scope: "session", sessionId: row.from_session };
+    }
+    if (scope) this.emit({ type: "read", state: this.store.ensureRead(scope) });
   }
 
   private setStatus(msgId: string, status: MsgStatus, reason?: string): void {
-    this.store.db.run("UPDATE messages SET status=?, reason=?, updated_at=? WHERE id=?", status, reason ?? null, this.now(), msgId);
-    const row = this.store.msg(msgId);
-    if (!row) return;
-    this.emit({ type: "message", msg: toWire(row), status, ...(reason ? { reason } : {}) });
+    const positioned = this.store.transaction(() => {
+      this.store.db.run("UPDATE messages SET status=?, reason=?, updated_at=? WHERE id=?", status, reason ?? null, this.now(), msgId);
+      const row = this.store.msg(msgId);
+      if (!row) return undefined;
+      const event: TailEvent = {
+        type: "message",
+        msg: toStored(row),
+        status,
+        ...(reason ? { reason } : {}),
+      };
+      return this.store.appendEvent(event, this.now());
+    });
+    if (!positioned) return;
+    this.publish(positioned);
+    const row = this.store.msg(msgId)!;
     if (status === "failed" || status === "expired") this.notifyFailure(row, reason ?? status);
   }
 
@@ -648,7 +877,7 @@ export class Daemon {
     const notice: MsgRow = {
       id: newId("m_"), from_name: "asenq", from_session: null, to_name: sender.name, to_session: sender.id, channel: null,
       text: `Message ${row.id} to ${row.to_name} was not delivered: ${reason}.`, kind: "status", thread: null,
-      reply_to: row.id, done: 0, status: "queued", reason: null, attempts: 0, created_at: this.now(), updated_at: this.now(),
+      reply_to: row.id, done: 0, status: "queued", reason: null, attempts: 0, created_at: this.now(), updated_at: this.now(), ord: 0,
     };
     void Promise.resolve(this.routeOne({ kind: "asenq" }, sender, notice)).catch((e) => this.log(`notice failed: ${String(e)}`));
   }
@@ -776,8 +1005,10 @@ export class Daemon {
   }
 
   prune(): void {
-    const cutoff: Param = this.now() - (this.opts.historyDays ?? 7) * 86_400_000;
+    const cutoff = this.now() - (this.opts.historyDays ?? 7) * 86_400_000;
     this.store.db.run("DELETE FROM messages WHERE created_at<? AND status NOT IN ('queued','held')", cutoff);
+    this.store.pruneEvents(cutoff);
+    for (const state of this.store.reconcileReads()) this.emit({ type: "read", state });
   }
 
   private opChannelSend(s: Sender, p: Params): Result {
@@ -790,7 +1021,7 @@ export class Daemon {
     const row: MsgRow = {
       id: newId("m_"), from_name: this.senderName(s), from_session: s.kind === "agent" ? s.session.id : null,
       to_name: "#" + channel, to_session: null, channel, text, kind: null, thread: null, reply_to: null, done: 0,
-      status: "posted", reason: null, attempts: 0, created_at: now, updated_at: now,
+      status: "posted", reason: null, attempts: 0, created_at: now, updated_at: now, ord: 0,
     };
     this.insert(row);
     return { msgId: row.id };
@@ -807,11 +1038,11 @@ export class Daemon {
       rows = [row];
     } else if (name) {
       rows = this.store.db.all<MsgRow>(
-        "SELECT * FROM (SELECT *, rowid AS r FROM messages WHERE from_name=? OR to_name=? ORDER BY created_at DESC, r DESC LIMIT ?) ORDER BY created_at, r",
+        "SELECT * FROM (SELECT * FROM messages WHERE from_name=? OR to_name=? ORDER BY ord DESC LIMIT ?) ORDER BY ord",
         name, name, limit);
     } else {
       rows = this.store.db.all<MsgRow>(
-        "SELECT * FROM (SELECT *, rowid AS r FROM messages ORDER BY created_at DESC, r DESC LIMIT ?) ORDER BY created_at, r", limit);
+        "SELECT * FROM (SELECT * FROM messages ORDER BY ord DESC LIMIT ?) ORDER BY ord", limit);
     }
     return { messages: rows.map((r) => ({ ...toWire(r), status: r.status, ...(r.reason ? { reason: r.reason } : {}) })) };
   }
