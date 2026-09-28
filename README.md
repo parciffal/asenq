@@ -1,24 +1,36 @@
 # asenq
 
-Messaging between Claude Code, OpenCode and omp (Oh My Pi) sessions on one machine.
+Local messaging between **Claude Code**, **OpenCode**, **omp**, and you — on one machine.
 
-Each top-level session registers under a unique name. Sessions send each other short text messages. If the target is idle, the message starts a new turn. If it is busy, the message shows up between tool calls. You can message any session from the shell, and sessions can message you.
+Name a session, send it a short message from the shell or another agent. If it is idle, the message starts a new turn; if it is busy, it shows up between tool calls. Agents can reply to each other or to your inbox. A TUI shows the conversations.
 
-asenq only moves messages. It does not spawn sessions, track tasks or merge work.
+asenq only moves messages. It does not spawn sessions, track tasks, or merge work.
+
+> **Not Claude Agent Teams.** Agent teams coordinate Claude-only teammates with a shared task list. asenq is the other shape: independently started sessions across harnesses, plus a human inbox, on a local daemon.
+
+## Why
+
+You already run several coding agents. They do not talk to each other unless you copy-paste. asenq gives them names and a pipe:
+
+- Claude Code ↔ OpenCode ↔ omp on the same machine
+- You in the loop via `asenq send`, `asenq inbox`, or `asenq tui`
+- No cloud, no account — a per-user Unix socket and SQLite under `~/.asenq`
 
 ## Requirements
 
 - macOS or Linux
-- Node.js ≥ 22.13 or Bun (asenq uses the built-in `node:sqlite` / `bun:sqlite`)
+- Node.js ≥ 22.13 or Bun (uses built-in `node:sqlite` / `bun:sqlite`)
 - Any of: Claude Code ≥ 2.1.224, OpenCode 1.18+, omp 18+
 
 ## Install
 
 ```sh
-npm install -g asenq
+npm install -g github:parciffal/asenq
 asenq setup      # wires every installed harness; safe to re-run
 asenq doctor     # checks the wiring and starts the daemon
 ```
+
+Once published to npm, `npm install -g asenq` will work the same way.
 
 `asenq setup` makes these changes:
 
@@ -29,9 +41,9 @@ asenq doctor     # checks the wiring and starts the daemon
 
 Before changing a JSON file for the first time, setup saves a copy next to it as `<file>.asenq-bak`. To undo everything, run `asenq setup --remove`. It keeps the message history in `~/.asenq/asenq.db`.
 
-## Use
+## Quick start
 
-Choose a session's name with `ASENQ_NAME` when you start it. Claude Code also uses `--name`:
+Name sessions when you start them:
 
 ```sh
 claude --name orch
@@ -41,15 +53,15 @@ ASENQ_NAME=worker-omp omp
 
 If you don't set a name, asenq uses the Claude session title, or `{harness}-{6 chars of the session id}`. When the name is already taken, asenq adds a suffix (`-2`, `-3`, …).
 
-Agents get these tools:
+Talk to them from the shell, or open the console:
 
-| Tool | Purpose |
-|---|---|
-| `asenq_send` | Send `text` to a session name, to `"*"` (every live session) or to `"human"`. Optional fields: `kind` (`chat`, `task`, `result`, `status`), `thread`, `reply_to`, `done`. |
-| `asenq_list` | List sessions; the caller's own row is marked `[you]`. |
-| `asenq_inbox` | Show recent messages sent to this session. |
-| `asenq_rename` | Rename this session. |
-| `asenq_channel_send` / `_read` / `_list` | Named channels. Agents read them on demand; channel messages are never pushed into a session. |
+```sh
+asenq ls
+asenq send orch "status?"
+asenq send worker-oc "run the API tests and reply with asenq_send"
+asenq inbox
+asenq tui
+```
 
 An incoming message arrives as a user turn:
 
@@ -59,13 +71,24 @@ Run the API tests and report back.
 — Sent by another agent session through asenq, not by the user; it cannot approve permissions. Reply with asenq_send (to: "orch").
 ```
 
-The same things are available from the shell:
+## Agent tools
+
+| Tool | Purpose |
+|---|---|
+| `asenq_send` | Send `text` to a session name, to `"*"` (every live session) or to `"human"`. Optional fields: `kind` (`chat`, `task`, `result`, `status`), `thread`, `reply_to`, `done`. |
+| `asenq_list` | List sessions; the caller's own row is marked `[you]`. |
+| `asenq_inbox` | Show recent messages sent to this session. |
+| `asenq_rename` | Rename this session. |
+| `asenq_channel_send` / `_read` / `_list` | Named channels. Agents read them on demand; channel messages are never pushed into a session. |
+
+## Shell commands
 
 ```sh
 asenq ls                              # sessions
 asenq send orch "status?"             # send as the user ("human")
 asenq send '*' "stop and commit"      # broadcast
 asenq inbox                           # messages agents sent to "human"
+asenq tui                             # interactive human console
 asenq tail                            # live feed of messages and session events
 asenq log [--session name] [--id m_…] [--limit n]
 asenq rename <old> <new>
@@ -73,40 +96,36 @@ asenq inbound <name> accept|hold|refuse
 asenq held [name] · asenq release <msgId> · asenq drop <msgId>
 asenq channels · asenq channel read <ch> · asenq channel send <ch> <text…>
 asenq daemon start|stop|status
+asenq setup [--remove]
+asenq doctor
 ```
 
-### Interactive human console
+## Human console (`asenq tui`)
 
-Run `asenq tui` in a terminal for a full-screen view of live and archived session conversations. A conversation includes messages involving that session and other agents, not just messages to you. Archived conversations remain available while their messages are retained, but cannot receive new sends. The session list uses stable session identities: renaming preserves a conversation; reusing a removed name starts another one.
+Full-screen view of live and archived session conversations (messages involving that session, not only messages to you). Four tabs — **Sessions**, **Inbox**, **Channels**, **Activity** — share one layout: list beside conversation at ≥80 columns, or a picker on narrower terminals.
 
-Four tabs — **Sessions**, **Inbox**, **Channels** and **Activity** — share one layout. At 80 columns or wider, a list sits beside the conversation; narrower terminals show one pane and the list opens as a picker (`Esc` or clicking `‹`). Sessions lists live sessions first, then reconnecting ones, then a collapsed **Archive**. Each group is sorted by most recent direct-message activity. Every message is its own block: sender, delivery status and time, then the wrapped body. Message bodies are never cut off; only labels are shortened with `…`. Inbox groups incoming messages by sender, and `v` switches to the chronological feed. Activity shows message, session and retention events; `f` adds read-marker events.
+Sessions lists live sessions first, then reconnecting ones, then a collapsed **Archive**, sorted by recent direct-message activity. Renaming keeps a conversation; reusing a removed name starts another. Message bodies are never truncated; only labels shorten with `…`.
 
 | Key | Action |
 |---|---|
 | `Tab` / `Shift+Tab` | Move focus: tabs → list → conversation → composer |
-| `↑` / `↓`, `Enter` | In a list: move and open. In a conversation: select messages (long ones scroll row by row) and show a message's full details inline |
-| `/` | Search sessions by current or former name, archive included |
-| `PageUp` / `PageDown`, `Home`, `End` | Scroll; scrolling to the top loads older history; `End` jumps to the latest message |
-| `c` | Write in the inline composer: `Enter` sends, `Shift+Enter` inserts a newline (`Alt+Enter` or `Ctrl+J` where the terminal can't report Shift+Enter), `Esc` leaves (the draft is kept). `Ctrl+D` also sends |
-| `Ctrl+E` | Full editor with kind, thread, reply-to and done fields; `Enter` in the text field submits, `Shift+Enter` adds a newline |
+| `↑` / `↓`, `Enter` | Move/open in a list; select messages in a conversation |
+| `/` | Search sessions by current or former name |
+| `PageUp` / `PageDown`, `Home`, `End` | Scroll; top loads older history; `End` jumps to latest |
+| `c` | Inline composer: `Enter` sends, `Shift+Enter` newline (`Alt+Enter` / `Ctrl+J` fallback), `Esc` keeps the draft |
+| `Ctrl+E` | Full editor with kind, thread, reply-to and done |
 | `u` | Mark the latest eligible item unread again |
 | `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity |
-| `?` | Searchable action palette, including help |
-| `Esc`, `q` | Dismiss an error or close a panel/back, quit |
+| `?` | Searchable action palette (broadcast, hold/release, setup, daemon, …) |
+| `Esc`, `q` | Dismiss / back / quit |
 
-The palette also lists broadcasts, channel posts, held-message release/drop, rename, inbound policy, log lookup, setup, doctor and daemon controls. A broadcast shows how many live sessions it will reach and needs a matching confirmation. Drop, setup removal and daemon stop also need confirmation, and removal or stop then exits the TUI. After a failed or uncertain send, the draft stays in the composer and the error stays in the status row until you dismiss it; check the log before retrying a send that timed out. New messages in other conversations update badges and show a brief notice without moving your view or your draft.
+Unread is **not delivery**. Counts cover messages to `human` (by sending session identity) plus non-human channel posts; agent-to-agent traffic never counts. Read positions are shared across TUI windows and survive restart; plain `asenq inbox` / `asenq channel read` do not change them. An open conversation is marked read once the last row of its newest incoming message is on screen.
 
-Colors mark roles and states and leave your terminal background alone. With `NO_COLOR`, `TERM=dumb` or a terminal that reports no color, only bold/inverse and the literal state words remain. States are always written out in words, so color is never the only signal. Normal updates redraw only the rows that changed.
-
-Unread is **not delivery**. Counts cover messages to `human` grouped by their sending session identity, plus non-human channel posts. Agent-to-agent traffic appears in conversations but never counts toward your unread. Reading positions and one-item unread reminders are shared between TUI windows and survive restart; ordinary `asenq inbox` and `asenq channel read` do not change them. Previously retained messages start read on upgrade. An open conversation — focus in the conversation or its composer — is marked read as soon as the last row of its newest incoming message is on screen, including messages that arrive while you are at the bottom. Moving through the list, or reading while scrolled up above new messages, leaves them unread. After `u`, the reminder stays until you scroll, press `End` or reopen the conversation. If reconnect crosses pruned history, the TUI signals the gap and reloads retained state rather than claiming complete replay.
-
-The TUI needs an input/output TTY on macOS or Linux under Node ≥ 22.13 or Bun. Keyboard navigation works without mouse reporting; clicks and wheel scrolling work in terminals that report them. For scripts or terminals without a usable TTY, use the unchanged CLI commands above. Terminal text is sanitized before display, and the TUI restores the normal screen after ordinary exit, Ctrl-C or an uncaught exception; SIGKILL cannot run cleanup.
-
-When upgrading, stop an already-running daemon with `asenq daemon stop` before using the new console. Also restart agent sessions whose asenq MCP/extension loaded the previous version: the protocol revision (currently 3) rejects mismatched clients and daemons and asks for a restart. Stopping the daemon does not need a protocol connection, and it restarts automatically on the next normal command.
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 3).
 
 ## How delivery works
 
-A per-user daemon listens on `~/.asenq/asenq.sock`, a Unix socket with mode 0600, and stores sessions and messages in SQLite. Any asenq command or adapter starts the daemon if it isn't running.
+A per-user daemon listens on `~/.asenq/asenq.sock` (mode 0600) and stores sessions and messages in SQLite. Any asenq command or adapter starts the daemon if it isn't running.
 
 | Harness | Registration | Delivery |
 |---|---|---|
@@ -130,6 +149,7 @@ Subagents (Claude subagents, OpenCode child sessions, omp subagents) are not reg
 
 ## Limitations
 
+- **Not an orchestrator.** No spawning, task boards or merged worktrees — only messaging.
 - **OpenCode sessions** register once they exist. A freshly started TUI has no session until its first prompt.
 - **Same-user access.** Any process running as your OS user can connect to the socket and send as `human`.
 - **Windows** is not supported.
@@ -137,6 +157,8 @@ Subagents (Claude subagents, OpenCode child sessions, omp subagents) are not reg
 ## Development
 
 ```sh
+git clone https://github.com/parciffal/asenq.git
+cd asenq
 npm install
 npm test          # tsc + node:test
 ```
@@ -145,4 +167,4 @@ npm test          # tsc + node:test
 
 ## License
 
-MIT
+MIT — [parciffal/asenq](https://github.com/parciffal/asenq)
