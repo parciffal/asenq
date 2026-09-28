@@ -16,6 +16,8 @@ You already run several coding agents. They do not talk to each other unless you
 - You in the loop via `asenq send`, `asenq inbox`, or `asenq tui`
 - No cloud, no account — a per-user Unix socket and SQLite under `~/.asenq`
 
+![asenq TUI: Sessions, Inbox, Channels and Activity](assets/asenq-tui.gif)
+
 ## Requirements
 
 - macOS or Linux
