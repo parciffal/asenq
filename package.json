@@ -3,6 +3,23 @@
   "version": "0.1.0",
   "description": "Cross-harness messenger for Claude Code, OpenCode and omp sessions on one machine",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/parciffal/asenq.git"
+  },
+  "homepage": "https://github.com/parciffal/asenq#readme",
+  "bugs": {
+    "url": "https://github.com/parciffal/asenq/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "opencode",
+    "omp",
+    "mcp",
+    "agents",
+    "messaging",
+    "cli"
+  ],
   "type": "module",
   "bin": {
     "asenq": "dist/src/cli.js"
