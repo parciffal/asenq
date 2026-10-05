@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { AsenqClient } from "../src/shared/client.js";
-import type { StoredMessage } from "../src/shared/protocol.js";
+import type { SendResult, StoredMessage } from "../src/shared/protocol.js";
 import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
@@ -783,7 +783,7 @@ test("held bar keeps a sanitized preview and monochrome emphasis without stealin
   const orch = await env.adapter("omp", "held-resize-orch", "orch");
   const worker = await env.adapter("omp", "held-resize-worker", "worker");
   await human.request("set_inbound", { name: "worker", mode: "hold" });
-  const held = await orch.client.request("send", { to: "worker", text: "safe-preview\nsecond-line \u001b[31mred\u001b[0m" });
+  const [held] = (await orch.client.request("send", { to: "worker", text: "safe-preview\nsecond-line \u001b[31mred\u001b[0m" })).results as SendResult[];
   const ui = await startConsole(120, 32);
   await ui.press("/");
   await ui.type("worker");
@@ -837,6 +837,7 @@ test("held chrome does not read a hidden or scrolled-away newest incoming row", 
   assert.equal(await unread(human, worker.session.id), 1, "hidden body and bar do not expose the incoming row");
   ui.size.columns = 120;
   ui.size.rows = 32;
+  await ui.press("u");
   await ui.press("HOME");
   assert.ok(ui.rows().some((row) => row.includes("held-reader-preview")));
   assert.ok(ui.rows().every((row) => !row.includes("latest-incoming-tail")));

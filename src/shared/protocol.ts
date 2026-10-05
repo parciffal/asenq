@@ -39,7 +39,8 @@ export type MsgStatus =
   | "queued" | "delivered" | "held" | "rejected" | "failed"
   | "expired" | "posted" | "dropped";
 
-/** A retained message together with its durable paging order and current delivery state. */
+/** Retained history and held replies include durable order and delivery state.
+ * Scope held actions by session ids; historical from/to names can outlive a rename. */
 export type StoredMessage = WireMsg & {
   order: number;
   fromSessionId?: string;
