@@ -1,6 +1,6 @@
 import type {
   ChannelSummary, ControlAction, Harness, Inbound, InboxSummary, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
-  PingStatus, ReplacementResult, Role, SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
+  PingStatus, ReplacementResult, ResetResult, Role, SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
 } from "../shared/protocol.js";
 import type { Db } from "../shared/sqlite.js";
 
@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   created_at INTEGER NOT NULL, UNIQUE(harness, key));
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
-  channel TEXT, source_channel TEXT, text TEXT NOT NULL, file TEXT, kind TEXT, action TEXT, thread TEXT, reply_to TEXT,
+  channel TEXT, source_channel TEXT, text TEXT NOT NULL, file TEXT, kind TEXT, action TEXT, thread TEXT, reply_to TEXT, reset TEXT, reset_result TEXT,
   done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ord INTEGER, delivery_seq INTEGER);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(to_session, status);
@@ -58,6 +58,7 @@ export type MsgRow = {
   done: number; status: MsgStatus; reason: string | null; attempts: number;
   created_at: number; updated_at: number; ord: number; delivery_seq?: number | null;
   file?: string | null; source_channel?: string | null;
+  reset?: "compact" | null; reset_result?: ResetResult | null;
 };
 
 type IdentityRow = {
@@ -84,6 +85,8 @@ export function toWire(r: MsgRow): WireMsg {
   if (r.thread) m.thread = r.thread;
   if (r.reply_to) m.replyTo = r.reply_to;
   if (r.done) m.done = true;
+  if (r.reset) m.reset = r.reset;
+  if (r.reset_result) m.resetResult = r.reset_result;
   return m;
 }
 
@@ -119,6 +122,10 @@ export class Store {
   constructor(readonly db: Db) {
     db.exec(SCHEMA);
     this.migrateMessageAction();
+    const messageColumns = this.db.all<{ name: string }>("PRAGMA table_info(messages)");
+    for (const name of ["reset", "reset_result"]) {
+      if (!messageColumns.some((column) => column.name === name)) this.db.exec(`ALTER TABLE messages ADD COLUMN ${name} TEXT`);
+    }
     const sessionColumns = this.db.all<{ name: string }>("PRAGMA table_info(sessions)");
     for (const [name, type] of [
       ["claude_transcript_path", "TEXT"], ["claude_source", "TEXT"],
@@ -823,10 +830,10 @@ export class Store {
     row.delivery_seq = row.channel === null && (row.status === "delivered" || row.status === "replied")
       ? this.nextDeliverySequence() : null;
     this.db.run(
-      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,source_channel,text,file,kind,action,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,source_channel,text,file,kind,action,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq,reset,reset_result)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       row.id, row.from_name, row.from_session, row.to_name, row.to_session, row.channel, row.source_channel ?? null, row.text, row.file ?? null, row.kind, row.action ?? null, row.thread, row.reply_to,
-      row.done, row.status, row.reason, row.attempts, row.created_at, row.updated_at, row.ord, row.delivery_seq,
+      row.done, row.status, row.reason, row.attempts, row.created_at, row.updated_at, row.ord, row.delivery_seq, row.reset ?? null, row.reset_result ?? null,
     );
     if (row.channel === null) {
       this.recordDirectActivity(row.from_session, row.created_at);

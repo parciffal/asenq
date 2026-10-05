@@ -1,12 +1,13 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import { AsenqError, type ChannelSummary, type ControlAction, type ListedSession, type ReplacementResult, type Role, type SendResult, type SessionIdentity, type TailEvent } from "../shared/protocol.js";
+import { AsenqError, type ChannelSummary, type ControlAction, type ListedSession, type ReplacementResult, type ResetResult, type Role, type SendResult, type SessionIdentity, type TailEvent } from "../shared/protocol.js";
 import { formatSendResults, formatSessions } from "../shared/tools.js";
 
 type LoggedMsg = {
   id: string; from: string; to: string; text: string; createdAt: number;
   kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; done?: boolean; status: string; reason?: string; sourceChannel?: string;
+  reset?: "compact"; resetResult?: ResetResult;
 };
 
 const out = (s: string): void => void process.stdout.write(s + "\n");
@@ -18,7 +19,7 @@ const oneLine = (s: string, n: number): string => {
 
 function msgLine(m: Omit<LoggedMsg, "status"> & { status?: string; reason?: string }): string {
   const status = m.status ? ` (${m.status}${m.reason ? `: ${m.reason}` : ""})` : "";
-  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.sourceChannel ? ` via #${m.sourceChannel}` : ""}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""}${m.replyToMissing && m.replyTo ? ` reply-to=${m.replyTo} (purged message)` : ""} ${oneLine(m.text, 120)}${status}`;
+  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.sourceChannel ? ` via #${m.sourceChannel}` : ""}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""}${m.reset ? ` reset=${m.reset}` : ""}${m.resetResult ? ` resetResult=${m.resetResult}` : ""}${m.replyToMissing && m.replyTo ? ` reply-to=${m.replyTo} (purged message)` : ""} ${oneLine(m.text, 120)}${status}`;
 }
 
 function need(args: string[], n: number, usage: string): void {
@@ -87,12 +88,12 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
     case "send": {
       const { values, positionals } = parseArgs({
         args: argv, allowPositionals: true,
-        options: { kind: { type: "string" }, action: { type: "string" }, thread: { type: "string" }, "reply-to": { type: "string" }, done: { type: "boolean" } },
+        options: { kind: { type: "string" }, action: { type: "string" }, reset: { type: "string" }, thread: { type: "string" }, "reply-to": { type: "string" }, done: { type: "boolean" } },
       });
       need(positionals, 2, "usage: asenq send <name|*|human> <text…>");
       const r = await client.request("send", {
         to: positionals[0], text: positionals.slice(1).join(" "),
-        kind: values.kind, action: values.action, thread: values.thread, replyTo: values["reply-to"], done: values.done,
+        kind: values.kind, action: values.action, reset: values.reset, thread: values.thread, replyTo: values["reply-to"], done: values.done,
       });
       const results = r.results as SendResult[];
       out(formatSendResults(results));

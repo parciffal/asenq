@@ -41,6 +41,7 @@ export const TOOLS: ToolSpec[] = [
       },
       kind: { type: "string", enum: KINDS, optional: true, description: "Message kind: chat, task, result, status or control" },
       action: { type: "string", enum: CONTROL_ACTIONS, optional: true, description: "Required for kind=control: pause, resume or cancel. Invalid on other kinds; asenq labels and delivers, but does not enforce the action." },
+      reset: { type: "string", enum: ["compact"], optional: true, description: 'Compact the target context before delivering this direct message. Human/orchestrator only; one named session, never "*" or "human". Receipt reports pending or unsupported; history reports resetResult when compaction finishes. Failed/unsupported compaction still delivers the message.' },
       thread: { type: "string", optional: true, description: "Free-form thread label to group related messages" },
       reply_to: { type: "string", optional: true, description: "Id of the message this answers (m_…)" },
       done: { type: "boolean", optional: true, description: "Marks the final message of a task or thread" },
@@ -212,11 +213,11 @@ export function formatSessions(sessions: ListedSession[], filtered = false): str
   ].join("\n")).join("\n\n");
 }
 
-type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; status?: MsgStatus; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; sourceChannel?: string };
+type Msg = WireMsg & { status?: MsgStatus };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
-  return results.map((r) => `${r.to} ${r.msgId ?? "-"} ${r.status}${r.reason ? ` (${r.reason})` : ""}`).join("\n");
+  return results.map((r) => `${r.to} ${r.msgId ?? "-"} ${r.status}${r.reset ? ` reset=${r.reset}` : ""}${r.reason ? ` (${r.reason})` : ""}`).join("\n");
 }
 
 export function formatReplace(result: ReplacementResult): string {
@@ -228,7 +229,7 @@ export function formatReplace(result: ReplacementResult): string {
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
-    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
+    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.status ? ` · status=${m.status}` : ""}${m.reset ? ` · reset=${m.reset}` : ""}${m.resetResult ? ` · resetResult=${m.resetResult}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
     .join("\n\n");
 }
 
@@ -283,7 +284,7 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
     switch (name) {
       case "asenq_send": {
         const r = await client.request("send", {
-          ...who, to: args.to, text: args.text, file: args.file, kind: args.kind, action: args.action, thread: args.thread, replyTo: args.reply_to, done: args.done,
+          ...who, to: args.to, text: args.text, file: args.file, kind: args.kind, action: args.action, reset: args.reset, thread: args.thread, replyTo: args.reply_to, done: args.done,
         });
         return formatSendResults(r.results as SendResult[]);
       }
