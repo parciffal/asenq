@@ -84,6 +84,9 @@ Run the API tests and report back.
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
 | `asenq_rename` | Rename this session. |
 | `asenq_channel_send` / `_read` / `_list` | Named channels. Agents read them on demand; channel messages are never pushed into a session. |
+| `asenq_channel_create` | Create a channel. A new channel created by an orchestrator atomically includes it as the first member; creating an existing channel does not join it. |
+| `asenq_channel_add` / `_remove` / `_members` | Edit or inspect identity-backed rosters. An orchestrator may join an existing channel itself; editing other members requires membership. Reads are unrestricted. |
+| `asenq_set_role` | Set `orchestrator`, `worker` or `unset` on a session sharing a channel with the caller, who must be an orchestrator. |
 
 Control messages are urgent labels, not commands enforced by asenq. `kind: "control"` requires `action: "pause"`, `"resume"` or `"cancel"`; `action` is invalid on other kinds. A text body or file reference is required. Delivery carries `[URGENT]` and the action, but asenq never pauses, resumes or cancels a session, changes its inbound policy, or bypasses hold/refuse, rate limits or queues.
 
@@ -95,9 +98,20 @@ Agents can send the same message with `asenq_send { to: "worker-oc", text: "Paus
 
 ### Human-assigned roles
 
-Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. Only the human can change roles; registered sessions receive `not_permitted` from `set_role`. Roles are informational: they grant no permissions and do not enforce work or change delivery policy.
+Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. The human can edit any role. An orchestrator can use `asenq_set_role` for sessions sharing at least one channel with it; workers and sessions with an unset role receive `not_permitted`. Roles do not enforce work or change delivery policy; the orchestrator role permits scoped roster and role editing.
 
 A role belongs to the session identity, not its name: renaming and reconnecting preserve it, while a different identity reusing the name starts unset. `asenq ls` and `asenq_list` show the role. Every delivered direct-message header tells the recipient its own role (`your-role=worker` or `your-role=orchestrator`); unset roles omit that label. TUI rows use plain `orch` / `wrk` tags, omitted when space is needed for the name, unread count and state; the conversation header also shows the full role. Archived identities retain their role but cannot be targeted by name.
+
+### Channel rosters
+
+Channels have durable names and rosters of session identities. A session may belong to several channels, with any mix of roles. Membership survives rename, temporary disconnection, archival and revival; another identity reusing a name does not inherit it. Late Claude lineage recognition unions provisional memberships into the ancestor, preserves an existing ancestor role or inherits the provisional role when unset, and leaves the ancestor's inbound policy unchanged.
+
+The human can create channels and edit any roster through the CLI or **? → Create channel / Add channel member / Remove channel member** in the TUI. An orchestrator can create a new channel with itself as first member, or add itself to any existing channel; it can edit other members only in channels it belongs to. Workers and unset-role sessions cannot create channels or edit rosters. Adding requires a live target. Removal resolves current names before former names within that roster and refuses ambiguous matches; the human can instead pass `--id` to remove a specific identity, including an archived member. The TUI always removes by identity.
+
+Posting to an unknown channel still creates it, with an empty roster and no automatic membership. Existing post-only channels migrate with empty rosters. Add/remove/member queries require an existing channel. Channel reads remain unrestricted and posts stay on demand: membership alone does not push messages or scope broadcasts. Mention delivery and broadcast scoping are separate changes.
+
+The Channels tab lists each roster under its channel with role and lifecycle state. Selecting a member keeps the channel conversation and composer in channel scope, not a direct message. Purging retained posts keeps the channel; deleting an identity through retention or human close removes its memberships.
+
 
 ### File references
 
@@ -154,6 +168,11 @@ asenq inbound <name> accept|hold|refuse
 asenq role <name> orchestrator|worker|unset
 asenq held [name] · asenq release <msgId> · asenq drop <msgId>
 asenq channels · asenq channel read <ch> · asenq channel send <ch> <text…>
+asenq channel create <ch>
+asenq channel add <ch> <live-name>
+asenq channel remove <ch> <member-name>
+asenq channel remove <ch> --id <session-id>
+asenq channel members <ch>
 asenq daemon start|stop|status
 asenq setup [--remove]
 asenq doctor
