@@ -2,16 +2,16 @@
 // so this module exports only `server`; helpers stay private.
 import { z } from "zod";
 import { AsenqClient } from "../shared/client.js";
-import type { Push } from "../shared/protocol.js";
+import type { Push, ResetResult } from "../shared/protocol.js";
 import { zodShape } from "../shared/schema.js";
 import { callTool, TOOLS } from "../shared/tools.js";
 import type { Hooks, OpencodeEvent, OpencodeMessage, PluginInput, SessionInfo, ToolDefinition } from "./opencode-types.js";
 
-/** Wire compaction outcome. Mirrors the daemon's terminal reset results; the plugin never sends `pending` here. */
-type ResetResult = "compacted" | "unsupported" | "failed";
+/** The deliver variant of the daemon push, which carries the compaction flag for capable connections. */
+type DeliveryPush = Extract<Push, { push: "deliver" }>;
 
-/** A deliver push plus the top-level compaction flag the daemon sets only for capable connections. */
-type DeliveryPush = { push: "deliver"; msg: { id: string }; text: string; session: string; key: string; reset?: "compact" };
+/** Delivery attempt outcome: `ok` mirrors promptAsync acceptance, `reason` is set only on failure. */
+type DeliveryAttempt = { ok: boolean; reason?: string };
 
 type OpencodeModel = { providerID: string; modelID: string };
 
@@ -98,25 +98,23 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
     }
   }
 
+  /** Injects the message, refusing a binding that was deleted or rebound since it was registered. */
+  async function inject(p: DeliveryPush): Promise<DeliveryAttempt> {
+    if (bound.get(p.key)?.id !== p.session) return { ok: false, reason: "session not registered" };
+    try {
+      const result = await sdk.promptAsync({
+        path: { id: p.key },
+        body: { parts: [{ type: "text", text: p.text }] },
+      });
+      return result && !result.error ? { ok: true } : { ok: false, reason: JSON.stringify(result?.error ?? "no result") };
+    } catch (e) {
+      return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
   /** Ordinary unflagged delivery: inject the message, then acknowledge the attempt. */
   async function deliver(p: DeliveryPush): Promise<void> {
-    const b = bound.get(p.key);
-    let ok = false;
-    let reason: string | undefined;
-    if (!b || b.id !== p.session) {
-      reason = "session not registered";
-    } else {
-      try {
-        const result = await sdk.promptAsync({
-          path: { id: p.key },
-          body: { parts: [{ type: "text", text: p.text }] },
-        });
-        ok = !!result && !result.error;
-        if (!ok) reason = JSON.stringify(result?.error ?? "no result");
-      } catch (e) {
-        reason = e instanceof Error ? e.message : String(e);
-      }
-    }
+    const { ok, reason } = await inject(p);
     try {
       await client.request("ack", { as: p.session, msgId: p.msg.id, ok, reason });
     } catch (e) {
@@ -126,28 +124,15 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
 
   /** Flagged delivery: compact the target, then inject, reporting the finished outcome via reset_result. */
   async function deliverCompact(p: DeliveryPush): Promise<void> {
-    const b = bound.get(p.key);
-    let reset: ResetResult;
-    let ok = false;
-    let reason: string | undefined;
-    if (!b || b.id !== p.session) {
-      reset = "failed";
-      reason = "session not registered";
-    } else {
+    let reset: ResetResult = "failed";
+    let attempt: DeliveryAttempt = { ok: false, reason: "session not registered" };
+    if (bound.get(p.key)?.id === p.session) {
       reset = await compact(p.key);
-      try {
-        const result = await sdk.promptAsync({
-          path: { id: p.key },
-          body: { parts: [{ type: "text", text: p.text }] },
-        });
-        ok = !!result && !result.error;
-        if (!ok) reason = JSON.stringify(result?.error ?? "no result");
-      } catch (e) {
-        reason = e instanceof Error ? e.message : String(e);
-      }
+      // summarize can take arbitrarily long, so a stale binding is caught by inject() right before the prompt.
+      attempt = await inject(p);
     }
     try {
-      await client.request("reset_result", { as: p.session, msgId: p.msg.id, reset, ok, reason });
+      await client.request("reset_result", { as: p.session, msgId: p.msg.id, reset, ok: attempt.ok, reason: attempt.reason });
     } catch (e) {
       log("warn", `reset_result ${p.msg.id} failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -163,8 +148,7 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
       return;
     }
     if (p.push !== "deliver") return;
-    // The daemon may attach the compaction flag to a deliver push; the base protocol type does not model it yet.
-    const d = p as DeliveryPush;
+    const d: DeliveryPush = p;
     if (d.reset === "compact") {
       // Receipt is acknowledged before joining the queue: a slow compaction must not delay acceptance.
       // The queued task waits for that ack and gives up if the daemon did not accept the message.

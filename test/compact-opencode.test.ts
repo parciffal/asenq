@@ -28,10 +28,13 @@ type Sdk = {
   calls: string[];
   summarizeCalls: SummarizeCall[];
   prompts: { id: string; text: string }[];
+  /** Messages the plugin sent through the SDK log boundary. */
+  logs: string[];
   setMessages(next: OpencodeMessage[]): void;
   setSummarize(next: ((call: SummarizeCall) => Promise<SummarizeOutcome>) | undefined): void;
   /** Resolves once the named call has happened at least `n` times; the deterministic alternative to polling. */
   callHappened(name: string, n?: number): Promise<void>;
+  logHappened(substring: string): Promise<void>;
 };
 
 /** Records every SDK boundary crossing the plugin makes; `withMethods: false` models an SDK without compaction. */
@@ -41,7 +44,9 @@ function fakeSdk(withMethods = true): Sdk {
   const calls: string[] = [];
   const summarizeCalls: SummarizeCall[] = [];
   const prompts: { id: string; text: string }[] = [];
+  const logs: string[] = [];
   const waiters: { name: string; n: number; resolve: () => void }[] = [];
+  const logWaiters: { substring: string; resolve: () => void }[] = [];
 
   const record = (name: string): void => {
     calls.push(name);
@@ -49,6 +54,16 @@ function fakeSdk(withMethods = true): Sdk {
     for (const w of [...waiters]) {
       if (w.name === name && count >= w.n) {
         waiters.splice(waiters.indexOf(w), 1);
+        w.resolve();
+      }
+    }
+  };
+
+  const recordLog = (message: string): void => {
+    logs.push(message);
+    for (const w of [...logWaiters]) {
+      if (message.includes(w.substring)) {
+        logWaiters.splice(logWaiters.indexOf(w), 1);
         w.resolve();
       }
     }
@@ -77,10 +92,19 @@ function fakeSdk(withMethods = true): Sdk {
   }
 
   return {
-    client: { session, app: { log: async () => ({}) } } as unknown as OpencodeClient,
+    client: {
+      session,
+      app: {
+        async log(o: { body: { message: string } }) {
+          recordLog(o.body.message);
+          return {};
+        },
+      },
+    } as unknown as OpencodeClient,
     calls,
     summarizeCalls,
     prompts,
+    logs,
     setMessages(next) {
       messages = next;
     },
@@ -91,6 +115,12 @@ function fakeSdk(withMethods = true): Sdk {
       if (calls.filter((c) => c === name).length >= n) return Promise.resolve();
       const { promise, resolve } = Promise.withResolvers<void>();
       waiters.push({ name, n, resolve });
+      return promise;
+    },
+    logHappened(substring) {
+      if (logs.some((message) => message.includes(substring))) return Promise.resolve();
+      const { promise, resolve } = Promise.withResolvers<void>();
+      logWaiters.push({ substring, resolve });
       return promise;
     },
   };
@@ -120,13 +150,6 @@ async function send(c: AsenqClient, to: string, text: string, reset?: "compact")
   return result;
 }
 
-async function loggedReset(c: AsenqClient, msgId: string): Promise<string | undefined> {
-  const r = await c.request("log", { msgId });
-  if (!Array.isArray(r.messages) || r.messages.length === 0) return undefined;
-  const [first] = r.messages;
-  return first && typeof first === "object" && "resetResult" in first && typeof first.resetResult === "string" ? first.resetResult : undefined;
-}
-
 function resetResultOf(msg: WireMsg): string | undefined {
   return "resetResult" in msg && typeof msg.resetResult === "string" ? msg.resetResult : undefined;
 }
@@ -136,6 +159,9 @@ const deliveredFor = (text: string) => (e: TailEvent): boolean =>
 
 const queuedFor = (text: string) => (e: TailEvent): boolean =>
   e.type === "message" && e.msg.text === text && e.status === "queued";
+
+const failedFor = (text: string) => (e: TailEvent): boolean =>
+  e.type === "message" && e.msg.text === text && e.status === "failed";
 
 const finishedFor = (text: string, reset: string) => (e: TailEvent): boolean =>
   e.type === "message" && e.msg.text === text && resetResultOf(e.msg) === reset;
@@ -298,18 +324,27 @@ test("does not declare compact without summarize/messages and still delivers", a
   await finished.event;
 });
 
-test("ordinary pushes keep the existing after-delivery acknowledgement", async () => {
+test("does not inject into a session deleted while its compaction is pending", async () => {
   env = await startEnv();
   const sdk = fakeSdk();
+  sdk.setMessages([{ info: { role: "user", model: { providerID: "p", modelID: "m" } } }]);
+  const held = Promise.withResolvers<void>();
+  sdk.setSummarize(() => held.promise.then(() => ({ data: true })));
+
   const h = await startPlugin(sdk);
   const name = await register(env, h, "oc-1");
-  const human = env.human();
 
-  const delivered = await env.watch(deliveredFor("plain"));
-  const result = await send(human, name, "plain");
+  const delivered = await env.watch(deliveredFor("stale task"));
+  const failed = await env.watch(failedFor("stale task"));
+  const result = await send(env.human(), name, "stale task", "compact");
+  assert.equal(result.reset, "pending");
   await delivered.event;
-  assert.equal(sdk.prompts[0]?.text, "plain");
-  assert.equal(result.reset, undefined);
-  assert.ok(result.msgId);
-  assert.equal(await loggedReset(human, result.msgId), undefined, "ordinary messages carry no reset outcome");
+  await sdk.callHappened("summarize");
+
+  // The OpenCode session disappears while summarize is still held; the message must not be injected into it.
+  await h.event?.({ event: { type: "session.deleted", properties: { info: { id: "oc-1" } } } });
+  held.resolve();
+  // The daemon either records the rejected delivery or refuses the completion report from the gone binding.
+  await Promise.race([failed.event, sdk.logHappened("reset_result")]);
+  assert.equal(sdk.prompts.length, 0, "a deleted session must not receive the message");
 });
