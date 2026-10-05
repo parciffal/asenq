@@ -1,14 +1,17 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, CONTROL_ACTIONS, KINDS, type ControlAction, type Role, type SendResult } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ControlAction, type Role, type SendResult, type WireMsg } from "./protocol.js";
+import { renderMessageBody } from "./render.js";
 
 export type ParamSpec = {
-  type: "string" | "integer" | "boolean";
   description: string;
   optional?: boolean;
   enum?: readonly string[];
   min?: number;
   max?: number;
-};
+} & (
+  | { type: "string" | "integer" | "boolean" }
+  | { type: "object"; properties: Record<string, ParamSpec> }
+);
 
 export type ToolSpec = { name: string; label: string; description: string; params: Record<string, ParamSpec> };
 
@@ -19,19 +22,35 @@ export const TOOLS: ToolSpec[] = [
     name: "asenq_send",
     label: "Asenq Send",
     description:
-      "Send a text message to another agent session on this machine (Claude Code, OpenCode or omp) through asenq. " +
+      "Send a message with text, a file reference, or both to another agent session on this machine (Claude Code, OpenCode or omp) through asenq. " +
       "An idle target starts a new turn; a busy target sees it between tool calls. " +
       `${NAMES_HINT} Use "*" to broadcast to every live session, or "human" to reach the user. ` +
+      "Prefer a file reference for anything over ~4,000 characters: use an absolute readable regular-file path and a required summary of at most 500 characters. " +
+      "The daemon records path, summary, byte size and a send-time SHA-256 snapshot, never copies contents; the receiver reads on demand with the same OS user's permissions. " +
+      "Files can change or disappear; use asenq_file_check to compare the current file with the snapshot. " +
       "Control messages carry urgent pause/resume/cancel labels; asenq only delivers them and never changes session state or inbound policy.",
     params: {
       to: { type: "string", description: 'Target session name, "*" for all live sessions, or "human"' },
-      text: { type: "string", description: "Message text" },
+      text: { type: "string", optional: true, description: "Message text; required unless file is present. Prefer a file reference for anything over ~4,000 characters." },
+      file: {
+        type: "object", optional: true, description: "On-demand file reference, not an attachment; contents are never copied.",
+        properties: {
+          path: { type: "string", description: "Absolute path to a readable regular file on this machine, accessible under the same OS user" },
+          summary: { type: "string", description: "Required summary of the file, at most 500 characters" },
+        },
+      },
       kind: { type: "string", enum: KINDS, optional: true, description: "Message kind: chat, task, result, status or control" },
       action: { type: "string", enum: CONTROL_ACTIONS, optional: true, description: "Required for kind=control: pause, resume or cancel. Invalid on other kinds; asenq labels and delivers, but does not enforce the action." },
       thread: { type: "string", optional: true, description: "Free-form thread label to group related messages" },
       reply_to: { type: "string", optional: true, description: "Id of the message this answers (m_…)" },
       done: { type: "boolean", optional: true, description: "Marks the final message of a task or thread" },
     },
+  },
+  {
+    name: "asenq_file_check",
+    label: "Asenq File Check",
+    description: "Compare a direct message's referenced file with its send-time SHA-256 snapshot. Returns match, changed or missing. Only the retained message's sender or recipient may check it. A match is not a lock: the file can change before or during your read.",
+    params: { id: { type: "string", description: "Id of a retained direct message carrying a file reference (m_…)" } },
   },
   {
     name: "asenq_list",
@@ -94,7 +113,7 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
-type Msg = { id: string; from: string; to: string; text: string; createdAt: number; kind?: string; action?: ControlAction; thread?: string };
+type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; kind?: string; action?: ControlAction; thread?: string };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
@@ -104,7 +123,7 @@ export function formatSendResults(results: SendResult[]): string {
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
-    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}\n${m.text}`)
+    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}\n${renderMessageBody(m)}`)
     .join("\n\n");
 }
 
@@ -131,7 +150,8 @@ function formatInbox(msgs: Msg[], hasMore: boolean, advancing: boolean): string 
           + (m.thread ? " Or use asenq_thread_read with this message's thread." : "");
         const marker = `\n\n[truncated message ${m.id}; more available. ${recovery}]`;
         const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}\n`;
-        const visible = text.length - m.text.length < 16_000 - marker.length ? text : header + m.text;
+        const body = renderMessageBody(m);
+        const visible = text.length - body.length < 16_000 - marker.length ? text : header + body;
         let end = Math.min(visible.length, 16_000 - marker.length);
         if (end > 0 && visible.charCodeAt(end - 1) >= 0xD800 && visible.charCodeAt(end - 1) <= 0xDBFF
           && visible.charCodeAt(end) >= 0xDC00 && visible.charCodeAt(end) <= 0xDFFF) end--;
@@ -158,9 +178,13 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
     switch (name) {
       case "asenq_send": {
         const r = await client.request("send", {
-          ...who, to: args.to, text: args.text, kind: args.kind, action: args.action, thread: args.thread, replyTo: args.reply_to, done: args.done,
+          ...who, to: args.to, text: args.text, file: args.file, kind: args.kind, action: args.action, thread: args.thread, replyTo: args.reply_to, done: args.done,
         });
         return formatSendResults(r.results as SendResult[]);
+      }
+      case "asenq_file_check": {
+        const r = await client.request("file_check", { ...who, msgId: args.id });
+        return String(r.status);
       }
       case "asenq_list": {
         const r = await client.request("list", who);

@@ -5,6 +5,7 @@ import type {
   ChannelSummary, HistoryScope, InboxSummary, PositionedEvent, ReadScope, ReadState, SendResult,
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
+import { renderMessageBody } from "../shared/render.js";
 import {
   activitySpans, clipSpans, editorLayout, ellipsize, formatTime, harnessShortName, isImportantEvent, justify, layoutTranscript,
   maxTop, padSpans, paneWidths, stepGrapheme, theme, viewportAt, viewportTop,
@@ -539,7 +540,7 @@ export class ConsoleApp {
           key,
           rows: (width, selected, focused) => {
             const unreadKey = summary.sessionId ? `s:${summary.sessionId}` : "";
-            const preview = sanitizeTerminalText(summary.latest.text);
+            const preview = sanitizeTerminalText(renderMessageBody(summary.latest));
             return [
               justify(
                 [this.marker(selected), { text: summary.name, style: theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],

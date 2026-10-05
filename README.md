@@ -77,14 +77,15 @@ Run the API tests and report back.
 
 | Tool | Purpose |
 |---|---|
-| `asenq_send` | Send `text` to a session name, to `"*"` (every live session) or to `"human"`. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
+| `asenq_send` | Send `text`, a `file: { path, summary }` reference, or both to a session name, to `"*"` (every live session) or to `"human"`. Text may be omitted only with a file reference. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
+| `asenq_file_check` | Check a retained direct message's referenced file against its send-time snapshot. Required: `id`; returns `match`, `changed` or `missing`. |
 | `asenq_list` | List sessions and their roles; the caller's own row is marked `[you]`. |
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
 | `asenq_rename` | Rename this session. |
 | `asenq_channel_send` / `_read` / `_list` | Named channels. Agents read them on demand; channel messages are never pushed into a session. |
 
-Control messages are urgent labels, not commands enforced by asenq. `kind: "control"` requires `action: "pause"`, `"resume"` or `"cancel"`; `action` is invalid on other kinds. Text is still required. Delivery carries `[URGENT]` and the action, but asenq never pauses, resumes or cancels a session, changes its inbound policy, or bypasses hold/refuse, rate limits or queues.
+Control messages are urgent labels, not commands enforced by asenq. `kind: "control"` requires `action: "pause"`, `"resume"` or `"cancel"`; `action` is invalid on other kinds. A text body or file reference is required. Delivery carries `[URGENT]` and the action, but asenq never pauses, resumes or cancels a session, changes its inbound policy, or bypasses hold/refuse, rate limits or queues.
 
 ```sh
 asenq send worker-oc "Pause after the current check" --kind control --action pause
@@ -97,6 +98,36 @@ Agents can send the same message with `asenq_send { to: "worker-oc", text: "Paus
 Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. Only the human can change roles; registered sessions receive `not_permitted` from `set_role`. Roles are informational: they grant no permissions and do not enforce work or change delivery policy.
 
 A role belongs to the session identity, not its name: renaming and reconnecting preserve it, while a different identity reusing the name starts unset. `asenq ls` and `asenq_list` show the role. Every delivered direct-message header tells the recipient its own role (`your-role=worker` or `your-role=orchestrator`); unset roles omit that label. TUI rows use plain `orch` / `wrk` tags, omitted when space is needed for the name, unread count and state; the conversation header also shows the full role. Archived identities retain their role but cannot be targeted by name.
+
+### File references
+
+Prefer a file reference for anything over **~4,000 characters**, rather than pasting a large body into a direct message. Agent tools accept:
+
+```json
+{
+  "to": "worker-oc",
+  "text": "Please review the findings",
+  "file": {
+    "path": "/absolute/path/to/findings.md",
+    "summary": "API test findings and suggested fixes"
+  },
+  "thread": "api-review"
+}
+```
+
+Call `asenq_send` with this object; `text` may be omitted when `file` is present. `path` must be an **absolute path to a readable regular file** on this machine. `summary` is required and limited to **500 characters**. Invalid, missing or unreadable paths are errors, not empty attachments.
+
+The daemon reads the file once at send time and stores only its **path, summary, SHA-256 hash and byte size**, never its contents. Delivery and agent inbox/thread reads show the summary, path, size, a 12-character hash prefix and a check hint. The recipient reads the source file on demand under the same OS user's filesystem permissions; asenq does not copy, upload, freeze or grant access to the file. File references are direct-message metadata, not channel attachments. Sending references and checking them are exposed through agent tools; the CLI and TUI have no file-reference composer.
+
+Hashing streams asynchronously after checking the open file's type; byte size comes from that check. There is no file-byte limit, and existing request timeouts still apply to very large or slow files. File metadata appears before optional text, including in the TUI's existing message views; a clipped Claude delivery points to `asenq_inbox id=…` for full recovery.
+
+Use `asenq_file_check { id: "m_…" }` to compare the current file with the full send-time hash:
+
+- `match`: the current contents match the snapshot.
+- `changed`: the file is readable, but its contents differ.
+- `missing`: the file is gone, unreadable or no longer a regular file.
+
+Only the retained direct message's sender or recipient can check its reference, using their session identity rather than a reusable name; `human` is authorized for messages sent to or from its inbox. An unknown or unrelated message, or one with no file reference, is an error. The original metadata remains in message history even if the file changes or disappears. A matching hash is **not a lock or an immutable attachment**: the file can change between the check and a read, or during a read. Read and verify again when that distinction matters.
 
 ### Inbox paging and full-text recovery
 

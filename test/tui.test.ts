@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import type { AsenqClient } from "../src/shared/client.js";
 import { ConsoleApp } from "../src/tui/app.js";
@@ -94,6 +96,23 @@ function assertWithin(ui: Console): void {
 }
 
 const size = { columns: 10, rows: 4 };
+
+test("file-only direct messages show the summary and path in transcript rows", async () => {
+  env = await startEnv();
+  const sender = await env.adapter("omp", "file-row-sender", "sender");
+  const path = join(env.home, "report.txt");
+  writeFileSync(path, "private report contents");
+  await sender.client.request("send", {
+    to: "human", file: { path, summary: "File report ready" },
+  });
+  const ui = await startConsole(120, 28);
+  await ui.until(() => ui.rows().some((row) => row.includes("sender")), "sender selection");
+  const rows = ui.rows().join("\n");
+  assert.ok(rows.includes("File report ready"), rows);
+  assert.ok(rows.includes(path), rows);
+  assert.ok(!rows.includes("private report contents"));
+  assertWithin(ui);
+});
 
 test("header hydrates held messages and follows hold, release, drop, removal and revival", async () => {
   env = await startEnv();

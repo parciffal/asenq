@@ -1,4 +1,4 @@
-export const PROTOCOL = 7;
+export const PROTOCOL = 8;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -27,10 +27,12 @@ export type Res =
   | { id: number; ok: true; [k: string]: unknown }
   | { id: number; ok: false; error: { code: ErrCode; message: string } };
 
+export type FileReference = { path: string; summary: string; sha256: string; size: number };
+
 export type WireMsg = {
   id: string; from: string; to: string;
   kind?: Kind; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean;
-  text: string; createdAt: number;
+  text: string; file?: FileReference; createdAt: number;
 };
 
 export type MsgStatus =

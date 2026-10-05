@@ -1,11 +1,12 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { chmodSync, constants, createReadStream, mkdirSync, rmSync } from "node:fs";
+import { open } from "node:fs/promises";
 import net from "node:net";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, NAME_RE, PROBE_MS,
   PROTOCOL, RESERVED, RETRY_MS, slug,
-  type ControlAction, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
+  type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
   type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
@@ -101,6 +102,40 @@ function readScope(p: Params): ReadScope {
 }
 
 const newId = (prefix: string): string => prefix + randomBytes(6).toString("hex");
+
+/** Inspect the nonblocking descriptor before streaming so special files cannot hang a read. */
+async function hashFile(path: string): Promise<{ sha256: string; size: number }> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) throw new Error("not a regular file");
+    const hash = createHash("sha256");
+    const stream = createReadStream(path, { fd: file.fd, autoClose: false });
+    for await (const chunk of stream) hash.update(chunk);
+    return { sha256: hash.digest("hex"), size: stat.size };
+  } finally {
+    await file.close();
+  }
+}
+
+async function fileParam(value: unknown): Promise<FileReference | undefined> {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AsenqError("bad_request", "file must contain path and summary");
+  }
+  const p = value as Params;
+  const path = str(p, "path", true);
+  const summary = str(p, "summary", true);
+  if (!isAbsolute(path)) throw new AsenqError("bad_request", "file path must be absolute");
+  if (!summary.trim() || summary.length > 500) {
+    throw new AsenqError("bad_request", "file summary must be nonempty and at most 500 characters");
+  }
+  try {
+    return { path, summary, ...await hashFile(path) };
+  } catch (error) {
+    throw new AsenqError("bad_request", `cannot read regular file "${path}": ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 export class Daemon {
   readonly store: Store;
@@ -306,6 +341,8 @@ export class Daemon {
       }
       case "send":
         return { results: await this.send(this.sender(c, p), p) };
+      case "file_check":
+        return this.opFileCheck(this.sender(c, p), p);
       case "ack": {
         const msgId = str(p, "msgId", true);
         const ack: Ack = { ok: p.ok === true, reason: str(p, "reason") };
@@ -403,6 +440,20 @@ export class Daemon {
         params: [s.session.id, s.session.id],
       }
       : { sql: "channel IS NULL AND (from_name='human' OR to_name='human')", params: [] };
+  }
+
+  private async opFileCheck(s: Sender, p: Params): Promise<Result> {
+    const scope = this.directScope(s);
+    const row = this.store.db.get<MsgRow>(
+      `SELECT * FROM messages WHERE id=? AND ${scope.sql}`, str(p, "msgId", true), ...scope.params,
+    );
+    if (!row?.file) throw new AsenqError("bad_request", "no retained file reference for the caller");
+    const file = toWire(row).file!;
+    try {
+      return { status: (await hashFile(file.path)).sha256 === file.sha256 ? "match" : "changed" };
+    } catch {
+      return { status: "missing" };
+    }
   }
 
   private messageCursor(
@@ -925,9 +976,12 @@ export class Daemon {
       let total = 0;
       const role = this.store.identity(row.id)?.role ?? undefined;
       for (const m of this.store.queuedFor(row.id)) {
-        let text = renderInbound(toWire(m), role);
+        const msg = toWire(m);
+        let text = renderInbound(msg, role);
         if (texts.length === 0 && text.length > POLL_BUDGET) {
-          text = text.slice(0, POLL_BUDGET) + `… (truncated; full text: asenq log --id ${m.id})`;
+          if (msg.file) text = renderInbound({ ...msg, thread: undefined, replyTo: undefined }, role);
+          const recovery = msg.file ? `asenq_inbox id=${m.id}` : `asenq log --id ${m.id}`;
+          text = text.slice(0, POLL_BUDGET) + `… (truncated; full text: ${recovery})`;
         } else if (total + text.length > POLL_BUDGET) break;
         texts.push(text);
         total += text.length;
@@ -1000,8 +1054,9 @@ export class Daemon {
   async send(s: Sender, p: Params): Promise<SendResult[]> {
     const targetSessionId = str(p, "toSessionId");
     let to = str(p, "to");
-    const text = str(p, "text", true);
-    if (text.length === 0) throw new AsenqError("bad_request", "text is empty");
+    const file = await fileParam(p.file);
+    const text = str(p, "text") ?? "";
+    if (text.length === 0 && !file) throw new AsenqError("bad_request", "text is empty; provide text or a file reference");
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);
     const kind = str(p, "kind") as Kind | undefined;
     if (kind !== undefined && !KINDS.includes(kind)) throw new AsenqError("bad_request", `kind must be one of ${KINDS.join(", ")}`);
@@ -1031,6 +1086,7 @@ export class Daemon {
       to_name: "", to_session: null, channel: null, text, kind: kind ?? null, action: action ?? null, thread: str(p, "thread") ?? null,
       reply_to: str(p, "replyTo") ?? null, done: p.done === true ? 1 : 0, status: "queued", reason: null, attempts: 0,
       created_at: now, updated_at: now, ord: 0,
+      file: file ? JSON.stringify(file) : null,
     };
     if (to === "human") {
       const row = { ...base, id: newId("m_"), to_name: "human", status: "posted" as const };
@@ -1059,7 +1115,7 @@ export class Daemon {
     };
     if (s.kind === "agent") {
       const bodyKey = row.kind === "control" ? `control\0${row.action}\0${row.text}` : `message\0${row.text}`;
-      const dupKey = `${s.session.id}\0${target.id}\0${bodyKey}`;
+      const dupKey = `${s.session.id}\0${target.id}\0${bodyKey}\0${row.file ?? ""}`;
       const seen = this.dupSeen.get(dupKey);
       if (seen !== undefined && now - seen < DUP_WINDOW_MS) return finish("dropped", "duplicate");
       this.dupSeen.set(dupKey, now);

@@ -12,6 +12,7 @@ export function zodShape(z: Zod, params: Record<string, ParamSpec>): Record<stri
   for (const [key, p] of Object.entries(params)) {
     let t: zod.ZodType;
     if (p.type === "boolean") t = z.boolean();
+    else if (p.type === "object") t = z.object(zodShape(z, p.properties));
     else if (p.type === "integer") {
       let n = z.number().int();
       if (p.min !== undefined) n = n.min(p.min);
