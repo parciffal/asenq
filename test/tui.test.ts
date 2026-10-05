@@ -1693,3 +1693,33 @@ test("retained sender notices show the original reply identity as a purged messa
   assert.ok(ui.rows().some((row) => row.includes("not delivered")), "independent sender notice remains visible");
   assertWithin(ui);
 });
+
+test("Home and End reach list boundaries after a selected archive is hidden", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "boundary-alpha", "alpha");
+  const beta = await env.adapter("omp", "boundary-beta", "beta");
+  await alpha.client.request("send", { to: "human", text: "Archived boundary conversation" });
+  await beta.client.request("send", { to: "human", text: "Live boundary conversation" });
+  const ui = await startConsole(120, 28);
+  const listWidth = paneWidths(120)!.list;
+  const list = (): string[] => ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  await ui.press("/");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  await alpha.client.request("unregister");
+  await ui.until(() => list().some((row) => row.includes("alpha") && row.includes("archived")), "selected identity archived");
+  await ui.press("ESCAPE");
+  await ui.press("END");
+  await ui.press("ENTER");
+  assert.ok(list().some((row) => row.includes("alpha") && row.includes("archived")), "End reaches the collapsed Archive heading");
+
+  await ui.press("DOWN");
+  await ui.press("?");
+  await ui.type("Toggle archive");
+  await ui.press("ENTER");
+  assert.ok(!list().some((row) => row.includes("alpha") && row.includes("archived")), "selected archive is hidden again");
+  await ui.press("HOME");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("Live boundary conversation")), "Home opens the first live session");
+  assertWithin(ui);
+});

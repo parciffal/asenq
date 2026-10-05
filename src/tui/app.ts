@@ -690,7 +690,8 @@ export class ConsoleApp {
     if (!keys.length) return;
     const current = this.tab === "activity" ? this.selectedActivity() : this.selection[this.tab];
     const index = current ? keys.indexOf(current) : -1;
-    const next = Math.max(0, Math.min(keys.length - 1, index < 0 ? (delta > 0 ? 0 : keys.length - 1) : index + delta));
+    const next = delta === Infinity ? keys.length - 1 : delta === -Infinity ? 0
+      : Math.max(0, Math.min(keys.length - 1, index < 0 ? (delta > 0 ? 0 : keys.length - 1) : index + delta));
     this.selection[this.tab] = keys[next];
     if (this.tab === "activity") this.followActivity = next === keys.length - 1;
     await this.opened();
