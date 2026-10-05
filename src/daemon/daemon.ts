@@ -51,7 +51,7 @@ type Ack = { ok: boolean; reason?: string };
 type LineageDecision = { identityId?: string; reason?: string };
 type DeliveryAttempt = { recipientId: string | null; settle(status: MsgStatus): void };
 type Inflight = { conn: Conn; sessionId: string; timer: NodeJS.Timeout; settle(a: Ack): void };
-type PendingReset = { conn: Conn; sessionId: string; received: boolean; deadline: number };
+type PendingReset = { conn: Conn; sessionId: string; attempt: string; received: boolean; deadline: number };
 type PendingPing = {
   sessionId: string; requester: Conn; conn?: Conn; deadline: number; timer?: NodeJS.Timeout;
   settle(ping: PingStatus): void;
@@ -463,6 +463,7 @@ export class Daemon {
           if (reset.conn !== c || actor.kind !== "agent" || actor.session.id !== reset.sessionId) {
             throw new AsenqError("not_permitted", "only the target adapter may acknowledge compact delivery");
           }
+          if (p.resetAttempt !== reset.attempt) throw new AsenqError("bad_request", "stale compact delivery attempt");
           if (ack.ok && p.reset !== "pending") throw new AsenqError("bad_request", "compact receipt ack requires reset pending");
           if (!reset.received && ack.ok) {
             const row = this.store.msg(msgId);
@@ -1620,6 +1621,7 @@ export class Daemon {
     if (pending.conn !== c || pending.sessionId !== actor.session.id || this.delivery.get(actor.session.id) !== c) {
       throw new AsenqError("not_permitted", "only the target delivery binding may finish compact delivery");
     }
+    if (p.resetAttempt !== pending.attempt) throw new AsenqError("bad_request", "stale compact completion attempt");
     if (!pending.received) throw new AsenqError("bad_request", "compact receipt must be acknowledged first");
     if (typeof p.ok !== "boolean") throw new AsenqError("bad_request", "compact completion requires delivery acceptance");
     const reason = str(p, "reason");
@@ -1812,9 +1814,9 @@ export class Daemon {
 
     const conn = this.delivery.get(target.id);
     if (!conn) return "queued";
-    const compact = row.reset === "compact" && conn.compactSupport.has(target.id);
-    if (compact) {
-      this.pendingResets.set(row.id, { conn, sessionId: target.id, received: false, deadline: this.now() + this.resetTimeoutMs });
+    const resetAttempt = row.reset === "compact" && conn.compactSupport.has(target.id) ? randomUUID() : undefined;
+    if (resetAttempt) {
+      this.pendingResets.set(row.id, { conn, sessionId: target.id, attempt: resetAttempt, received: false, deadline: this.now() + this.resetTimeoutMs });
       this.resetting.add(target.id);
     }
     const { promise, resolve } = Promise.withResolvers<Ack>();
@@ -1827,7 +1829,7 @@ export class Daemon {
     const timer = setTimeout(() => settle({ ok: false, reason: "ack timeout" }), this.ackTimeoutMs);
     const inflight: Inflight = { conn, sessionId: target.id, timer, settle };
     this.inflight.set(row.id, inflight);
-    const push: Push = { push: "deliver", msg: message, text, session: target.id, key: target.key, ...(compact ? { reset: "compact" } : {}) };
+    const push: Push = { push: "deliver", msg: message, text, session: target.id, key: target.key, ...(resetAttempt ? { reset: "compact", resetAttempt } : {}) };
     conn.write(push);
     const ack = await promise;
     const current = this.store.msg(row.id);
@@ -1838,7 +1840,7 @@ export class Daemon {
       this.setStatus(row.id, "delivered");
       return this.store.msg(row.id)!.status;
     }
-    if (compact) {
+    if (resetAttempt) {
       this.pendingResets.delete(row.id);
       this.resetting.delete(target.id);
     }

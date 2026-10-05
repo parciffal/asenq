@@ -272,3 +272,38 @@ test("a rejected receipt queued behind timed-out compaction is handled immediate
     await env.close();
   }
 });
+
+test("two buffered compact pushes across ACK timeout and retry compact and inject only once", async (t) => {
+  const env = await startEnv({ ackTimeoutMs: 30 });
+  const gate = Promise.withResolvers<void>();
+  const secondReceipt = Promise.withResolvers<void>();
+  const originalRequest = AsenqClient.prototype.request;
+  let receipts = 0;
+  t.mock.method(AsenqClient.prototype, "request", async function(this: AsenqClient, op: string, params: Record<string, unknown> = {}) {
+    if (op === "ack" && params.reset === "pending") {
+      if (++receipts === 2) secondReceipt.resolve();
+      await gate.promise; // Hold transport receipt requests while the real daemon times out and retries.
+    }
+    return originalRequest.call(this, op, params);
+  });
+  try {
+    let compacts = 0;
+    const host = await boot(makeCtx("omp-buffered-retry", async () => { compacts++; }), "buffered-retry");
+    const human = env.human();
+    const [sent] = (await human.request("send", { to: "buffered-retry", text: "one task after a retry", reset: "compact" })).results as SendResult[];
+    assert.equal(sent.status, "queued");
+    const retrying = env.daemon.deliver(sent.msgId!);
+    await secondReceipt.promise;
+    gate.resolve();
+    assert.equal(await retrying, "delivered");
+    await waitForReset(human, sent.msgId!, "compacted");
+    await flushTurns();
+    assert.equal(compacts, 1, "only the current receipt grants permission to compact");
+    assert.equal(host.sent.length, 1, "the retried task must be injected exactly once");
+    assert.match(host.sent[0], /(?:^|\n)one task after a retry(?:\n|$)/);
+  } finally {
+    gate.resolve();
+    stopHosts();
+    await env.close();
+  }
+});

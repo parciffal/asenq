@@ -155,8 +155,7 @@ asenq send worker-omp "Start the next task" --kind task --reset compact
 The agent equivalent is `asenq_send { to: "worker-omp", text: "Start the next task", kind: "task", reset: "compact" }`. Workers and unset-role sessions receive `not_permitted`; broadcasts (`"*"`), the human address, stable-ID sends and channel posts reject the flag with `bad_request`. Normal inbound policy and queue admission still apply.
 
 - **omp:** the adapter declares `compact`, awaits `ctx.compact({ suppressContinuation: true })`, then injects the message. Compaction does not automatically continue the interrupted task.
-- **OpenCode:** the plugin declares `compact` only when its SDK exposes both session history and `session.summarize`. It selects the target's latest usable provider/model, summarizes, then prompts the target. A summarization error or missing model reports failure but still prompts.
-- **Claude Code / adapters without the capability:** no compaction; the message is delivered normally.
+- **OpenCode / Claude Code / adapters without the capability:** no compaction; the message is delivered normally. OpenCode compaction is tracked separately in [#42](https://github.com/parciffal/asenq/issues/42).
 
 A capable live target acknowledges receipt immediately: the send result reports **`reset=pending`**, not completed compaction. The adapter then compacts and delivers the task; history and tail events record **`resetResult=compacted`** or **`resetResult=failed`**. Failure to compact still delivers the message. A target without the capability reports **`reset=unsupported`** once delivered, also retained as `resetResult=unsupported`. `asenq log --id <msgId>` shows the final outcome.
 
@@ -165,6 +164,8 @@ Held and queued sends retain the request but omit the initial reset outcome. The
 A pending reset has a **10-minute** daemon-side cap (`DaemonOpts.resetTimeoutMs`); sweep expiry records failure and releases deferred delivery attempts. Disconnect also ends the pending reset as failed; deferred messages remain queued for reconnection. A hung harness API is not repaired by this deadline: subsequent attempts still use normal delivery acknowledgments and retries. An adapter injection error or an interrupted accepted delivery is recorded as failed without repeating compaction.
 
 Before receipt acceptance, queue expiry or delivery-binding removal/replacement cancels the pending attempt and immediately releases the target's delivery gate. A stale compact receipt is rejected, not relabeled as unsupported; adapters do not compact or inject after that rejection.
+
+Every compact push carries a unique `resetAttempt` token, echoed in its receipt and completion. A stale push cannot acquire permission from a later retry of the same message.
 
 This summarizes the existing context; it never clears context or creates a new harness session. The harness session ID and asenq identity stay unchanged.
 

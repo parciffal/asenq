@@ -64,7 +64,7 @@ export default function asenq(pi: ExtensionAPI): void {
 
   /** Flagged pushes acknowledge receipt before waiting on the queue or compaction. */
   const ackReceipt = (p: Delivery): Promise<boolean> =>
-    client!.request("ack", { as: p.session, msgId: p.msg.id, ok: true, reset: "pending" }).then(
+    client!.request("ack", { as: p.session, msgId: p.msg.id, ok: true, reset: "pending", resetAttempt: p.resetAttempt }).then(
       () => true,
       (e: unknown) => {
         warn(`receipt ack ${p.msg.id} failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -74,7 +74,7 @@ export default function asenq(pi: ExtensionAPI): void {
 
   /** Reports the finished reset outcome and this adapter's delivery acceptance separately from receipt. */
   const reportReset = (p: Delivery, reset: ResetResult, ok: boolean, reason?: string): void => {
-    client?.request("reset_result", { as: p.session, msgId: p.msg.id, reset, ok, reason })
+    client?.request("reset_result", { as: p.session, msgId: p.msg.id, reset, resetAttempt: p.resetAttempt, ok, reason })
       .catch((e: unknown) => warn(`reset_result ${p.msg.id} failed: ${String(e)}`));
   };
 

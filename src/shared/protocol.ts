@@ -180,9 +180,9 @@ export type ReplayResult = {
 
 export type ReadMutationResult = { applied: boolean; state: ReadState };
 
-/** `session`/`key` identify the target binding on connections that host several sessions. */
+/** `session`/`key` identify the target binding; a compact push requires a per-attempt `resetAttempt` receipt token. */
 export type Push =
-  | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string; reset?: "compact" }
+  | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string; reset?: "compact"; resetAttempt?: string }
   | { push: "ping"; pingId: string }
   | { push: "event"; position: number; event: TailEvent };
 
