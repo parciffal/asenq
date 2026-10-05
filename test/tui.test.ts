@@ -1937,3 +1937,179 @@ test("channel composer mention picker filters members and inserts a token withou
   assert.deepEqual((await human.request("channel_read", { channel: "work" })).messages, [], "picker Enter never sends");
   assertWithin(ui);
 });
+
+test("mention arrows choose members and every keyword, and only the next Enter posts", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await env.adapter("omp", "mention-arrows-alpha", "alpha");
+  await env.adapter("omp", "mention-arrows-beta", "beta");
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["alpha", "beta"]) await human.request("channel_add", { channel: "work", name });
+  const ui = await startConsole(80, 24);
+  await ui.press("#");
+  await ui.press("c");
+  await ui.type("@");
+  await ui.press("DOWN"); // @all -> @alpha
+  await ui.press("DOWN"); // @alpha -> @beta
+  await ui.press("UP");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("@alpha")));
+  assert.deepEqual((await human.request("channel_read", { channel: "work" })).messages, []);
+  await ui.press("ENTER");
+  for (const keyword of ["all", "orch", "orchestrator", "orchestrators", "wrk", "worker", "workers"]) {
+    await ui.type(`@${keyword}`);
+    assert.ok(ui.rows().some((row) => row.includes(`@${keyword}`)));
+    await ui.press("ENTER");
+    const before = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+    assert.ok(!before.some((post) => post.text === `@${keyword}`), "selection cannot post");
+    await ui.press("ENTER");
+  }
+  const posts = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  assert.deepEqual(posts.map((post) => post.text), ["@alpha", "@all", "@orch", "@orchestrator", "@orchestrators", "@wrk", "@worker", "@workers"]);
+  assertWithin(ui);
+});
+
+test("mention completion edits an existing token while preserving its suffix and cursor", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await env.adapter("omp", "mention-edit-alpha", "alpha");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  const ui = await startConsole(80, 24);
+  await ui.press("#");
+  await ui.press("c");
+  await ui.paste("Need @al tail");
+  for (let index = 0; index < 5; index++) await ui.press("LEFT");
+  await ui.press("p");
+  assert.ok(ui.rows().some((row) => row.includes("@alpha")));
+  await ui.press("ENTER");
+  await ui.press("!");
+  assert.ok(ui.rows().some((row) => row.includes("Need @alpha! tail")));
+  await ui.press("ENTER");
+  const posts = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  assert.deepEqual(posts.map((post) => post.text), ["Need @alpha! tail"]);
+});
+
+test("mention dismissal keeps composer focus and normal delimiters and cursor controls", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await human.request("channel_create", { channel: "work" });
+  const ui = await startConsole(80, 24);
+  await ui.press("#");
+  await ui.press("c");
+  await ui.type("@all");
+  await ui.press("ESCAPE");
+  await ui.press("!");
+  await ui.press("ENTER");
+  await ui.paste("@all");
+  await ui.press("LEFT");
+  await ui.press("RIGHT");
+  await ui.press("ENTER"); // cursor movement closed the picker
+  await ui.paste("@all");
+  await ui.press("CTRL_J");
+  await ui.type("next");
+  await ui.press("ENTER");
+  await ui.type("@all");
+  await ui.press("TAB"); // ordinary composer focus cycling, not completion
+  await ui.press("c");
+  await ui.press("ENTER");
+  const posts = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  assert.deepEqual(posts.map((post) => post.text), ["@all!", "@all", "@all\nnext", "@all"]);
+});
+
+test("mention picker stays channel scoped through quick jump, literal emails and burst input", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "mention-burst-alpha", "alpha");
+  await human.request("channel_create", { channel: "one" });
+  await human.request("channel_create", { channel: "two" });
+  await human.request("channel_add", { channel: "one", name: "alpha" });
+  const ui = await startConsole(80, 24);
+  await ui.press("#");
+  await ui.press("c");
+  await ui.burst(["@", "a", "l", "p", "ENTER"]);
+  assert.deepEqual((await human.request("channel_read", { channel: "one" })).messages, []);
+  assert.deepEqual(alpha.deliveries, []);
+  await ui.press("CTRL_U");
+  await ui.type("@");
+  await ui.press("CTRL_K");
+  await ui.type("#two");
+  await ui.press("ENTER");
+  await ui.press("c");
+  await ui.burst([..."plain", "ENTER"]);
+  assert.deepEqual(((await human.request("channel_read", { channel: "two" })).messages as StoredMessage[]).map((post) => post.text), ["plain"]);
+  await ui.press("CTRL_K");
+  await ui.type("#one");
+  await ui.press("ENTER");
+  await ui.press("c");
+  await ui.press("CTRL_U");
+  await ui.type("mail alpha@example.com");
+  assert.ok(!ui.rows().some((row) => row.includes("@all")));
+  await ui.press("ENTER");
+  await ui.press("CTRL_K");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  await ui.press("c");
+  await ui.type("literal @all alpha@example.com");
+  assert.ok(!ui.rows().some((row) => row.includes("@workers")));
+  await ui.press("ENTER");
+  await ui.until(() => alpha.deliveries.length === 1, "literal direct draft delivered");
+  assert.equal(alpha.deliveries[0].msg.text, "literal @all alpha@example.com");
+});
+
+test("mention choices follow current channel identities and keep input visible at narrow and short sizes", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await env.adapter("omp", "mention-snapshot-alpha", "alpha");
+  await env.adapter("omp", "mention-collision-worker", "worker");
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["alpha", "worker"]) await human.request("channel_add", { channel: "work", name });
+  const ui = await startConsole(80, 24);
+  await ui.press("#");
+  await ui.press("c");
+  await ui.type("@alp");
+  await human.request("rename", { from: "alpha", name: "renamed" });
+  await ui.until(() => ui.rows().some((row) => row.includes("@renamed")), "former-name filter inserts the current name");
+  await ui.press("ENTER");
+  await ui.press("CTRL_U");
+  await ui.type("@worker");
+  await ui.press("DOWN");
+  await ui.press("DOWN"); // clamps at @workers: the colliding member is not a third choice
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  await ui.press("CTRL_U");
+  await ui.type("@");
+  for (const [columns, rows] of [[79, 16], [80, 8], [20, 6], [10, 4], [2, 2], [1, 1]]) {
+    await ui.resize(columns, rows);
+    assertWithin(ui);
+    const cursor = ui.frame().cursor;
+    assert.ok(cursor && cursor.row >= 0 && cursor.row < rows && cursor.column >= 0 && cursor.column < columns, "cursor stays in the visible input");
+  }
+  await ui.resize(20, 6);
+  await ui.type("alp");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  const posts = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  assert.deepEqual(posts.map((post) => post.text), ["@workers", "@renamed"]);
+});
+
+test("pushed channel mention stays in the direct conversation and names its channel and poster", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await env.adapter("omp", "mention-header-alpha", "alpha");
+  const beta = await env.adapter("omp", "mention-header-beta", "beta");
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["alpha", "beta"]) await human.request("channel_add", { channel: "work", name });
+  await beta.client.request("channel_send", { channel: "work", text: "Review @alpha\nbody stays intact", thread: "review" });
+  const ui = await startConsole(120, 24);
+  await ui.press("CTRL_K");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("beta") && row.includes("#work")), "direct header identifies the poster and source channel");
+  assert.ok(ui.rows().some((row) => row.includes("Review @alpha")));
+  assert.ok(ui.rows().some((row) => row.includes("body stays intact")));
+  await ui.press("UP");
+  await ui.press("ENTER"); // expanded message retains its source context
+  assert.ok(ui.rows().some((row) => row.includes("thread review")));
+  assertWithin(ui);
+});

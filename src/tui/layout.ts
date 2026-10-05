@@ -150,6 +150,7 @@ function headerSpans(message: StoredMessage, now: number): TerminalSpan[] {
     { text: human ? "› " : "● ", style: human ? theme.human : theme.agent },
     { text: senderLabel(message), style: human ? theme.human : theme.agent },
   ];
+  if (!message.channel && message.sourceChannel) spans.push({ text: ` via #${message.sourceChannel}`, style: theme.dim });
   if (message.channel) spans.push({ text: ` in #${message.channel}`, style: theme.dim });
   else if (message.to !== "human" && !human) spans.push({ text: ` → ${message.to}`, style: theme.agent });
   else if (human) spans.push({ text: ` → ${message.to === "human" ? "you" : message.to}`, style: theme.dim });
@@ -166,6 +167,7 @@ function detailLines(message: StoredMessage): string[] {
     `from ${message.from}${message.fromSessionId ? ` (${message.fromSessionId})` : ""} → ${message.channel ? `#${message.channel}` : message.to}${message.toSessionId ? ` (${message.toSessionId})` : ""}`,
     `status ${message.status}${message.reason ? `: ${message.reason}` : ""} · order ${message.order} · ${new Date(message.createdAt).toLocaleString()}`,
   ];
+  if (message.sourceChannel) lines.push(`via #${message.sourceChannel}`);
   if (message.thread) lines.push(`thread ${message.thread}`);
   if (message.replyTo) lines.push(`reply to ${message.replyTo}${message.replyToMissing ? " (purged message)" : ""}`);
   return lines;
