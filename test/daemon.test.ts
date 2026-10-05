@@ -368,6 +368,7 @@ test("Claude polling retains file metadata when text or thread exceeds the deliv
   env = await startEnv();
   const human = env.human();
   await human.request("claude_hook", { event: "start", key: "file-poll", sessionId: "file-poll", name: "orch" });
+  await human.request("set_role", { name: "orch", role: "worker" });
   const path = join(env.home, "report.txt");
   writeFileSync(path, "abc");
   const receiver = env.human();
@@ -376,6 +377,7 @@ test("Claude polling retains file metadata when text or thread exceeds the deliv
     const text = "long body ".repeat(2000);
     const [sent] = await send(human, "orch", text, { thread, file: { path, summary: "Review report" } });
     const texts = (await human.request("claude_hook", { event: "poll", sessionId: "file-poll" })).texts as string[];
+    assert.ok(texts[0].split("\n")[0].includes("your-role=worker"));
     assert.ok(texts[0].includes("Review report"));
     assert.ok(texts[0].includes(path));
     assert.ok(texts[0].includes("3 bytes"));
