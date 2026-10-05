@@ -1965,7 +1965,7 @@ test("orchestrators edit only their channel rosters and shared roles, losing per
   assert.equal(((await worker.client.request("channel_members", { channel: "work" })).members as { name: string; role: string }[])
     .find((m) => m.name === "worker")?.role, "orchestrator");
   await orch.client.request("set_role", { name: "worker", role: "worker" });
-  for (const client of [orch.client, worker.client, outside.client]) {
+  for (const client of [worker.client, outside.client]) {
     await assert.rejects(client.request("channel_create", { channel: "forbidden" }), { code: "not_permitted" });
   }
   for (const op of ["channel_add", "channel_remove"]) {
@@ -2003,12 +2003,58 @@ test("membership and role authorization select the bound or attached actor befor
     await assert.rejects(multi.client.request(op, { ...p, as: worker.id }), { code: "not_permitted" });
   }
   await multi.client.request("set_role", { name: "target", role: "worker", as: multi.session.id });
+  const multiCreated = (await multi.client.request("channel_create", { channel: "multi-work", as: multi.session.id })).channel as { memberIds: string[] };
+  assert.deepEqual(multiCreated.memberIds, [multi.session.id]);
+  await assert.rejects(multi.client.request("channel_add", { channel: "multi-work", name: "worker", as: worker.id }), { code: "not_permitted" });
   await multi.client.request("channel_remove", { channel: "work", name: "target", as: multi.session.id });
   await claude.request("channel_add", { channel: "work", name: "target" });
   await claude.request("set_role", { name: "target", role: null });
   assert.equal((await human.sync()).sessions.find((s) => s.id === target.session.id)?.role, null);
   await assert.rejects(claude.request("channel_remove", { channel: "work", sessionId: target.session.id }), { code: "not_permitted" });
-  await assert.rejects(claude.request("channel_create", { channel: "forbidden" }), { code: "not_permitted" });
+  const created = (await claude.request("channel_create", { channel: "claude-work" })).channel as { memberIds: string[] };
+  const claudeIdentity = (await human.sync()).sessions.find((s) => s.name === "claude")!;
+  assert.deepEqual(created.memberIds, [claudeIdentity.id]);
+});
+
+test("orchestrators bootstrap new channels and explicitly self-join existing channels before managing others", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "orch-key", "orch");
+  const worker = await env.adapter("omp", "worker-key", "worker");
+  const unset = await env.adapter("omp", "unset-key", "unset");
+  await human.request("set_role", { name: "orch", role: "orchestrator" });
+  await human.request("set_role", { name: "worker", role: "worker" });
+  const before = await human.sync();
+  const created = (await orch.client.request("channel_create", { channel: "new" })).channel;
+  assert.deepEqual(created, { name: "new", count: 0, lastAt: 0, lastOrder: 0, memberIds: [orch.session.id] });
+  await orch.client.request("channel_add", { channel: "new", name: "worker" });
+  await human.request("channel_create", { channel: "existing" });
+  assert.deepEqual((await orch.client.request("channel_create", { channel: "existing" })).channel,
+    { name: "existing", count: 0, lastAt: 0, lastOrder: 0, memberIds: [] });
+  await assert.rejects(orch.client.request("channel_add", { channel: "existing", name: "worker" }), { code: "not_permitted" });
+  await assert.rejects(orch.client.request("set_role", { name: "unset", role: "worker" }), { code: "not_permitted" });
+  await assert.rejects(unset.client.request("channel_create", { channel: "unset-denied" }), { code: "not_permitted" });
+  await assert.rejects(unset.client.request("channel_add", { channel: "existing", name: "unset" }), { code: "not_permitted" });
+  await orch.client.request("channel_add", { channel: "existing", name: "orch" });
+  await orch.client.request("channel_add", { channel: "existing", name: "unset" });
+  await orch.client.request("set_role", { name: "unset", role: "worker" });
+  await orch.client.request("channel_remove", { channel: "existing", name: "unset" });
+  for (const participant of [worker, unset]) {
+    await assert.rejects(participant.client.request("channel_create", { channel: "denied" }), { code: "not_permitted" });
+    await assert.rejects(participant.client.request("channel_add", { channel: "existing", name: participant.session.name }), { code: "not_permitted" });
+  }
+  await orch.client.request("channel_send", { channel: "post-only", text: "implicit creates still have no roster" });
+  assert.deepEqual((await human.sync()).channels.find((c) => c.name === "post-only")?.memberIds, []);
+  await orch.client.request("channel_remove", { channel: "new", name: "orch" });
+  assert.deepEqual((await orch.client.request("channel_create", { channel: "new" })).channel,
+    { name: "new", count: 0, lastAt: 0, lastOrder: 0, memberIds: [worker.session.id] });
+  await assert.rejects(orch.client.request("channel_remove", { channel: "new", name: "worker" }), { code: "not_permitted" });
+  await orch.client.request("channel_add", { channel: "new", name: "orch" });
+  await orch.client.request("channel_remove", { channel: "new", name: "worker" });
+  const replay = await human.replay(before.watermark);
+  const creation = replay.events.filter(({ event }) => event.type === "channel" && event.action === "created" && event.channel.name === "new");
+  assert.deepEqual(creation.map(({ event }) => event.type === "channel" && event.channel.memberIds), [[orch.session.id]]);
+  assert.deepEqual((await human.sync()).channels.find((c) => c.name === "new")?.memberIds, [orch.session.id]);
 });
 
 test("channel additions require live targets and removals resolve only roster identities with current-name precedence", async () => {

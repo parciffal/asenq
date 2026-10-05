@@ -399,8 +399,10 @@ export class Daemon {
       }
       case "channel_create": {
         const actor = this.sender(c, p);
-        if (actor.kind !== "human") throw new AsenqError("not_permitted", "only the human can create channels");
-        return this.mutateChannel(this.channelName(p), "create");
+        if (actor.kind !== "human" && (actor.kind !== "agent" || this.store.identity(actor.session.id)?.role !== "orchestrator")) {
+          throw new AsenqError("not_permitted", "only the human or an orchestrator can create channels");
+        }
+        return this.mutateChannel(this.channelName(p), "create", actor.kind === "agent" ? actor.session.id : undefined);
       }
       case "channel_add":
       case "channel_remove":
@@ -1352,6 +1354,7 @@ export class Daemon {
       const changed = action === "create" ? this.store.createChannel(name)
         : action === "add" ? this.store.addChannelMember(name, sessionId!)
         : this.store.removeChannelMember(name, sessionId!);
+      if (changed && action === "create" && sessionId !== undefined) this.store.addChannelMember(name, sessionId);
       const channel = this.store.channelSummary(name);
       const event = changed ? this.store.appendEvent({
         type: "channel", action: action === "create" ? "created" : "updated", channel,
@@ -1371,7 +1374,8 @@ export class Daemon {
     }
     const channel = this.channelName(p);
     if (!this.store.hasChannel(channel)) throw new AsenqError("unknown_channel", `unknown channel "${channel}"`);
-    if (actor.kind === "agent" && !this.store.isChannelMember(channel, actor.session.id)) {
+    if (actor.kind === "agent" && !this.store.isChannelMember(channel, actor.session.id)
+      && !(add && p.name === actor.session.name)) {
       throw new AsenqError("not_permitted", `not a member of channel "${channel}"`);
     }
     if (add) {
