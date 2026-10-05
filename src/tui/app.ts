@@ -18,6 +18,7 @@ import {
 } from "./terminal.js";
 import { roundedPanel } from "./panel.js";
 import { hintSpans } from "./chrome.js";
+import { heldBar } from "./held.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -906,7 +907,7 @@ export class ConsoleApp {
   }
 
   private footer(width: number): TerminalLine {
-    const hints = this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
+    let hints = this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
       : this.palette ? "type to filter · ↑↓ · Enter run · Esc close · Ctrl+K jump"
       : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel · Ctrl+K jump"
       : this.searching ? "type name · ↑↓ · Enter keep · Esc clear · Ctrl+K jump"
@@ -914,6 +915,9 @@ export class ConsoleApp {
       : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · Ctrl+K jump · ? menu"
       : this.focus === "tabs" ? "←→ switch · Enter open · Ctrl+K jump · ? menu"
       : "↑↓ move · Enter open · Tab focus · Ctrl+K jump · ? menu";
+    if (this.shownHeldId && !this.finder && !this.palette && !this.form && !this.searching && this.focus !== "composer") {
+      hints += " · r release · x drop";
+    }
     const notice = this.notice;
     if (!notice) return padSpans(hintSpans(hints, width), width);
     const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
@@ -1037,12 +1041,16 @@ export class ConsoleApp {
     if (this.panel) return this.panelPane(rows, width, height, y0, x0);
     const target = this.composeTarget();
     const available = height - rows.length;
+    const held = target?.kind === "session" ? this.heldForSession(target.id) : undefined;
+    // Reserve one transcript row and the editor's input before held chrome. A full bar
+    // needs three rows; short panes use one, and the smallest panes hide it entirely.
+    const heldRows = held ? heldBar(held.message, held.count, width, available >= 8 ? 3 : available >= 3 ? 1 : 0) : [];
     // Keep two transcript rows in previews; focused editors may borrow one, but never
     // lose their input row to chrome. Short panes use an unboxed editor instead.
     const composerRoom = this.focus === "composer" ? Math.max(1, available - 1) : available >= 5 ? available - 2 : 0;
     let composer: Pane | undefined;
-    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, composerRoom), x0);
-    const transcriptHeight = height - rows.length - (composer?.rows.length ?? 0);
+    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, Math.max(1, composerRoom - heldRows.length)), x0);
+    const transcriptHeight = height - rows.length - heldRows.length - (composer?.rows.length ?? 0);
     const transcriptY = y0 + rows.length;
     const scope = this.scope();
     let body: TerminalLine[];
@@ -1087,6 +1095,10 @@ export class ConsoleApp {
       this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: { kind: "transcript" } });
     }
     rows.push(...body);
+    if (held && heldRows.length) {
+      rows.push(...heldRows);
+      this.shownHeldId = held.message.id;
+    }
     if (!composer) return { rows };
     const composerY = y0 + rows.length;
     composer.rows.forEach((_, index) => {

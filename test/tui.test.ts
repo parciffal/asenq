@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import type { AsenqClient } from "../src/shared/client.js";
+import type { StoredMessage } from "../src/shared/protocol.js";
 import { ConsoleApp } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
@@ -605,6 +606,115 @@ test("rounded panes resize at the wide boundary without overflowing or moving mo
     handlers.onInterrupt?.();
     await app.idle();
   }
+});
+
+test("held bar is target-scoped and hidden by non-session surfaces and text overlays", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "held-scopes-orch", "orch");
+  const worker = await env.adapter("omp", "held-scopes-worker", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  await orch.client.request("send", { to: "worker", text: "target-held-preview" });
+  await worker.client.request("send", { to: "human", text: "grouped-inbox-message" });
+  await human.request("channel_send", { channel: "held-scopes", text: "channel-message" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("orch");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "sending a held message does not give the sender a bar");
+  await ui.press("/");
+  await ui.press("ESCAPE");
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("⏸ held")), "target bar");
+  await ui.press("ENTER");
+  await ui.press("?");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "palette hides the bar");
+  await ui.press("ESCAPE");
+  await ui.press("CTRL_E");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "full editor hides the bar");
+  await ui.press("ESCAPE");
+  await ui.press("i");
+  assert.ok(ui.rows().some((row) => row.includes("target-held-preview")), "grouped inbox opens the same target identity");
+  await ui.press("v");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "aggregate inbox is not a target conversation");
+  await ui.press("#");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "channel has no session bar");
+  await ui.press("a");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "activity has no bar");
+  assertWithin(ui);
+});
+
+test("held bar keeps a sanitized preview and monochrome emphasis without stealing a resized draft's input", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "held-resize-orch", "orch");
+  const worker = await env.adapter("omp", "held-resize-worker", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  const held = await orch.client.request("send", { to: "worker", text: "safe-preview\nsecond-line \u001b[31mred\u001b[0m" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  const barRow = ui.rows().findIndex((row) => row.includes("⏸ held"));
+  assert.ok(barRow >= 0);
+  assert.match(ui.rows()[barRow]!, /"safe-preview second-line red"/);
+  const spans = normalizeTerminalLine(ui.frame().lines[barRow], ui.size.columns);
+  assert.ok(spans.some((span) => span.text.includes("⏸ held") && span.style?.foreground === "yellow" && span.style.bold));
+  assert.ok(spans.some((span) => span.text.includes("│") && span.style?.foreground === "yellow" && span.style.dim));
+  const monochrome = normalizeTerminalLine(ui.frame().lines[barRow], ui.size.columns, false);
+  assert.ok(monochrome.some((span) => span.text.includes("⏸ held") && span.style?.bold && !span.style.foreground));
+  assert.ok(monochrome.some((span) => span.text.includes("│") && span.style?.dim && !span.style.foreground));
+  const composerRow = ui.rows().findIndex((row) => row.includes("│› "));
+  assert.ok(composerRow > barRow, "composer input stays below the held bar");
+  const promptColumn = ui.rows()[composerRow]!.indexOf("› ");
+  await ui.click(promptColumn, composerRow);
+  const beforeTyping = ui.frame();
+  await ui.press("r");
+  assert.deepEqual(changedTerminalRows(beforeTyping, ui.frame(), ui.size), [composerRow], "held chrome stays stable while the draft row changes");
+  await ui.press("x");
+  for (const [columns, height, visible] of [[79, 8, true], [79, 6, true], [79, 5, false], [79, 3, false], [7, 6, false], [80, 8, true], [120, 32, true]] as const) {
+    Object.assign(ui.size, { columns, rows: height });
+    await ui.press("LEFT");
+    assertWithin(ui);
+    assert.equal(ui.rows().some((row) => row.includes("⏸ held")), visible, `${columns}×${height}: held chrome visibility`);
+    const cursor = ui.frame().cursor;
+    assert.ok(cursor && cursor.row >= 0 && cursor.row < height && cursor.column >= 0 && cursor.column < columns);
+    assert.ok(!"╭╮╰╯│─".includes(ui.rows()[cursor.row]![cursor.column]!), "draft cursor stays off the held and composer borders");
+  }
+  assert.deepEqual(((await human.request("held")).messages as StoredMessage[]).map((message) => message.id), [held.msgId], "typing and resizing never release or drop the held message");
+  await ui.press("ENTER");
+  assert.equal((await worker.nextDelivery()).msg.text, "rx", "composer r/x remain editable text through held-bar resize");
+});
+
+test("held chrome does not read a hidden or scrolled-away newest incoming row", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "held-reader-orch", "orch");
+  const worker = await env.adapter("omp", "held-reader-worker", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  await orch.client.request("send", { to: "worker", text: "held-reader-preview" });
+  await worker.client.request("send", { to: "human", text: `${"long incoming paragraph\n".repeat(40)}latest-incoming-tail` });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  ui.size.columns = 80;
+  ui.size.rows = 4;
+  await ui.press("ENTER");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held") && !row.includes("latest-incoming-tail")));
+  assert.equal(await unread(human, worker.session.id), 1, "hidden body and bar do not expose the incoming row");
+  ui.size.columns = 120;
+  ui.size.rows = 32;
+  await ui.press("HOME");
+  assert.ok(ui.rows().some((row) => row.includes("held-reader-preview")));
+  assert.ok(ui.rows().every((row) => !row.includes("latest-incoming-tail")));
+  assert.equal(await unread(human, worker.session.id), 1, "a visible held preview is not the incoming message");
+  await ui.press("END");
+  assert.ok(ui.rows().some((row) => row.includes("latest-incoming-tail")));
+  assert.equal(await unread(human, worker.session.id), 0, "only the reached newest incoming row advances the marker");
+  assertWithin(ui);
 });
 
 test("wide bordered conversation keeps every wrapped body row reachable and reads only the visible last incoming row", async () => {
