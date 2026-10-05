@@ -931,6 +931,7 @@ export class Daemon {
         type: "session", action: "removed", name: provisional.name, harness: "claude",
         reason: `merged into ${ancestor.name}`, session: { ...provisional, state: "removed", removedAt: this.now() },
       });
+      for (const channel of transfer.channels) this.emit({ type: "channel", action: "updated", channel });
       this.emit({ type: "read", state: this.store.ensureRead({ scope: "session", sessionId: ancestor.id }) });
       setImmediate(() => void this.flush(ancestor.id));
       return this.store.session(ancestor.id)!;

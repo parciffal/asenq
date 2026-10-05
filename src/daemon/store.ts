@@ -411,10 +411,17 @@ export class Store {
   }
 
   /** Moves a provisional conversation into its recognized ancestor, without changing ancestor policy. */
-  mergeClaudeIdentity(provisionalId: string, ancestorId: string): { droppedReminder?: number } {
+  mergeClaudeIdentity(provisionalId: string, ancestorId: string): { channels: ChannelSummary[]; droppedReminder?: number } {
     return this.transaction(() => {
       const provisional = this.identity(provisionalId)!;
       const ancestor = this.identity(ancestorId)!;
+      const channels = this.db.all<{ channel: string }>("SELECT channel FROM channel_members WHERE session_id=?", provisionalId);
+      this.db.run("UPDATE session_identities SET role=COALESCE(role,?) WHERE id=?", provisional.role ?? null, ancestorId);
+      this.db.run(
+        "INSERT OR IGNORE INTO channel_members(channel,session_id) SELECT channel,? FROM channel_members WHERE session_id=?",
+        ancestorId, provisionalId,
+      );
+      this.db.run("DELETE FROM channel_members WHERE session_id=?", provisionalId);
       const previous = [...ancestor.previousNames];
       for (const name of [...provisional.previousNames, provisional.name]) {
         if (name !== ancestor.name && !previous.includes(name)) previous.push(name);
@@ -450,8 +457,11 @@ export class Store {
       this.db.run("DELETE FROM human_read_positions WHERE scope='session' AND stream_key=?", provisionalId);
       this.db.run("DELETE FROM sessions WHERE id=?", provisionalId);
       this.db.run("DELETE FROM session_identities WHERE id=?", provisionalId);
-      return ancestorRead?.reminder != null && oldRead?.reminder != null && ancestorRead.reminder !== oldRead.reminder
-        ? { droppedReminder: oldRead.reminder } : {};
+      return {
+        channels: channels.map((row) => this.channelSummary(row.channel)),
+        ...(ancestorRead?.reminder != null && oldRead?.reminder != null && ancestorRead.reminder !== oldRead.reminder
+          ? { droppedReminder: oldRead.reminder } : {}),
+      };
     });
   }
 

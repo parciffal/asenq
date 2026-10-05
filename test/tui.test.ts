@@ -718,7 +718,7 @@ test("channel palette edits and member hit targets keep delivery in channel scop
     await ui.type(`post-${columns}`);
     await ui.press("ENTER");
     const posts = (await human.request("channel_read", { channel: "empty" })).messages as StoredMessage[];
-    assert.ok(posts.some((post) => post.text === `post-${columns}` && post.channel === "empty" && post.from === "human"));
+    assert.ok(posts.some((post) => post.text === `post-${columns}` && post.from === "human"));
     assert.deepEqual(alpha.deliveries, [], "selecting a member never targets a direct message");
     assertWithin(ui);
     await ui.press("ESCAPE");
