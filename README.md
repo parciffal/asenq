@@ -77,12 +77,20 @@ Run the API tests and report back.
 
 | Tool | Purpose |
 |---|---|
-| `asenq_send` | Send `text` to a session name, to `"*"` (every live session) or to `"human"`. Optional fields: `kind` (`chat`, `task`, `result`, `status`), `thread`, `reply_to`, `done`. |
+| `asenq_send` | Send `text` to a session name, to `"*"` (every live session) or to `"human"`. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
 | `asenq_list` | List sessions; the caller's own row is marked `[you]`. |
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
 | `asenq_rename` | Rename this session. |
 | `asenq_channel_send` / `_read` / `_list` | Named channels. Agents read them on demand; channel messages are never pushed into a session. |
+
+Control messages are urgent labels, not commands enforced by asenq. `kind: "control"` requires `action: "pause"`, `"resume"` or `"cancel"`; `action` is invalid on other kinds. Text is still required. Delivery carries `[URGENT]` and the action, but asenq never pauses, resumes or cancels a session, changes its inbound policy, or bypasses hold/refuse, rate limits or queues.
+
+```sh
+asenq send worker-oc "Pause after the current check" --kind control --action pause
+```
+
+Agents can send the same message with `asenq_send { to: "worker-oc", text: "Pause after the current check", kind: "control", action: "pause" }`. The TUI displays control actions; use the CLI or agent tool to send them, not the TUI editor.
 
 ### Inbox paging and full-text recovery
 
@@ -136,7 +144,7 @@ Sessions lists live sessions first, then reconnecting ones, then a collapsed **A
 
 Unread is **not delivery**. Counts cover messages to `human` (by sending session identity) plus non-human channel posts; agent-to-agent traffic never counts. Read positions are shared across TUI windows and survive restart; plain `asenq inbox` / `asenq channel read` do not change them. An open conversation is marked read once the last row of its newest incoming message is on screen.
 
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 4).
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 5).
 
 ## How delivery works
 
@@ -153,7 +161,7 @@ Subagents (Claude subagents, OpenCode child sessions, omp subagents) are not reg
 **What happens to messages:**
 
 - **The target disappears.** asenq queues the message. The target has 2 minutes to come back; a harness restarted with the same name and working directory takes over the old session and its queue. After that, the message expires and the sender gets a notice.
-- **Loops and floods.** From one agent, the same text sent to the same target within 30 s is dropped. Each agent can send 30 messages in a burst, then one every 2 s. A target with 50 queued messages refuses more.
+- **Loops and floods.** From one agent, the same text sent to the same target within 30 s is dropped. For control messages, the kind and action also distinguish duplicates, so identical text with `pause` then `resume` is delivered twice. Each agent can send 30 messages in a burst, then one every 2 s. A target with 50 queued messages refuses more.
 - **Inbound policy.** `asenq inbound <name> hold` holds messages from other agents until you run `asenq release` or `asenq drop`. `refuse` rejects them. Messages you send yourself skip `hold`.
 - **History.** Messages are kept for 7 days. Set `historyDays` in `~/.asenq/config.json` to change this.
 

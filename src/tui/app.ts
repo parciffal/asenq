@@ -1592,6 +1592,7 @@ export class ConsoleApp {
     if (!text.trim()) throw new Error("Message text is empty");
     const count = this.sessions.filter((s) => s.state === "live").length;
     if (target === "*" && confirmation !== `yes ${count}`) throw new Error(`Broadcast to ${count} live sessions: enter 'yes ${count}' to confirm`);
+    if (kind === "control") throw new Error("Control messages require an action; send them with CLI --kind control --action or MCP asenq_send instead");
     const kindOption = KINDS.find((candidate) => candidate === kind);
     if (kind && !kindOption) throw new Error(`Kind must be one of ${KINDS.join(", ")}`);
     if (done && !["yes", "no", "true", "false"].includes(done)) throw new Error("Done must be yes or no");

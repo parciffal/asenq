@@ -3,9 +3,9 @@ import { chmodSync, mkdirSync, rmSync } from "node:fs";
 import net from "node:net";
 import { join } from "node:path";
 import {
-  ACK_TIMEOUT_MS, AsenqError, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, NAME_RE, PROBE_MS,
+  ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, NAME_RE, PROBE_MS,
   PROTOCOL, RESERVED, RETRY_MS, slug,
-  type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
+  type ControlAction, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
   type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
@@ -891,6 +891,14 @@ export class Daemon {
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);
     const kind = str(p, "kind") as Kind | undefined;
     if (kind !== undefined && !KINDS.includes(kind)) throw new AsenqError("bad_request", `kind must be one of ${KINDS.join(", ")}`);
+    const action = str(p, "action") as ControlAction | undefined;
+    if (kind === "control") {
+      if (action === undefined || !CONTROL_ACTIONS.includes(action)) {
+        throw new AsenqError("bad_request", `control action must be one of ${CONTROL_ACTIONS.join(", ")}`);
+      }
+    } else if (p.action !== undefined) {
+      throw new AsenqError("bad_request", "action is only valid for kind control");
+    }
     if (p.done !== undefined && typeof p.done !== "boolean") throw new AsenqError("bad_request", '"done" must be a boolean');
     let stableTarget: SessionRow | undefined;
     if (targetSessionId !== undefined) {
@@ -906,7 +914,7 @@ export class Daemon {
     const now = this.now();
     const base: MsgRow = {
       id: "", from_name: this.senderName(s), from_session: s.kind === "agent" ? s.session.id : null,
-      to_name: "", to_session: null, channel: null, text, kind: kind ?? null, thread: str(p, "thread") ?? null,
+      to_name: "", to_session: null, channel: null, text, kind: kind ?? null, action: action ?? null, thread: str(p, "thread") ?? null,
       reply_to: str(p, "replyTo") ?? null, done: p.done === true ? 1 : 0, status: "queued", reason: null, attempts: 0,
       created_at: now, updated_at: now, ord: 0,
     };
@@ -936,7 +944,8 @@ export class Daemon {
       return { to: target.name, msgId: row.id, status, ...(reason ? { reason } : {}) };
     };
     if (s.kind === "agent") {
-      const dupKey = `${s.session.id}\0${target.id}\0${row.text}`;
+      const bodyKey = row.kind === "control" ? `control\0${row.action}\0${row.text}` : `message\0${row.text}`;
+      const dupKey = `${s.session.id}\0${target.id}\0${bodyKey}`;
       const seen = this.dupSeen.get(dupKey);
       if (seen !== undefined && now - seen < DUP_WINDOW_MS) return finish("dropped", "duplicate");
       this.dupSeen.set(dupKey, now);

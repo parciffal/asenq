@@ -1,5 +1,5 @@
 import type {
-  ChannelSummary, Harness, Inbound, InboxSummary, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
+  ChannelSummary, ControlAction, Harness, Inbound, InboxSummary, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
   SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
 } from "../shared/protocol.js";
 import type { Db } from "../shared/sqlite.js";
@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   created_at INTEGER NOT NULL, UNIQUE(harness, key));
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
-  channel TEXT, text TEXT NOT NULL, kind TEXT, thread TEXT, reply_to TEXT,
+  channel TEXT, text TEXT NOT NULL, kind TEXT, action TEXT, thread TEXT, reply_to TEXT,
   done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ord INTEGER, delivery_seq INTEGER);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(to_session, status);
@@ -38,7 +38,7 @@ export type SessionRow = {
 
 export type MsgRow = {
   id: string; from_name: string; from_session: string | null; to_name: string; to_session: string | null;
-  channel: string | null; text: string; kind: Kind | null; thread: string | null; reply_to: string | null;
+  channel: string | null; text: string; kind: Kind | null; action?: ControlAction | null; thread: string | null; reply_to: string | null;
   done: number; status: MsgStatus; reason: string | null; attempts: number;
   created_at: number; updated_at: number; ord: number; delivery_seq?: number | null;
 };
@@ -60,6 +60,7 @@ type ReadRow = {
 export function toWire(r: MsgRow): WireMsg {
   const m: WireMsg = { id: r.id, from: r.from_name, to: r.to_name, text: r.text, createdAt: r.created_at };
   if (r.kind) m.kind = r.kind;
+  if (r.action) m.action = r.action;
   if (r.thread) m.thread = r.thread;
   if (r.reply_to) m.replyTo = r.reply_to;
   if (r.done) m.done = true;
@@ -95,6 +96,7 @@ function toIdentity(r: IdentityRow): SessionIdentity {
 export class Store {
   constructor(readonly db: Db) {
     db.exec(SCHEMA);
+    this.migrateMessageAction();
     this.migrateMessageOrder();
     this.backfillIdentities();
     this.initializeReadPositions();
@@ -122,6 +124,11 @@ export class Store {
       "INSERT INTO protocol_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
       key, value,
     );
+  }
+
+  private migrateMessageAction(): void {
+    const columns = this.db.all<{ name: string }>("PRAGMA table_info(messages)");
+    if (!columns.some((column) => column.name === "action")) this.db.exec("ALTER TABLE messages ADD COLUMN action TEXT");
   }
 
   private migrateMessageOrder(): void {
@@ -368,9 +375,9 @@ export class Store {
     row.ord = order;
     row.delivery_seq = row.channel === null && row.status === "delivered" ? this.nextDeliverySequence() : null;
     this.db.run(
-      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      row.id, row.from_name, row.from_session, row.to_name, row.to_session, row.channel, row.text, row.kind, row.thread, row.reply_to,
+      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,text,kind,action,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      row.id, row.from_name, row.from_session, row.to_name, row.to_session, row.channel, row.text, row.kind, row.action ?? null, row.thread, row.reply_to,
       row.done, row.status, row.reason, row.attempts, row.created_at, row.updated_at, row.ord, row.delivery_seq,
     );
     return row;

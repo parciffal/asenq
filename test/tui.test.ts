@@ -612,3 +612,19 @@ test("chrome composer is a focused rounded box with target and editing hints", a
   assert.equal((await reviewer.nextDelivery()).msg.text, "hello\nthere");
   assertWithin(ui);
 });
+
+test("console shows control actions beside their kind without changing ordinary message tags", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  await alpha.client.request("send", { to: "human", text: "Ordinary status", kind: "status" });
+  await alpha.client.request("send", { to: "human", text: "Please pause here", kind: "control", action: "pause" });
+  const ui = await startConsole(120, 30);
+  await ui.until(() => ui.rows().some((row) => row.includes("Please pause here")), "control message");
+
+  const control = ui.rows().find((row) => row.includes(" · control"));
+  const ordinary = ui.rows().find((row) => row.includes(" · status"));
+  assert.ok(control?.includes("pause"), "the visible control tag carries its action");
+  assert.ok(ordinary, "ordinary status tag remains visible");
+  assert.ok(!ordinary.includes("pause") && !ordinary.includes("control"), "ordinary metadata is unchanged");
+  assertWithin(ui);
+});

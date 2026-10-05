@@ -201,3 +201,69 @@ test("inbox keeps a near-cap message whole when a compact more marker fits", asy
   assert.match(output, /more available/);
   assert.ok(!output.includes("truncated"));
 });
+
+test("control tools deliver urgent actions and retain them in inbox and thread recovery", async () => {
+  env = await startEnv();
+  const sender = await env.adapter("omp", "sender", "sender");
+  const receiver = await env.adapter("omp", "receiver", "receiver");
+
+  for (const action of ["pause", "resume", "cancel"]) {
+    const result = await callTool(sender.client, "asenq_send", {
+      to: "receiver", text: "Please change course", kind: "control", action, thread: "control-loop",
+    });
+    assert.match(result, /^receiver m_[0-9a-f]{12} delivered$/);
+    const delivery = await receiver.nextDelivery();
+    assert.match(delivery.text.split("\n")[0], /\[URGENT\]/);
+    assert.ok(delivery.text.split("\n")[0].includes(`action=${action}`));
+    const recovered = await callTool(receiver.client, "asenq_inbox", { id: delivery.msg.id });
+    assert.ok(recovered.includes(`kind=control · action=${action}`));
+    assert.ok(recovered.endsWith("Please change course"));
+  }
+
+  for (const output of [
+    await callTool(receiver.client, "asenq_inbox", { unread_only: false }),
+    await callTool(sender.client, "asenq_thread_read", { thread: "control-loop" }),
+  ]) {
+    assert.equal(messageIds(output).length, 3, "distinct actions with identical text all survive");
+    for (const action of ["pause", "resume", "cancel"]) assert.ok(output.includes(`kind=control · action=${action}`));
+  }
+});
+
+test("control tool validation errors stay visible and admit no messages", async () => {
+  env = await startEnv();
+  const sender = await env.adapter("omp", "sender", "sender");
+  const receiver = await env.adapter("omp", "receiver", "receiver");
+  for (const extra of [
+    { kind: "control" },
+    { kind: "control", action: "stop" },
+    { kind: "chat", action: "pause" },
+    { action: "resume" },
+    { kind: "control", action: "cancel", text: "" },
+  ]) {
+    const result = await callTool(sender.client, "asenq_send", {
+      to: "receiver", text: "Do not admit invalid controls", ...extra,
+    });
+    assert.match(result, /^asenq error \(bad_request\): /);
+  }
+  assert.equal(await callTool(receiver.client, "asenq_inbox", { unread_only: false }), "no messages");
+  assert.equal(receiver.deliveries.length, 0, "invalid requests never reach delivery");
+});
+
+test("clipped control metadata retains its action and full recovery preserves the thread", async () => {
+  env = await startEnv();
+  const receiver = await env.adapter("omp", "receiver", "receiver");
+  const thread = "t".repeat(20_000);
+  const msgId = await send(env.human(), "receiver", "Keep this control body", { kind: "control", action: "cancel", thread });
+  const clipped = await callTool(receiver.client, "asenq_inbox", { unread_only: false });
+  assert.ok(clipped.length <= 16_000);
+  assert.ok(clipped.includes(` · ${msgId} · kind=control · action=cancel`), "clipping optional metadata keeps the control intent");
+  assert.ok(clipped.includes("Keep this control body"));
+  assert.match(clipped, /truncated/);
+  for (const recovered of [
+    await callTool(receiver.client, "asenq_inbox", { id: msgId }),
+    await callTool(receiver.client, "asenq_thread_read", { thread }),
+  ]) {
+    assert.ok(recovered.includes(`kind=control · action=cancel · thread=${thread}`));
+    assert.ok(recovered.endsWith("Keep this control body"));
+  }
+});
