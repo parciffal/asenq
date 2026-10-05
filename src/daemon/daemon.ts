@@ -448,7 +448,7 @@ export class Daemon {
   private opFileCheck(s: Sender, p: Params): Result {
     const scope = this.directScope(s);
     const row = this.store.db.get<MsgRow>(
-      `SELECT * FROM messages WHERE id=? AND ${scope.sql}`, str(p, "id", true), ...scope.params,
+      `SELECT * FROM messages WHERE id=? AND ${scope.sql}`, str(p, "msgId", true), ...scope.params,
     );
     if (!row?.file) throw new AsenqError("bad_request", "no retained file reference for the caller");
     const file = toWire(row).file!;

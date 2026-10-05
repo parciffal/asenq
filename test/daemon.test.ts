@@ -349,21 +349,21 @@ test("file checks compare send-time bytes and report missing for removed or non-
   const [sent] = await send(alpha.client, "beta", "Please review", { file: { path, summary: "Report" } });
   const delivery = await beta.nextDelivery();
   assert.ok(delivery.text.includes("Please review\nReport"));
-  assert.equal((await alpha.client.request("file_check", { id: sent.msgId })).status, "match");
-  assert.equal((await beta.client.request("file_check", { id: sent.msgId })).status, "match");
+  assert.equal((await alpha.client.request("file_check", { msgId: sent.msgId })).status, "match");
+  assert.equal((await beta.client.request("file_check", { msgId: sent.msgId })).status, "match");
   writeFileSync(path, "abd");
-  assert.equal((await beta.client.request("file_check", { id: sent.msgId })).status, "changed");
+  assert.equal((await beta.client.request("file_check", { msgId: sent.msgId })).status, "changed");
   const retained = (await beta.client.request("inbox", { msgId: sent.msgId })).messages as StoredMessage[];
   assert.equal(retained[0].file?.sha256, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
   assert.equal(retained[0].file?.size, 3);
   rmSync(path);
-  assert.equal((await beta.client.request("file_check", { id: sent.msgId })).status, "missing");
+  assert.equal((await beta.client.request("file_check", { msgId: sent.msgId })).status, "missing");
   execFileSync("mkfifo", [path]);
-  assert.equal((await beta.client.request("file_check", { id: sent.msgId })).status, "missing");
+  assert.equal((await beta.client.request("file_check", { msgId: sent.msgId })).status, "missing");
   rmSync(path);
   mkdirSync(path);
-  assert.equal((await beta.client.request("file_check", { id: sent.msgId })).status, "missing");
-  await assert.rejects(alpha.client.request("file_check", { id: "m_absent" }), { code: "bad_request" });
+  assert.equal((await beta.client.request("file_check", { msgId: sent.msgId })).status, "missing");
+  await assert.rejects(alpha.client.request("file_check", { msgId: "m_absent" }), { code: "bad_request" });
 });
 
 test("file references reject malformed metadata and paths, including FIFOs without blocking", async () => {
@@ -388,7 +388,7 @@ test("file references reject malformed metadata and paths, including FIFOs witho
   }
   const result = await human.request("send", { to: "human", file: { path, summary: "x".repeat(500) } });
   const [sent] = result.results as SendResult[];
-  assert.equal((await human.request("file_check", { id: sent.msgId })).status, "match");
+  assert.equal((await human.request("file_check", { msgId: sent.msgId })).status, "match");
   assert.deepEqual(((await human.request("inbox")).messages as StoredMessage[]).map((m) => m.id), [sent.msgId]);
   writeFileSync(path, "é");
   const unicode = (await human.request("send", { to: "human", file: { path, summary: "UTF-8 report" } })).results as SendResult[];
@@ -407,7 +407,7 @@ test("unreadable file sends fail and retained references report missing", { skip
     await assert.rejects(human.request("send", { to: "human", file: { path, summary: "Report" } }), {
       code: "bad_request", message: /cannot read regular file/,
     });
-    assert.equal((await human.request("file_check", { id: sent.msgId })).status, "missing");
+    assert.equal((await human.request("file_check", { msgId: sent.msgId })).status, "missing");
   } finally {
     chmodSync(path, 0o600);
   }
@@ -424,33 +424,33 @@ test("file checks enforce exact direct-message identity and shared-connection se
   const file = { path, summary: "Report" };
   const [sent] = await send(alpha.client, "beta", "", { file });
   for (const client of [stranger.client, human]) {
-    await assert.rejects(client.request("file_check", { id: sent.msgId }), { code: "bad_request" });
+    await assert.rejects(client.request("file_check", { msgId: sent.msgId }), { code: "bad_request" });
   }
   const [posted] = await send(alpha.client, "human", "", { file });
-  assert.equal((await human.request("file_check", { id: posted.msgId })).status, "match");
-  await assert.rejects(beta.client.request("file_check", { id: posted.msgId }), { code: "bad_request" });
+  assert.equal((await human.request("file_check", { msgId: posted.msgId })).status, "match");
+  await assert.rejects(beta.client.request("file_check", { msgId: posted.msgId }), { code: "bad_request" });
   const [fromHuman] = await send(human, "beta", "", { file });
-  assert.equal((await human.request("file_check", { id: fromHuman.msgId })).status, "match");
-  assert.equal((await beta.client.request("file_check", { id: fromHuman.msgId })).status, "match");
+  assert.equal((await human.request("file_check", { msgId: fromHuman.msgId })).status, "match");
+  assert.equal((await beta.client.request("file_check", { msgId: fromHuman.msgId })).status, "match");
   const shared = env.human();
   await shared.request("register", { harness: "omp", key: "file-alpha", name: "alpha" });
   await shared.request("register", { harness: "omp", key: "file-stranger", name: "stranger" });
-  await assert.rejects(shared.request("file_check", { id: sent.msgId }), { code: "bad_request", message: /"as" is required/ });
-  assert.equal((await shared.request("file_check", { id: sent.msgId, as: alpha.session.id })).status, "match");
-  await assert.rejects(shared.request("file_check", { id: sent.msgId, as: stranger.session.id }), { code: "bad_request" });
-  await assert.rejects(shared.request("file_check", { id: sent.msgId, as: beta.session.id }), { code: "bad_request", message: /not bound/ });
+  await assert.rejects(shared.request("file_check", { msgId: sent.msgId }), { code: "bad_request", message: /"as" is required/ });
+  assert.equal((await shared.request("file_check", { msgId: sent.msgId, as: alpha.session.id })).status, "match");
+  await assert.rejects(shared.request("file_check", { msgId: sent.msgId, as: stranger.session.id }), { code: "bad_request" });
+  await assert.rejects(shared.request("file_check", { msgId: sent.msgId, as: beta.session.id }), { code: "bad_request", message: /not bound/ });
   await human.request("set_inbound", { name: "beta", mode: "hold" });
   const [held] = await send(shared, "beta", "held", { file, as: alpha.session.id });
   assert.equal(held.status, "held");
-  assert.equal((await shared.request("file_check", { id: held.msgId, as: alpha.session.id })).status, "match");
-  await assert.rejects(beta.client.request("file_check", { id: held.msgId }), { code: "bad_request" });
+  assert.equal((await shared.request("file_check", { msgId: held.msgId, as: alpha.session.id })).status, "match");
+  await assert.rejects(beta.client.request("file_check", { msgId: held.msgId }), { code: "bad_request" });
   await human.request("release", { msgId: held.msgId });
-  assert.equal((await beta.client.request("file_check", { id: held.msgId })).status, "match");
+  assert.equal((await beta.client.request("file_check", { msgId: held.msgId })).status, "match");
   await beta.client.request("unregister");
   const replacement = await env.adapter("omp", "replacement-beta", "beta");
-  await assert.rejects(replacement.client.request("file_check", { id: sent.msgId }), { code: "bad_request" });
+  await assert.rejects(replacement.client.request("file_check", { msgId: sent.msgId }), { code: "bad_request" });
   const [plain] = await send(human, "human", "legacy text");
-  await assert.rejects(human.request("file_check", { id: plain.msgId }), { code: "bad_request" });
+  await assert.rejects(human.request("file_check", { msgId: plain.msgId }), { code: "bad_request" });
 });
 
 test("duplicate detection distinguishes reference path, summary, hash and control action", async () => {
@@ -2354,7 +2354,7 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
     writeFileSync(path, "abc");
     const [reference] = await send(agent, "human", "", { file: { path, summary: "Migrated report" } });
     assert.equal(reference.status, "posted");
-    assert.equal((await agent.request("file_check", { id: reference.msgId })).status, "match");
+    assert.equal((await agent.request("file_check", { msgId: reference.msgId })).status, "match");
     const fileHistory = await client.historyPage({ scope: "inbox" });
     assert.deepEqual(fileHistory.messages.at(-1)?.file, {
       path, summary: "Migrated report", sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", size: 3,
@@ -2762,7 +2762,7 @@ test("file references persist across database reopen and queued delivery never r
     assert.deepEqual(deliveries.map((delivery) => [delivery.msg.id, delivery.msg.text, delivery.msg.file]), [[queued.msgId, "", file]]);
     assert.ok(deliveries[0].text.includes(`read the file; verify with asenq_file_check id=${queued.msgId}`));
     assert.ok(!deliveries[0].text.includes("\nabc\n"));
-    assert.equal((await beta.request("file_check", { id: queued.msgId })).status, "missing");
+    assert.equal((await beta.request("file_check", { msgId: queued.msgId })).status, "missing");
     const history = await human.historyPage({ scope: "inbox" });
     assert.deepEqual(history.messages.map((message) => [message.id, message.text, message.file]), [[posted.msgId, "Read when needed", file]]);
     const replay = await human.replay(before.watermark);
@@ -2771,7 +2771,7 @@ test("file references persist across database reopen and queued delivery never r
         .map((entry) => entry.event.type === "message" && entry.event.msg.file),
       [file],
     );
-    assert.equal((await human.request("file_check", { id: posted.msgId })).status, "missing");
+    assert.equal((await human.request("file_check", { msgId: posted.msgId })).status, "missing");
   } finally {
     alpha.close();
     beta.close();

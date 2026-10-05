@@ -183,7 +183,7 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
         return formatSendResults(r.results as SendResult[]);
       }
       case "asenq_file_check": {
-        const r = await client.request("file_check", { ...who, id: args.id });
+        const r = await client.request("file_check", { ...who, msgId: args.id });
         return String(r.status);
       }
       case "asenq_list": {
