@@ -126,7 +126,13 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
           bound.delete(id);
           children.delete(id);
           if (b) await client.request("unregister", { as: b.id });
-        } else if ((event.type === "session.status" || event.type === "session.updated") && !bound.has(id) && !children.has(id)) {
+        } else if (event.type === "session.status") {
+          const b = await register(id);
+          if (!b) return;
+          const status = event.properties?.status as { type?: unknown } | undefined;
+          const busy = status?.type === "busy" ? true : status?.type === "idle" ? false : null;
+          await client.request("session_status", { as: b.id, busy });
+        } else if (event.type === "session.updated" && !bound.has(id) && !children.has(id)) {
           await register(id);
         }
       } catch (e) {
