@@ -10,7 +10,7 @@ import {
   changedTerminalRows, normalizeTerminalLine, terminalTextWidth, translateKeyboardInput, truncateTerminalText, wrapTerminalText,
   type TerminalAdapterOptions, type TerminalFrame, type TerminalLine, type TerminalSize,
 } from "../src/tui/terminal.js";
-import { logOf, startEnv, type TestEnv } from "./helpers.js";
+import { logOf, startEnv, type Adapter, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 let open: Console | undefined;
@@ -33,6 +33,7 @@ type Console = {
   resize(columns: number, rows: number): Promise<void>;
   close(): void;
   type(text: string): Promise<void>;
+  paste(text: string): Promise<void>;
   until(predicate: () => boolean | Promise<boolean>, what: string): Promise<void>;
 };
 
@@ -1480,5 +1481,340 @@ test("r and x remain ordinary draft characters while a held bar is visible", asy
   await ui.until(() => target.deliveries.length === 1, "draft delivered without releasing held message");
   assert.equal((await target.nextDelivery()).msg.text, "rx", "both characters stay in the sent draft");
   assert.equal(((await human.request("held")).messages as unknown[]).length, 1, "human draft delivery bypasses hold without releasing agent messages");
+  assertWithin(ui);
+});
+
+async function paletteAction(ui: Console, action: string): Promise<void> {
+  await ui.press("?");
+  await ui.type(action);
+  await ui.press("ENTER");
+}
+
+async function selectSession(ui: Console, name: string): Promise<void> {
+  await ui.press("s");
+  await ui.press("/");
+  await ui.type(name);
+  await ui.press("ENTER");
+}
+
+test("Ctrl+X closes only a selected session row after one-key confirmation and leaves composer input alone", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "close-alpha", "alpha");
+  const beta = await env.adapter("omp", "close-beta", "beta");
+  const ui = await startConsole(120, 24);
+  await selectSession(ui, "alpha");
+  assert.ok(ui.rows().at(-1)!.includes("Ctrl+X"), "close is discoverable on the selected row");
+  await ui.press("CTRL_X");
+  assert.ok(ui.rows().some((row) => row.includes(alpha.session.id)), "confirmation identifies the pinned target");
+  assert.ok(ui.rows().at(-1)!.includes("confirm") && ui.rows().at(-1)!.includes("cancel"));
+  await ui.press("ENTER");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === alpha.session.id)!.state, "live", "Enter cannot accidentally confirm");
+  await ui.paste("y");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === alpha.session.id)!.state, "live", "pasted text cannot accidentally confirm");
+  await ui.press("n");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === alpha.session.id)!.state, "live", "cancel leaves the target live");
+
+  await ui.press("ENTER");
+  await ui.press("CTRL_X");
+  assert.ok(!ui.rows().some((row) => row.includes("y confirm")), "conversation focus does not close a row");
+  await ui.press("c");
+  await ui.type("draft");
+  await ui.press("CTRL_X");
+  await ui.type("y");
+  await ui.press("ENTER");
+  assert.equal((await alpha.nextDelivery()).msg.text, "drafty", "Ctrl+X does not intercept the composer");
+  await ui.press("ESCAPE");
+  await ui.press("LEFT");
+  await ui.press("CTRL_X");
+  await human.request("rename", { from: "alpha", name: "renamed" });
+  await ui.press("y");
+  await ui.until(() => ui.rows()[0].includes("1 live"), "closed target leaves live rows");
+  const snapshot = await human.sync();
+  assert.equal(snapshot.sessions.find((s) => s.id === alpha.session.id)!.state, "removed", "confirmation stays bound across rename");
+  assert.equal(snapshot.sessions.find((s) => s.id === beta.session.id)!.state, "live", "the other row stays live");
+  await ui.press("ESCAPE");
+  await ui.press("END");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("renamed") && row.includes("archived")), "closed conversation is reachable in the archive");
+  assertWithin(ui);
+});
+
+test("close all stale probes quiet sessions and excludes responding and unknown identities", async () => {
+  const pingTimeoutMs = 25;
+  env = await startEnv({ pingTimeoutMs });
+  const human = env.human();
+  const quiet = await env.adapter("omp", "quiet-key", "quiet");
+  const hung = await env.adapter("omp", "hung-key", "hung", { autoPong: false });
+  const legacy = await env.adapter("omp", "legacy-key", "legacy", { pingSupport: false });
+  const hookOnly = (await human.request("claude_hook", {
+    event: "start", key: "sid:hook-only", sessionId: "hook-only", socket: null, name: "hook-only",
+  })).session as { id: string; name: string };
+  const deadSocket = join(env.home, "dead-claude.sock");
+  const deadClaude = (await human.request("claude_hook", {
+    event: "start", key: deadSocket, socket: deadSocket, sessionId: "dead-claude", name: "dead-claude",
+  })).session as { id: string; name: string };
+  env.clock.advance(6 * 3_600_000 + 1);
+  const ui = await startConsole(120, 28);
+  await ui.press("?");
+  await ui.type("Close all stale");
+  const action = ui.press("ENTER");
+  await hung.nextPing();
+  await quiet.nextPing();
+  await quiet.client.request("list"); // round trip after its automatic pong, before expiring hung
+  env.clock.advance(pingTimeoutMs);
+  env.daemon.sweep();
+  await action;
+  const rows = ui.rows().join("\n");
+  assert.match(rows, /2 conversations/, "only the hung adapter and dead Claude socket are counted");
+  for (const session of [hung.session, deadClaude]) {
+    assert.ok(rows.includes(`${session.name} (${session.id})`), "failed probes identify their close targets");
+  }
+  for (const session of [quiet.session, legacy.session, hookOnly]) {
+    assert.ok(!rows.includes(session.id), "responsive or unsupported quiet sessions are not close targets");
+  }
+  await ui.press("y");
+  const snapshot = await human.sync();
+  for (const session of [hung.session, deadClaude]) {
+    assert.equal(snapshot.sessions.find((s) => s.id === session.id)!.state, "removed");
+  }
+  for (const session of [quiet.session, legacy.session, hookOnly]) {
+    assert.equal(snapshot.sessions.find((s) => s.id === session.id)!.state, "live");
+  }
+  assert.equal(snapshot.sessionPings[quiet.session.id], "responding", "six hours without direct messages does not make a responding session stale");
+  assert.equal(snapshot.sessionPings[legacy.session.id], "unknown", "older adapters remain safe without capabilities");
+  assert.equal(snapshot.sessionPings[hookOnly.id], "unknown", "hook-only Claude has no socket to probe");
+  assertWithin(ui);
+});
+
+test("close all stale bounds its preview, cancels safely and submits only the confirmed identities", async () => {
+  const pingTimeoutMs = 25;
+  env = await startEnv({ pingTimeoutMs });
+  const human = env.human();
+  const hung: Adapter[] = [];
+  for (let index = 0; index < 12; index++) {
+    hung.push(await env.adapter("omp", `hung-${index}`, `hung-${index}`, { autoPong: false }));
+  }
+  const quiet = await env.adapter("omp", "snapshot-quiet", "quiet");
+  const gone = await env.adapter("omp", "gone-key", "gone");
+  const goneEvent = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === gone.session.id);
+  gone.client.close();
+  await goneEvent.event;
+  const archived = await env.adapter("omp", "archive-key", "archived");
+  await human.request("close", { identity: archived.session.id });
+  const ui = await startConsole(120, 28);
+  const targetIds = new Set([...hung.map((adapter) => adapter.session.id), gone.session.id]);
+  const preview = async (): Promise<void> => {
+    await ui.press("?");
+    await ui.type("Close all stale");
+    const action = ui.press("ENTER");
+    await Promise.all(hung.map((adapter) => adapter.nextPing()));
+    await quiet.nextPing();
+    await quiet.client.request("list");
+    env!.clock.advance(pingTimeoutMs);
+    env!.daemon.sweep();
+    await action;
+    const rows = ui.rows().join("\n");
+    assert.match(rows, /13 conversations/, "all twelve hung sessions and the disconnected session are counted");
+    const targets = (await human.sync()).sessions.filter((session) => targetIds.has(session.id));
+    for (const session of targets.slice(0, 10)) {
+      assert.ok(rows.includes(`${session.name} (${session.id})`), "preview names the first ten exact targets");
+    }
+    for (const session of targets.slice(10)) {
+      assert.ok(!rows.includes(session.id), "remaining targets are counted instead of expanding the preview");
+    }
+    assert.ok(rows.includes("and 3 more"), "the preview reports its omitted target count");
+    assert.ok(!rows.includes(quiet.session.id) && !rows.includes(archived.session.id), "responding and archived identities are excluded");
+  };
+  await preview();
+  await ui.press("n");
+  assert.equal((await human.sync()).sessions.filter((s) => targetIds.has(s.id) && s.state === "removed").length, 0, "cancel closes no targets");
+  await preview();
+  const later = await env.adapter("omp", "later-key", "later");
+  for (const adapter of [quiet, later]) {
+    const disconnected = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === adapter.session.id);
+    adapter.client.close();
+    await disconnected.event;
+  }
+  await ui.press("y");
+  const snapshot = await human.sync();
+  for (const id of targetIds) assert.equal(snapshot.sessions.find((session) => session.id === id)!.state, "removed");
+  for (const adapter of [quiet, later]) {
+    assert.equal(snapshot.sessions.find((session) => session.id === adapter.session.id)!.state, "gone", "newly disconnected and newly arrived identities are not silently added");
+  }
+  assertWithin(ui);
+});
+
+test("Ping sessions refreshes rows and external pongs and disconnection update an already open console", async () => {
+  const pingTimeoutMs = 25;
+  env = await startEnv({ pingTimeoutMs });
+  const human = env.human();
+  const hung = await env.adapter("omp", "ping-status-key", "worker", { autoPong: false });
+  const ui = await startConsole(120, 24);
+  await ui.press("?");
+  await ui.type("Ping sessions");
+  const action = ui.press("ENTER");
+  await hung.nextPing();
+  env.clock.advance(pingTimeoutMs);
+  env.daemon.sweep();
+  await action;
+  assert.ok(ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "failed ping renders on the live session row");
+  assert.equal((await human.sync()).sessions.find((session) => session.id === hung.session.id)!.state, "live", "ping failure does not disconnect or close the session");
+  assert.ok(!ui.rows().some((row) => row.includes("y confirm")), "Ping sessions never opens a destructive confirmation");
+
+  const external = human.request("ping", { sessionId: hung.session.id });
+  const probe = await hung.nextPing();
+  await hung.client.request("pong", { pingId: probe.pingId });
+  await external;
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "external response replaces cached failed status");
+
+  const failedAgain = human.request("ping", { sessionId: hung.session.id });
+  await hung.nextPing();
+  env.clock.advance(pingTimeoutMs);
+  env.daemon.sweep();
+  await failedAgain;
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "external failed ping updates the connected console");
+  const gone = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === hung.session.id);
+  hung.client.close();
+  await gone.event;
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("gone") && !row.includes("not_responding")), "disconnection clears cached ping");
+  const revived = await env.adapter("omp", "ping-status-key", "worker");
+  assert.equal(revived.session.id, hung.session.id);
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "revival does not inherit a failed ping");
+  assertWithin(ui);
+});
+
+test("archive purge conversation cancels safely then removes cached direct content from every surface without deleting channel posts", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const retired = await env.adapter("omp", "retired-key", "retired");
+  const live = await env.adapter("omp", "survivor-key", "survivor");
+  await retired.client.request("send", { to: "human", text: "purged-private-marker" });
+  await retired.client.request("channel_send", { channel: "updates", text: "retained-channel-marker" });
+  await live.client.request("send", { to: "human", text: "retained-private-marker" });
+  await human.request("close", { identity: retired.session.id });
+  const ui = await startConsole(120, 30);
+  await ui.press("i");
+  await ui.press("v");
+  await ui.press("#");
+  await ui.press("a");
+  await selectSession(ui, "retired");
+  assert.ok(ui.rows().some((row) => row.includes("purged-private-marker")), "archived conversation is loaded");
+  assert.ok(ui.rows().at(-1)!.includes("purge"), "archive surface advertises purge");
+  await paletteAction(ui, "Purge conversation");
+  assert.ok(ui.rows().some((row) => row.includes(retired.session.id)), "confirmation pins the selected archive");
+  await ui.press("n");
+  assert.ok((await human.sync()).sessions.some((s) => s.id === retired.session.id));
+  assert.ok(ui.rows().some((row) => row.includes("purged-private-marker")), "cancel preserves the conversation");
+  await paletteAction(ui, "Purge conversation");
+  await ui.press("y");
+  await ui.until(async () => !(await human.sync()).sessions.some((s) => s.id === retired.session.id)
+    && !ui.rows().some((row) => row.includes("purged-private-marker")), "purge resets the open conversation");
+  assert.ok(ui.rows()[0].includes("2 unread"), "purge clears only the archived identity's unread marker");
+  await ui.press("ESCAPE");
+  await ui.press("END");
+  await ui.press("ENTER");
+  assert.ok(!ui.rows().some((row) => row.includes("retired") || row.includes("purged-private-marker")), "archive no longer lists the purged identity");
+  await ui.press("i");
+  await ui.press("v");
+  assert.ok(!ui.rows().some((row) => row.includes("purged-private-marker") || row.includes("retired")), "grouped inbox no longer leaks purged content");
+  await ui.press("v");
+  assert.ok(!ui.rows().some((row) => row.includes("purged-private-marker")), "cached chronological inbox is refreshed");
+  assert.ok(ui.rows().some((row) => row.includes("retained-private-marker")), "unrelated direct content survives");
+  await ui.press("a");
+  assert.ok(!ui.rows().some((row) => row.includes("purged-private-marker")), "retained activity no longer leaks purged direct content");
+  assert.ok(ui.rows().some((row) => row.includes("retained-channel-marker")), "channel activity remains");
+  await ui.press("#");
+  assert.ok(ui.rows().some((row) => row.includes("retained-channel-marker")), "purged author's channel post remains");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === live.session.id)!.state, "live");
+  assertWithin(ui);
+});
+
+test("purge all archives cancels safely and never enlarges the confirmed archive snapshot", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "purge-alpha", "alpha");
+  const beta = await env.adapter("omp", "purge-beta", "beta");
+  const later = await env.adapter("omp", "purge-later", "later");
+  for (const adapter of [alpha, beta]) await human.request("close", { identity: adapter.session.id });
+  const ui = await startConsole(120, 24);
+  await ui.press("END");
+  assert.ok(ui.rows().at(-1)!.includes("purge"), "collapsed archive offers purge actions");
+  await paletteAction(ui, "Purge all archives");
+  for (const adapter of [alpha, beta]) assert.ok(ui.rows().some((row) => row.includes(adapter.session.id)));
+  assert.ok(!ui.rows().some((row) => row.includes(later.session.id)));
+  await ui.press("n");
+  let snapshot = await human.sync();
+  for (const adapter of [alpha, beta]) assert.ok(snapshot.sessions.some((s) => s.id === adapter.session.id), "cancel preserves each archive");
+  await paletteAction(ui, "Purge all archives");
+  await human.request("close", { identity: later.session.id });
+  await ui.press("y");
+  await ui.until(async () => {
+    snapshot = await human.sync();
+    return [alpha, beta].every((adapter) => !snapshot.sessions.some((s) => s.id === adapter.session.id));
+  }, "confirmed archives purged");
+  assert.ok(snapshot.sessions.some((s) => s.id === later.session.id && s.state === "removed"), "archive created after preview is not deleted");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("later") && row.includes("archived")), "unconfirmed archive remains visible");
+  assert.ok(!ui.rows().some((row) => /\b(alpha|beta)\b/.test(row)), "confirmed archive rows disappear");
+  assertWithin(ui);
+});
+
+test("retained sender notices show the original reply identity as a purged message in rendered details", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "notice-sender", "sender");
+  const target = await env.adapter("omp", "notice-target", "target");
+  await human.request("set_inbound", { name: "target", mode: "hold" });
+  const held = await sender.client.request("send", { to: "target", text: "held-private-marker" });
+  const original = (held.results as { msgId: string }[])[0].msgId;
+  await human.request("close", { identity: target.session.id });
+  const notice = (await sender.nextDelivery()).msg;
+  assert.equal(notice.replyTo, original);
+  const ui = await startConsole(120, 30);
+  await selectSession(ui, "sender");
+  await ui.press("ENTER");
+  await ui.press("END");
+  await ui.press("UP");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes(`reply to ${original}`)), "notice details retain the original message identity");
+  await human.request("purge", { identity: target.session.id });
+  await ui.until(() => !ui.rows().some((row) => row.includes("held-private-marker")), "purge refreshes cached sender conversation");
+  await ui.press("END");
+  await ui.press("DOWN");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("(purged message)")), "missing reply reference has a visible label");
+  assert.ok(ui.rows().some((row) => row.includes(`reply to ${original}`)), "purge does not discard the reference");
+  assert.ok(ui.rows().some((row) => row.includes("not delivered")), "independent sender notice remains visible");
+  assertWithin(ui);
+});
+
+test("Home and End reach list boundaries after a selected archive is hidden", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "boundary-alpha", "alpha");
+  const beta = await env.adapter("omp", "boundary-beta", "beta");
+  await alpha.client.request("send", { to: "human", text: "Archived boundary conversation" });
+  await beta.client.request("send", { to: "human", text: "Live boundary conversation" });
+  const ui = await startConsole(120, 28);
+  const listWidth = paneWidths(120)!.list;
+  const list = (): string[] => ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  await ui.press("/");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  await alpha.client.request("unregister");
+  await ui.until(() => list().some((row) => row.includes("alpha") && row.includes("archived")), "selected identity archived");
+  await ui.press("ESCAPE");
+  await ui.press("END");
+  await ui.press("ENTER");
+  assert.ok(list().some((row) => row.includes("alpha") && row.includes("archived")), "End reaches the collapsed Archive heading");
+
+  await ui.press("DOWN");
+  await ui.press("?");
+  await ui.type("Toggle archive");
+  await ui.press("ENTER");
+  assert.ok(!list().some((row) => row.includes("alpha") && row.includes("archived")), "selected archive is hidden again");
+  await ui.press("HOME");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("Live boundary conversation")), "Home opens the first live session");
   assertWithin(ui);
 });

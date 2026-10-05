@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { AsenqClient, type ClientOpts } from "../shared/client.js";
 import { KINDS } from "../shared/protocol.js";
+import { isStaleSession } from "../shared/sessions.js";
 import type {
-  ChannelSummary, HistoryScope, InboxSummary, PositionedEvent, ReadScope, ReadState, SendResult,
+  ChannelSummary, HistoryScope, InboxSummary, PingStatus, PositionedEvent, ReadScope, ReadState, SendResult,
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
 import { renderMessageBody } from "../shared/render.js";
@@ -41,8 +42,9 @@ const ACTION_GROUPS = [
   ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
-  ["Sessions", ["Rename session", "Inbound policy", "Set role"]],
+  ["Sessions", ["Rename session", "Inbound policy", "Set role", "Ping sessions", "Close session", "Close all stale"]],
   ["Channels", ["Create channel", "Add channel member", "Remove channel member"]],
+  ["Archive", ["Purge conversation", "Purge all archives"]],
   ["Daemon", ["Daemon status", "Daemon start", "Daemon stop", "Reconnect", "Setup", "Remove setup", "Doctor"]],
   ["Help", ["Help", "Error details", "Quit"]],
 ] as const;
@@ -52,6 +54,7 @@ const ACTIONS: { group: string; label: Action }[] = ACTION_GROUPS.flatMap(([grou
 const SHORTCUTS: Partial<Record<Action, string>> = {
   Sessions: "s", Inbox: "i", Channels: "#", Activity: "a", "Quick jump": "Ctrl+K", "Search sessions": "/", "Toggle inbox feed": "v",
   "Toggle activity filter": "f", "Compose / send": "c", "Full editor": "Ctrl+E", "Mark read": "End",
+  "Close session": "Ctrl+X",
   "Mark latest unread": "u", Help: "?", Quit: "q",
 };
 
@@ -62,6 +65,7 @@ const HELP = [
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
   "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
   "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
+  "Session list: Ctrl+X closes the selected session after y/n confirmation. ? → Ping sessions refreshes responding status without a model turn. ? → Close all stale pings first and previews disconnected or not_responding sessions; quiet responding and unknown sessions are kept. Archive: ? → Purge conversation / Purge all archives permanently deletes only the confirmed identities.",
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
@@ -92,6 +96,15 @@ type Form = {
   draftKey?(form: Form): string;
 };
 type Panel = { title: string; lines?: string[]; messages?: StoredMessage[]; top: number; height: number; rows: number };
+type Confirmation = {
+  title: string;
+  lines: string[];
+  top: number;
+  height: number;
+  rows: number;
+  busy: boolean;
+  submit(): Promise<void>;
+};
 type Notice = { text: string; kind: "info" | "new" | "error"; until?: number };
 type Target =
   | { kind: "tab"; tab: Tab }
@@ -140,6 +153,7 @@ export class ConsoleApp {
   private readonly client: AsenqClient;
   private sessions: SessionIdentity[] = [];
   private sessionOrders: Record<string, number> = {};
+  private sessionPings: Record<string, PingStatus> = {};
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
   private readStates = new Map<string, ReadState>();
@@ -163,6 +177,7 @@ export class ConsoleApp {
   private form?: Form;
   private palette?: { query: string; selected: number; top: number };
   private finder?: { query: string; selected?: string; top: number };
+  private confirmation?: Confirmation;
   private notice?: Notice;
   private noticeTimer?: NodeJS.Timeout;
   private errorDetail = "";
@@ -366,6 +381,7 @@ export class ConsoleApp {
   private applySnapshot(s: SyncResult): void {
     this.sessions = s.sessions;
     this.sessionOrders = { ...s.sessionLastOrders };
+    this.sessionPings = { ...s.sessionPings };
     this.channels = s.channels;
     this.readStates = new Map(s.readStates.map((r) => [keyOf(r.scope), r]));
     this.watermark = s.watermark;
@@ -396,14 +412,22 @@ export class ConsoleApp {
       this.say(`Disconnected: ${stringify(e)} · reconnecting`, "error");
     } finally {
       this.replaying = false;
-      this.ensureSelection();
-      this.render();
       if (this.resync) {
         this.resync = false;
         this.streams.clear();
+        this.activity = [];
+        this.summaries = [];
+        this.sessions = [];
+        this.sessionPings = {};
+        this.readStates.clear();
+        this.heldMessages.clear();
+        this.panel = undefined;
+        this.readHold = undefined;
         this.watermark = 0;
         await this.hydrate();
       } else if (this.connection === "connected" && this.pushedPosition > this.watermark) await this.replay();
+      this.ensureSelection();
+      this.render();
     }
   }
 
@@ -468,6 +492,9 @@ export class ConsoleApp {
       if (index >= 0) this.sessions[index] = e.session;
       else this.sessions.push(e.session);
       for (const summary of this.summaries) if (summary.sessionId === e.session.id) summary.name = e.session.name;
+      if (e.session.state !== "live") delete this.sessionPings[e.session.id];
+    } else if (e.type === "ping") {
+      if (this.session(e.sessionId)?.state === "live") this.sessionPings[e.sessionId] = e.ping;
     } else if (e.type === "retention") {
       this.resync = true;
     }
@@ -501,7 +528,9 @@ export class ConsoleApp {
   // ------------------------------------------------------------------ lists
 
   private stateLabel(s: SessionIdentity): TerminalSpan {
-    if (s.state === "live") return { text: "live", style: theme.ok };
+    if (s.state === "live") return this.sessionPings[s.id] === "not_responding"
+      ? { text: "not_responding", style: theme.warn }
+      : { text: "live", style: theme.ok };
     if (s.state === "gone") return { text: "gone", style: theme.warn };
     return { text: "archived", style: theme.dim };
   }
@@ -666,7 +695,8 @@ export class ConsoleApp {
     if (!keys.length) return;
     const current = this.tab === "activity" ? this.selectedActivity() : this.selection[this.tab];
     const index = current ? keys.indexOf(current) : -1;
-    const next = Math.max(0, Math.min(keys.length - 1, index < 0 ? (delta > 0 ? 0 : keys.length - 1) : index + delta));
+    const next = delta === Infinity ? keys.length - 1 : delta === -Infinity ? 0
+      : Math.max(0, Math.min(keys.length - 1, index < 0 ? (delta > 0 ? 0 : keys.length - 1) : index + delta));
     this.selection[this.tab] = keys[next];
     if (this.tab === "activity") this.followActivity = next === keys.length - 1;
     await this.opened();
@@ -722,6 +752,7 @@ export class ConsoleApp {
       }
       sessionId = e.msg.from === "human" ? e.msg.toSessionId : e.msg.fromSessionId ?? e.msg.toSessionId;
     } else if (e.type === "session") sessionId = e.session.id;
+    else if (e.type === "ping") sessionId = e.sessionId;
     else if (e.type === "read") sessionId = e.state.scope.scope === "session" ? e.state.scope.sessionId : undefined;
     const session = sessionId && this.session(sessionId);
     if (!session) {
@@ -854,7 +885,7 @@ export class ConsoleApp {
         ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
       ];
       const right: TerminalSpan[] = item.session
-        ? [{ text: item.session.state === "gone" ? "reconnecting" : item.session.state === "live" ? "live" : "archived", style: this.stateLabel(item.session).style }]
+        ? [item.session.state === "gone" ? { text: "reconnecting", style: theme.warn } : this.stateLabel(item.session)]
         : [{ text: "channel", style: theme.dim }];
       this.hits.push({ row: y0 + inset + rows.length, start: inset, end: width - inset, target: { kind: "finder", key: item.key } });
       rows.push(justify(left, right, innerWidth, selected ? theme.selected : undefined));
@@ -976,15 +1007,21 @@ export class ConsoleApp {
   }
 
   private footer(width: number): TerminalLine {
-    let hints = this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
+    let hints = this.confirmation ? (this.confirmation.busy ? "working…" : "y confirm · n cancel · Esc cancel · ↑↓ scroll")
+      : this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
       : this.palette ? "type to filter · ↑↓ · Enter run · Esc close · Ctrl+K jump"
       : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel · Ctrl+K jump"
       : this.searching ? "type name · ↑↓ · Enter keep · Esc clear · Ctrl+K jump"
       : this.focus === "composer" ? "Enter send · Shift+Enter newline · Ctrl+E editor · Esc done · Ctrl+K jump"
       : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · Ctrl+K jump · ? menu"
       : this.focus === "tabs" ? "←→ switch · Enter open · Ctrl+K jump · ? menu"
+      : this.tab === "sessions" && this.selection.sessions === "archive" ? "↑↓ move · Enter expand · Ctrl+K jump · ? purge archives"
+      : this.tab === "sessions" && this.selection.sessions?.startsWith("s:")
+        ? this.session(this.selection.sessions.slice(2))?.state === "removed"
+          ? "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? purge"
+          : "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? menu"
       : "↑↓ move · Enter open · Tab focus · Ctrl+K jump · ? menu";
-    if (this.shownHeldId && !this.finder && !this.palette && !this.form && !this.searching && this.focus !== "composer") {
+    if (this.shownHeldId && !this.confirmation && !this.finder && !this.palette && !this.form && !this.searching && this.focus !== "composer") {
       hints += " · r release · x drop";
     }
     const notice = this.notice;
@@ -1000,6 +1037,7 @@ export class ConsoleApp {
 
   private body(width: number, height: number, y0: number): Pane {
     if (height <= 0) return { rows: [] };
+    if (this.confirmation) return this.confirmationPane(width, height);
     if (this.finder) return this.finderPane(width, height, y0);
     if (this.palette) return this.palettePane(width, height, y0);
     if (this.form) return this.formPane(width, height, y0);
@@ -1268,9 +1306,24 @@ export class ConsoleApp {
     return { rows, cursor: { row: y0, column: Math.min(width - 1, 2 + terminalTextWidth(palette.query)) } };
   }
 
+  private confirmationPane(width: number, height: number): Pane {
+    const confirmation = this.confirmation!;
+    const boxed = width >= 6 && height >= 3;
+    const content = confirmation.lines.flatMap((line) => wrapTerminalText(line, Math.max(1, width - (boxed ? 2 : 0))));
+    confirmation.height = Math.max(0, height - (boxed ? 2 : 1));
+    confirmation.rows = content.length;
+    confirmation.top = Math.max(0, Math.min(confirmation.top, content.length - confirmation.height));
+    const title: TerminalLine = [{ text: ellipsize(confirmation.title, width), style: theme.accentBold }];
+    const visible = content.slice(confirmation.top, confirmation.top + confirmation.height);
+    return { rows: boxed ? roundedPanel(title, visible, width, height, true) : [title, ...visible] };
+  }
+
   private paletteItems(): { group: string; label: Action }[] {
     const q = (this.palette?.query ?? "").toLowerCase();
-    return ACTIONS.filter((item) => !q || item.label.toLowerCase().includes(q) || item.group.toLowerCase().includes(q));
+    const archive = this.tab === "sessions" && (this.selection.sessions === "archive"
+      || (this.scope()?.scope === "session" && this.session(this.selection.sessions?.slice(2) ?? "")?.state === "removed"));
+    return ACTIONS.filter((item) => (item.group !== "Archive" || archive)
+      && (!q || item.label.toLowerCase().includes(q) || item.group.toLowerCase().includes(q)));
   }
 
   private formPane(width: number, height: number, y0: number): Pane {
@@ -1452,6 +1505,7 @@ export class ConsoleApp {
   }
 
   private paste(text: string): void {
+    if (this.confirmation) return;
     const clean = cleanInput(text);
     if (this.finder) {
       this.finder.query += clean.replace(/\n/g, " ");
@@ -1557,6 +1611,7 @@ export class ConsoleApp {
 
   private async key(k: KeyInput): Promise<void> {
     if (this.closed) return;
+    if (this.confirmation) return this.confirmationKey(k);
     if (k.name === "CTRL_K") return this.openFinder();
     if (this.finder) return this.finderKey(k);
     if (this.palette) return this.paletteKey(k);
@@ -1567,6 +1622,14 @@ export class ConsoleApp {
       return this.heldAction(k.text === "r" ? "release" : "drop");
     }
     const name = k.name;
+    if (name === "CTRL_X") {
+      if (this.tab === "sessions" && this.focus === "list" && this.selection.sessions?.startsWith("s:")
+        && this.selectable("sessions").includes(this.selection.sessions)) {
+        const session = this.session(this.selection.sessions.slice(2));
+        if (session) this.confirmSessions("close", [session]);
+      }
+      return this.render();
+    }
     if (name === "TAB" || name === "SHIFT_TAB") {
       this.cycleFocus(name === "TAB" ? 1 : -1);
       return this.render();
@@ -1735,6 +1798,7 @@ export class ConsoleApp {
 
   private async mouse(m: MouseInput): Promise<void> {
     if (this.closed) return;
+    if (this.confirmation) return;
     const hit = this.hits.find((h) => h.row === m.row && m.column >= h.start && m.column < h.end);
     if (this.finder) {
       if (m.action === "wheel-up" || m.action === "wheel-down") {
@@ -1827,6 +1891,69 @@ export class ConsoleApp {
 
   private ask(title: string, labels: string[], submit: (v: string[]) => Promise<void>, defaults: string[] = [], description?: string[]): void {
     this.openForm(title, labels.map((label, i) => ({ label, value: defaults[i] ?? "" })), submit, description);
+  }
+
+  private async pingSessions(): Promise<SyncResult> {
+    this.say("Pinging sessions…");
+    this.render();
+    await this.client.request("ping");
+    await this.replay();
+    const snapshot = await this.client.sync();
+    this.sessionPings = { ...snapshot.sessionPings };
+    this.say("Session ping complete");
+    this.render();
+    return snapshot;
+  }
+
+  private confirmSessions(operation: "close" | "purge", sessions: SessionIdentity[]): void {
+    if (!sessions.length) {
+      this.say(operation === "close" ? "No stale sessions to close" : "No archived conversations to purge");
+      return;
+    }
+    const targets = sessions.map((session) => ({ id: session.id, name: session.name }));
+    this.confirmation = {
+      title: `${operation === "close" ? "Close" : "Purge"} ${targets.length} ${targets.length === 1 ? "conversation" : "conversations"}`,
+      lines: [
+        operation === "close"
+          ? "Terminally archives these sessions and expires waiting messages. Resuming creates a new identity."
+          : "Permanently deletes these archived conversations and identities. Channel posts are kept.",
+        "",
+        ...targets.slice(0, 10).map((target) => `${target.name} (${target.id})`),
+        ...(targets.length > 10 ? [`and ${targets.length - 10} more`] : []),
+        "",
+        "y confirm · n cancel · Esc cancel",
+      ],
+      top: 0, height: 0, rows: 0, busy: false,
+      submit: async () => {
+        for (const target of targets) await this.client.request(operation, { identity: target.id });
+        await this.replay();
+        this.say(`${operation === "close" ? "Closed" : "Purged"} ${targets.length} conversations`);
+      },
+    };
+    this.render();
+  }
+
+  private async confirmationKey(k: KeyInput): Promise<void> {
+    const confirmation = this.confirmation!;
+    if (confirmation.busy) return;
+    if (k.name === "ESCAPE" || (!k.ctrl && k.text?.toLowerCase() === "n")) {
+      this.confirmation = undefined;
+    } else if (!k.ctrl && k.text?.toLowerCase() === "y") {
+      confirmation.busy = true;
+      this.render();
+      try {
+        await confirmation.submit();
+      } catch (e) {
+        this.say(`${stringify(e)} · refresh before retrying; some confirmed identities may already be processed`, "error");
+      } finally {
+        this.confirmation = undefined;
+      }
+    } else {
+      const delta = k.name === "UP" ? -1 : k.name === "DOWN" ? 1 : k.name === "PAGE_UP" ? -confirmation.height
+        : k.name === "PAGE_DOWN" ? confirmation.height : k.name === "HOME" ? -Infinity : k.name === "END" ? Infinity : 0;
+      confirmation.top = Math.max(0, Math.min(confirmation.rows - confirmation.height, confirmation.top + delta));
+    }
+    this.render();
   }
 
   /** Full editor with every send option; a bound session target keeps its stable identity until edited. */
@@ -2023,6 +2150,28 @@ export class ConsoleApp {
             this.say(`${name}: ${role}`);
           }, [selected?.name ?? "", selected?.role ?? "unset"], ["Roles do not restrict messaging. Orchestrators can edit members and roles within their own channels."]);
           break;
+        case "Ping sessions":
+          await this.pingSessions();
+          break;
+        case "Close session":
+          if (this.tab !== "sessions" || !selected) throw new Error("Select a session row to close");
+          this.confirmSessions("close", [selected]);
+          break;
+        case "Close all stale": {
+          const snapshot = await this.pingSessions();
+          this.confirmSessions("close", snapshot.sessions.filter((session) =>
+            isStaleSession(session, snapshot.sessionPings[session.id])));
+          break;
+        }
+        case "Purge conversation":
+          if (this.tab !== "sessions" || selected?.state !== "removed") throw new Error("Select an archived conversation to purge");
+          this.confirmSessions("purge", [selected]);
+          break;
+        case "Purge all archives": {
+          const snapshot = await this.client.sync();
+          this.confirmSessions("purge", snapshot.sessions.filter((session) => session.state === "removed"));
+          break;
+        }
         case "Daemon status": await this.executeLocal(["daemon", "status"]); break;
         case "Daemon start": await this.executeLocal(["daemon", "start"]); break;
         case "Daemon stop":

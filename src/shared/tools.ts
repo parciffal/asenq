@@ -168,7 +168,7 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
-type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; kind?: string; action?: ControlAction; thread?: string };
+type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
@@ -178,7 +178,7 @@ export function formatSendResults(results: SendResult[]): string {
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
-    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}\n${renderMessageBody(m)}`)
+    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
     .join("\n\n");
 }
 

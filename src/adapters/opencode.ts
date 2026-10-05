@@ -32,7 +32,7 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
     onPush: (p: Push) => void onPush(p),
     onReconnect: async () => {
       for (const [ocId, b] of bound) {
-        const r = await client.request("register", { harness: "opencode", key: ocId, name: b.name, cwd: ctx.directory });
+        const r = await client.request("register", { harness: "opencode", key: ocId, name: b.name, cwd: ctx.directory, caps: ["ping"] });
         const s = r.session as { id: string; name: string };
         bound.set(ocId, s);
       }
@@ -40,6 +40,14 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
   });
 
   async function onPush(p: Push): Promise<void> {
+    if (p.push === "ping") {
+      try {
+        await client.request("pong", { pingId: p.pingId });
+      } catch (e) {
+        log("warn", `pong failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      return;
+    }
     if (p.push !== "deliver") return;
     let ok = false;
     let reason: string | undefined;
@@ -75,7 +83,7 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
         }
         const name = !envNameUsed && process.env.ASENQ_NAME ? process.env.ASENQ_NAME : undefined;
         if (name) envNameUsed = true;
-        const r = await client.request("register", { harness: "opencode", key: ocId, name, cwd: ctx.directory });
+        const r = await client.request("register", { harness: "opencode", key: ocId, name, cwd: ctx.directory, caps: ["ping"] });
         const s = r.session as { id: string; name: string };
         bound.set(ocId, s);
         log("info", `registered session ${ocId} as ${s.name}`);

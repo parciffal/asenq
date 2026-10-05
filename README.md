@@ -106,7 +106,7 @@ A role belongs to the session identity, not its name: renaming and reconnecting 
 
 ### Channel rosters
 
-Channels have durable names and rosters of session identities. A session may belong to several channels, with any mix of roles. Membership survives rename, temporary disconnection, archival and revival; another identity reusing a name does not inherit it. Late Claude lineage recognition unions provisional memberships into the ancestor, preserves an existing ancestor role or inherits the provisional role when unset, and leaves the ancestor's inbound policy unchanged.
+Channels have durable names and rosters of session identities. A session may belong to several channels, with any mix of roles. Membership survives rename, temporary disconnection, automatic removal and revival; another identity reusing a name does not inherit it. Human **close**, archive **purge** and identity retention remove that identity's memberships without deleting the channel or its posts. Late Claude lineage recognition unions provisional memberships into the ancestor, preserves an existing ancestor role or inherits the provisional role when unset, and leaves the ancestor's inbound policy unchanged.
 
 The human can create channels and edit any roster through the CLI or **? → Create channel / Add channel member / Remove channel member** in the TUI. An orchestrator can create a new channel with itself as first member, or add itself to any existing channel; it can edit other members only in channels it belongs to. Workers and unset-role sessions cannot create channels or edit rosters. Adding requires a live target. Removal resolves current names before former names within that roster and refuses ambiguous matches; the human can instead pass `--session-id` to remove a specific identity, including an archived member. The TUI always removes by identity.
 
@@ -165,6 +165,9 @@ asenq tui                             # interactive human console
 asenq tail                            # live feed of messages and session events
 asenq log [--session name] [--id m_…] [--limit n]
 asenq rename <old> <new>
+asenq close <name|identity>            # terminally archive a session
+asenq purge <name|identity>            # permanently delete one archive
+asenq purge --all                     # permanently delete every archive
 asenq inbound <name> accept|hold|refuse
 asenq role <name> orchestrator|worker|unset
 asenq held [name] · asenq release <msgId> · asenq drop <msgId>
@@ -181,6 +184,10 @@ asenq doctor
 
 Human `asenq inbox` prints the newest 20-message page oldest first and does not change read markers.
 
+`close` is human-only: it terminally archives the session, removes its channel memberships, expires its queued/held messages with sender notices, and ends resolution through its current/former names and harness identity. Notices for offline, non-closed senders queue for delivery when the same sender identity revives; closed senders receive none. Resuming a closed harness session creates a new identity without its old memberships. Closing an already closed identity is safe to repeat. `purge` is also human-only and permanently deletes archived conversations, their removed identities, memberships and reading positions; it never deletes live/reconnecting sessions, channels or channel posts, even posts authored by a purged identity. Independent delivery-failure notices remain with their senders. Retained replies keep their original message ID and show **(purged message)** when the referenced message is gone.
+
+These commands accept an exact **current** name or a stable identity ID; former names are not destructive-command targets. `close` prefers a live/reconnecting name over old archives. `purge` rejects a name also held by a live/reconnecting session. Ambiguous archive names are rejected with candidate IDs; use an explicit archived ID instead. The CLI prints the actual closed/purged IDs and runs immediately, without an interactive confirmation (like `drop`); `purge --all` deletes all archives at submission time. Use the TUI for a visible confirmation preview.
+
 ## Human console (`asenq tui`)
 
 Full-screen view of live and archived session conversations (messages involving that session, not only messages to you). Four tabs — **Sessions**, **Inbox**, **Channels**, **Activity** — share one layout: list beside conversation at ≥80 columns, or a picker on narrower terminals.
@@ -196,13 +203,22 @@ Sessions lists live sessions first, then reconnecting ones, then a collapsed **A
 | `c` | Inline composer: `Enter` sends, `Shift+Enter` newline (`Alt+Enter` / `Ctrl+J` fallback), `Esc` keeps the draft |
 | `Ctrl+E` | Full editor with kind, thread, reply-to and done |
 | `u` | Mark the latest eligible item unread again |
+| `Ctrl+X` | On a selected Sessions list row only: close after a single-key `y` / `n` confirmation; no composer binding |
 | `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity |
 | `?` | Searchable action palette (broadcast, hold/release, setup, daemon, …) |
 | `Esc`, `q` | Dismiss / back / quit |
 
 Unread is **not delivery**. Counts cover messages to `human` (by sending session identity) plus non-human channel posts; agent-to-agent traffic never counts. Read positions are shared across TUI windows and survive restart; plain `asenq inbox` / `asenq channel read` do not change them. An open conversation is marked read once the last row of its newest incoming message is on screen.
 
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 10).
+Use **? → Ping sessions** to check live sessions and refresh their status. OMP and OpenCode adapters answer immediately through their connection, without starting a model turn; Claude sessions with a messaging socket are probed through that socket. A failed check shows **not_responding** on the session row but does not disconnect or close it. A later answered ping replaces that status; disconnection clears the cached ping.
+
+`asenq tail` includes ping results keyed by stable session identity, so failed probes and later recoveries remain visible outside the TUI.
+
+The palette's **Close all stale** action first waits for a fresh ping, refreshes session state, then previews disconnected (`gone`) sessions and live sessions whose latest ping is `not_responding`. Quiet running sessions are not stale, even after hours without direct messages: direct-message activity is informational only. A supported adapter that answers is `responding`; hook-only Claude sessions and older adapters that do not declare ping support are `unknown` and safely excluded while live. Disconnected sessions are always stale regardless of their previous ping. Nothing is closed until you confirm the exact identity snapshot.
+
+Select the **Archive** heading or an archived conversation and use `?` for **Purge all archives** or **Purge conversation**, respectively. Every close/purge preview shows the exact target count, the first ten names with stable IDs, and an **and N more** count if needed. Press `y` to confirm or `n` / `Esc` to cancel; `Enter` does not confirm, pasted text is ignored, and arrow/page keys scroll longer previews. Only the previewed identity IDs are submitted: new targets or new archives are not silently added. Purge refreshes every open console's conversation, inbox and activity caches; unrelated conversations and channel posts remain.
+
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 11).
 
 ## How delivery works
 
@@ -224,6 +240,7 @@ Subagents (Claude subagents, OpenCode child sessions, omp subagents) are not reg
 - **Loops and floods.** From one agent, the same text sent to the same target within 30 s is dropped. For control messages, the kind and action also distinguish duplicates, so identical text with `pause` then `resume` is delivered twice. Each agent can send 30 messages in a burst, then one every 2 s. A target with 50 queued messages refuses more.
 - **Inbound policy.** `asenq inbound <name> hold` holds messages from other agents until you run `asenq release` or `asenq drop`. Listing held message bodies with `asenq held`, releasing them and dropping them are user-only operations; registered agent connections cannot read held messages. `refuse` rejects them. Messages you send yourself skip `hold`.
 - **History.** Messages are kept for 7 days. Set `historyDays` in `~/.asenq/config.json` to change this.
+- **Stale sessions.** Only disconnected sessions or live sessions that fail a fresh ping are eligible for **Close all stale**. There is no idle-time threshold or automatic closure; unsupported clients have an `unknown` ping result and remain safe.
 
 ## Claude Code notes
 

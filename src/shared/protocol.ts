@@ -1,4 +1,4 @@
-export const PROTOCOL = 10;
+export const PROTOCOL = 11;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -33,6 +33,8 @@ export type FileReference = { path: string; summary: string; sha256: string; siz
 export type WireMsg = {
   id: string; from: string; to: string;
   kind?: Kind; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean;
+  /** The reply target is no longer retained or is not readable by this caller. */
+  replyToMissing?: boolean;
   text: string; file?: FileReference; createdAt: number;
 };
 
@@ -52,6 +54,7 @@ export type StoredMessage = WireMsg & {
 };
 
 export type SessionState = "live" | "gone" | "removed";
+export type PingStatus = "responding" | "not_responding" | "unknown";
 
 /** Stable historical identity; names can be reused, but ids cannot. */
 export type SessionIdentity = {
@@ -65,6 +68,7 @@ export type SessionIdentity = {
   role?: Role | null;
   createdAt: number;
   removedAt?: number;
+  closedAt?: number;
 };
 
 export type ChannelSummary = {
@@ -98,6 +102,7 @@ export type TailEvent =
   | { type: "channel"; action: "created" | "updated"; channel: ChannelSummary }
   | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string }
   | { type: "read"; state: ReadState }
+  | { type: "ping"; sessionId: string; ping: PingStatus }
   | { type: "retention" };
 
 export type PositionedEvent = { position: number; event: TailEvent };
@@ -110,6 +115,9 @@ export type SyncResult = {
   readStates: ReadState[];
   /** Latest retained non-channel message order per stable session identity; absent means zero. */
   sessionLastOrders: Record<string, number>;
+  /** Durable direct activity: outgoing creation or first incoming delivery, excluding channel posts. */
+  sessionLastActivity: Record<string, number>;
+  sessionPings: Record<string, PingStatus>;
 };
 
 /** Latest incoming human-inbox message from one sender; `sessionId` is absent for legacy name-only senders. */
@@ -136,6 +144,7 @@ export type ReadMutationResult = { applied: boolean; state: ReadState };
 /** `session`/`key` identify the target binding on connections that host several sessions. */
 export type Push =
   | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string }
+  | { push: "ping"; pingId: string }
   | { push: "event"; position: number; event: TailEvent };
 
 export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unknown_target"; reason?: string };

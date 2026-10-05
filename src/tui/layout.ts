@@ -167,7 +167,7 @@ function detailLines(message: StoredMessage): string[] {
     `status ${message.status}${message.reason ? `: ${message.reason}` : ""} · order ${message.order} · ${new Date(message.createdAt).toLocaleString()}`,
   ];
   if (message.thread) lines.push(`thread ${message.thread}`);
-  if (message.replyTo) lines.push(`reply to ${message.replyTo}`);
+  if (message.replyTo) lines.push(`reply to ${message.replyTo}${message.replyToMissing ? " (purged message)" : ""}`);
   return lines;
 }
 
@@ -310,6 +310,9 @@ export function activitySpans(item: PositionedEvent, names: (id: string) => stri
   }
   if (event.type === "channel") {
     return [position, { text: "channel  ", style: theme.accent }, { text: `${event.action} #${event.channel.name}`, style: theme.bold }, { text: `  ${event.channel.memberIds?.length ?? 0} members`, style: theme.dim }];
+  }
+  if (event.type === "ping") {
+    return [position, { text: "ping     ", style: theme.accent }, { text: names(event.sessionId) ?? event.sessionId, style: theme.bold }, { text: `  ${event.ping}`, style: event.ping === "not_responding" ? theme.warn : theme.dim }];
   }
   if (event.type === "read") {
     const scope = event.state.scope;
