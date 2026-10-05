@@ -80,6 +80,26 @@ export type SessionIdentity = {
   closedAt?: number;
 };
 
+/** Current registered session, including harness-reported availability and resume metadata. */
+export type ListedSession = {
+  id: string;
+  name: string;
+  previousNames: string[];
+  harness: Harness;
+  cwd: string | null;
+  state: "live" | "gone" | "stale";
+  stale: boolean;
+  ping: "responding" | "not_responding" | "unknown" | null;
+  inbound: Inbound;
+  role: Role | null;
+  channels: string[];
+  lastSeen: number | null;
+  busy: boolean | null;
+  harnessSessionId: string | null;
+  resumeCommand?: string;
+  you: boolean;
+};
+
 export type ChannelSummary = {
   name: string;
   count: number;
