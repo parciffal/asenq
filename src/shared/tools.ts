@@ -145,7 +145,13 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_channel_send",
     label: "Asenq Channel Send",
-    description: "Post a message to a named asenq channel. Channels are read on demand and never pushed into sessions.",
+    description:
+      "Post text to a named asenq channel. Posts stay read on demand unless they contain standalone @member mentions (current or former member names), " +
+      "@orch/@orchestrator/@orchestrators, @wrk/@worker/@workers, or @all. Keywords take precedence over names. " +
+      "Mentions are case-sensitive ASCII names (letters, digits, _ and -). An @ starts a mention only at the start of text, after whitespace, or after ( [ { < \" ' or a backtick; other preceding characters block mentions, including email local parts. Tokens end at the first non-name character. Markdown/code blocks have no exceptions. " +
+      "Only channel members resolve; each identity is targeted once, excluding the poster and the human. " +
+      "An unknown, non-member or ambiguous mention fails the whole post with unknown_mention and lists valid members. " +
+      "Target inbound policies apply; the result lists resolved targets and their actual delivery states, including held, rejected, queued or failed rather than claiming every target was pushed.",
     params: {
       channel: { type: "string", description: "Channel name: lowercase letters, digits, - and _" },
       text: { type: "string", description: "Message text" },
@@ -168,7 +174,7 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
-type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; status?: MsgStatus; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean };
+type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; status?: MsgStatus; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; sourceChannel?: string };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
@@ -178,7 +184,7 @@ export function formatSendResults(results: SendResult[]): string {
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
-    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
+    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
     .join("\n\n");
 }
 
@@ -204,7 +210,7 @@ function formatInbox(msgs: Msg[], hasMore: boolean, advancing: boolean): string 
         const recovery = `Full text: asenq_inbox id=${m.id}.`
           + (m.thread ? " Or use asenq_thread_read with this message's thread." : "");
         const marker = `\n\n[truncated message ${m.id}; more available. ${recovery}]`;
-        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}\n`;
+        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}\n`;
         const body = renderMessageBody(m);
         const visible = text.length - body.length < 16_000 - marker.length ? text : header + body;
         let end = Math.min(visible.length, 16_000 - marker.length);
@@ -295,7 +301,9 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
       }
       case "asenq_channel_send": {
         const r = await client.request("channel_send", { ...who, channel: args.channel, text: args.text });
-        return `posted ${String(r.msgId)} to #${String(args.channel)}`;
+        const results = r.results as SendResult[];
+        const delivery = results.length ? `mention targets:\n${formatSendResults(results)}` : "mention targets: none; no direct messages pushed";
+        return `posted ${String(r.msgId)} to #${String(args.channel)}\n${delivery}`;
       }
       case "asenq_channel_read": {
         const r = await client.request("channel_read", { ...who, channel: args.channel, limit: args.limit });

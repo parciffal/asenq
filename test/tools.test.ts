@@ -676,3 +676,49 @@ test("reply availability cannot reveal a message outside the caller's direct sco
   assert.equal(output.match(/\(purged message\)/g)?.length, 2);
   assert.ok(!output.includes("Private body"));
 });
+
+test("channel tool results report actual mention admission states and resolve full posts before delivery", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "tool-poster", "poster");
+  const delivered = await env.adapter("omp", "tool-delivered", "delivered");
+  await env.adapter("omp", "tool-holder", "holder");
+  await env.adapter("omp", "tool-refuser", "refuser");
+  await human.request("claude_hook", { event: "start", key: "sid:tool-queued", sessionId: "tool-queued", name: "queued" });
+  await human.request("set_inbound", { name: "holder", mode: "hold" });
+  await human.request("set_inbound", { name: "refuser", mode: "refuse" });
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["delivered", "holder", "refuser", "queued"]) await human.request("channel_add", { channel: "work", name });
+  const output = await callTool(poster.client, "asenq_channel_send", {
+    channel: "work", text: "Review @delivered @holder @refuser @queued",
+  });
+  for (const [name, status] of [["delivered", "delivered"], ["holder", "held"], ["refuser", "rejected"], ["queued", "queued"]]) {
+    assert.match(output, new RegExp(`^${name} m_[0-9a-f]{12} ${status}(?: |$)`, "m"));
+  }
+  const invalid = await callTool(poster.client, "asenq_channel_send", { channel: "work", text: "@delivered @missing" });
+  assert.ok(invalid.includes("unknown_mention"));
+  assert.ok(invalid.includes("delivered"));
+  assert.equal(delivered.deliveries.length, 1);
+  await callTool(poster.client, "asenq_channel_send", { channel: "work", text: "Read on demand" });
+  const posts = (await human.historyPage({ scope: "channel", channel: "work" })).messages;
+  assert.deepEqual(posts.map((post) => post.text), ["Review @delivered @holder @refuser @queued", "Read on demand"]);
+  assert.equal(delivered.deliveries.length, 1);
+});
+
+test("tool inbox and full recovery preserve mention channel headers without modifying oversized bodies", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const receiver = await env.adapter("omp", "tool-context", "receiver");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "receiver" });
+  const text = "@receiver " + "review ".repeat(3000);
+  const result = (await human.request("channel_send", { channel: "work", text })).results as SendResult[];
+  const output = await callTool(receiver.client, "asenq_inbox", { unread_only: false });
+  assert.ok(output.length <= 16_000);
+  assert.match(output.split("\n")[0], /human.*via #work/);
+  assert.ok(output.includes(`Full text: asenq_inbox id=${result[0].msgId}`));
+  const recovered = await callTool(receiver.client, "asenq_inbox", { id: result[0].msgId });
+  assert.match(recovered.split("\n")[0], /human.*via #work/);
+  assert.ok(recovered.endsWith(text));
+  assert.equal(receiver.deliveries[0].msg.text, text);
+});

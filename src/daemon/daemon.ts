@@ -4,9 +4,9 @@ import { open } from "node:fs/promises";
 import net from "node:net";
 import { isAbsolute, join } from "node:path";
 import {
-  ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, NAME_RE, PROBE_MS,
-  PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, slug,
-  type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
+  ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, MENTION_KEYWORDS, NAME_RE, PROBE_MS,
+  PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, hasMentionOpening, slug,
+  type ChannelSendResult, type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
   type PingStatus, type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type SessionIdentity, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
@@ -1362,7 +1362,7 @@ export class Daemon {
     };
     if (s.kind === "agent") {
       const bodyKey = row.kind === "control" ? `control\0${row.action}\0${row.text}` : `message\0${row.text}`;
-      const dupKey = `${s.session.id}\0${target.id}\0${bodyKey}\0${row.file ?? ""}`;
+      const dupKey = `${s.session.id}\0${target.id}\0${bodyKey}\0${row.file ?? ""}${row.source_channel ? `\0channel\0${row.source_channel}` : ""}`;
       const seen = this.dupSeen.get(dupKey);
       if (seen !== undefined && now - seen < DUP_WINDOW_MS) return finish("dropped", "duplicate");
       this.dupSeen.set(dupKey, now);
@@ -1692,11 +1692,33 @@ export class Daemon {
     return this.mutateChannel(channel, "remove", matches[0].id);
   }
 
-  private opChannelSend(s: Sender, p: Params): Result {
+  private async opChannelSend(s: Sender, p: Params): Promise<ChannelSendResult> {
     const channel = this.channelName(p);
     const text = str(p, "text", true);
     if (text.length === 0) throw new AsenqError("bad_request", "text is empty");
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);
+    const members = this.store.channelMembers(channel);
+    const targets = new Map<string, (typeof members)[number]>();
+    for (const match of text.matchAll(/@([A-Za-z0-9_-]+)/g)) {
+      if (!hasMentionOpening(text, match.index)) continue;
+      const token = match[1];
+      let matches: typeof members;
+      if (MENTION_KEYWORDS.includes(token)) {
+        const role = token.startsWith("orch") ? "orchestrator" : "worker";
+        matches = token === "all" ? members : members.filter((member) => member.role === role);
+      } else {
+        const current = members.filter((member) => member.name === token);
+        matches = current.length > 0 ? current : members.filter((member) => member.previousNames.includes(token));
+        if (matches.length !== 1) {
+          const candidates = matches.length > 1 ? `; candidates: ${matches.map((member) => `${member.id} name=${member.name}`).join(", ")}` : "";
+          const valid = members.map((member) => `${member.name} (${member.id})`).join(", ") || "(none)";
+          throw new AsenqError("unknown_mention", `unknown or ambiguous mention "@${token}"${candidates}; valid members of #${channel}: ${valid}`);
+        }
+      }
+      for (const member of matches) {
+        if (s.kind !== "agent" || member.id !== s.session.id) targets.set(member.id, member);
+      }
+    }
     if (!this.store.hasChannel(channel)) this.mutateChannel(channel, "create");
     const now = this.now();
     const row: MsgRow = {
@@ -1705,7 +1727,14 @@ export class Daemon {
       status: "posted", reason: null, attempts: 0, created_at: now, updated_at: now, ord: 0,
     };
     this.insert(row);
-    return { msgId: row.id };
+    const results = await Promise.all([...targets.values()].map((member): Promise<SendResult> | SendResult => {
+      const target = this.store.session(member.id) ?? member;
+      return this.routeOne(s, target, {
+        ...row, id: newId("m_"), to_name: target.name, to_session: member.id,
+        channel: null, source_channel: channel, status: "queued", ord: 0,
+      });
+    }));
+    return { msgId: row.id, results };
   }
 
   private opLog(s: Sender, p: Params): Result {

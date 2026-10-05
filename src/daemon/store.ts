@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   created_at INTEGER NOT NULL, UNIQUE(harness, key));
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
-  channel TEXT, text TEXT NOT NULL, file TEXT, kind TEXT, action TEXT, thread TEXT, reply_to TEXT,
+  channel TEXT, source_channel TEXT, text TEXT NOT NULL, file TEXT, kind TEXT, action TEXT, thread TEXT, reply_to TEXT,
   done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ord INTEGER, delivery_seq INTEGER);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(to_session, status);
@@ -55,7 +55,7 @@ export type MsgRow = {
   channel: string | null; text: string; kind: Kind | null; action?: ControlAction | null; thread: string | null; reply_to: string | null;
   done: number; status: MsgStatus; reason: string | null; attempts: number;
   created_at: number; updated_at: number; ord: number; delivery_seq?: number | null;
-  file?: string | null;
+  file?: string | null; source_channel?: string | null;
 };
 
 type IdentityRow = {
@@ -76,6 +76,7 @@ type ReadRow = {
 export function toWire(r: MsgRow): WireMsg {
   const m: WireMsg = { id: r.id, from: r.from_name, to: r.to_name, text: r.text, createdAt: r.created_at };
   if (r.file) m.file = JSON.parse(r.file) as WireMsg["file"];
+  if (r.source_channel) m.sourceChannel = r.source_channel;
   if (r.kind) m.kind = r.kind;
   if (r.action) m.action = r.action;
   if (r.thread) m.thread = r.thread;
@@ -124,6 +125,7 @@ export class Store {
       if (!sessionColumns.some((column) => column.name === name)) this.db.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}`);
     }
     this.migrateMessageFile();
+    this.migrateMessageSourceChannel();
     this.migrateMessageOrder();
     this.backfillIdentities();
     this.backfillHarnessIds();
@@ -219,6 +221,11 @@ export class Store {
   private migrateMessageFile(): void {
     const columns = this.db.all<{ name: string }>("PRAGMA table_info(messages)");
     if (!columns.some((column) => column.name === "file")) this.db.exec("ALTER TABLE messages ADD COLUMN file TEXT");
+  }
+
+  private migrateMessageSourceChannel(): void {
+    const columns = this.db.all<{ name: string }>("PRAGMA table_info(messages)");
+    if (!columns.some((column) => column.name === "source_channel")) this.db.exec("ALTER TABLE messages ADD COLUMN source_channel TEXT");
   }
 
   private migrateMessageOrder(): void {
@@ -727,9 +734,9 @@ export class Store {
     row.delivery_seq = row.channel === null && (row.status === "delivered" || row.status === "replied")
       ? this.nextDeliverySequence() : null;
     this.db.run(
-      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,text,file,kind,action,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      row.id, row.from_name, row.from_session, row.to_name, row.to_session, row.channel, row.text, row.file ?? null, row.kind, row.action ?? null, row.thread, row.reply_to,
+      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,source_channel,text,file,kind,action,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      row.id, row.from_name, row.from_session, row.to_name, row.to_session, row.channel, row.source_channel ?? null, row.text, row.file ?? null, row.kind, row.action ?? null, row.thread, row.reply_to,
       row.done, row.status, row.reason, row.attempts, row.created_at, row.updated_at, row.ord, row.delivery_seq,
     );
     if (row.channel === null) {

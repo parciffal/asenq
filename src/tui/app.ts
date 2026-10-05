@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { AsenqClient, type ClientOpts } from "../shared/client.js";
-import { KINDS } from "../shared/protocol.js";
+import { KINDS, MENTION_KEYWORDS, hasMentionOpening } from "../shared/protocol.js";
 import { isStaleSession } from "../shared/sessions.js";
 import type {
   ChannelSummary, HistoryScope, InboxSummary, PingStatus, PositionedEvent, ReadScope, ReadState, SendResult,
@@ -123,6 +123,8 @@ type Shown = { key: string; layout: TranscriptLayout; top: number; height: numbe
 type ComposeTarget = { kind: "session"; id: string; name: string } | { kind: "channel"; name: string };
 type Pane = { rows: TerminalLine[]; cursor?: TerminalCursor };
 type JumpItem = { key: string; name: string; former?: string; session?: SessionIdentity; rank: number; state: number };
+type MentionItem = { key: string; name: string; former?: string; session?: SessionIdentity };
+type MentionPicker = { key: string; start: number; end: number; query: string; selected?: string; top: number };
 
 /** Shift+Enter where the terminal reports it; Alt+Enter and Ctrl+J (iTerm's Shift+Enter) elsewhere. */
 const NEWLINE_KEYS: Record<string, true> = { SHIFT_ENTER: true, ALT_ENTER: true, CTRL_J: true };
@@ -179,6 +181,7 @@ export class ConsoleApp {
   private palette?: { query: string; selected: number; top: number };
   private finder?: { query: string; selected?: string; top: number };
   private confirmation?: Confirmation;
+  private mention?: MentionPicker;
   private notice?: Notice;
   private noticeTimer?: NodeJS.Timeout;
   private errorDetail = "";
@@ -804,6 +807,7 @@ export class ConsoleApp {
   }
 
   private openFinder(): void {
+    this.mention = undefined;
     if (!this.finder) this.finder = { query: "", top: 0 };
     this.render();
   }
@@ -907,6 +911,11 @@ export class ConsoleApp {
 
   private render(): void {
     if (this.closed) return;
+    if (this.mention) {
+      const target = this.composeTarget();
+      if (this.focus !== "composer" || target?.kind !== "channel" || this.draftKey(target) !== this.mention.key
+        || this.finder || this.palette || this.form || this.panel) this.mention = undefined;
+    }
     const { columns: width, rows: height } = this.screen.size;
     this.hits = [];
     this.shown = undefined;
@@ -1017,6 +1026,7 @@ export class ConsoleApp {
       : this.palette ? "type to filter · ↑↓ · Enter run · Esc close · Ctrl+K jump"
       : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel · Ctrl+K jump"
       : this.searching ? "type name · ↑↓ · Enter keep · Esc clear · Ctrl+K jump"
+      : this.mention ? "↑↓ choose · Enter insert · Esc close · Ctrl+K jump"
       : this.focus === "composer" ? "Enter send · Shift+Enter newline · Ctrl+E editor · Esc done · Ctrl+K jump"
       : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · Ctrl+K jump · ? menu"
       : this.focus === "tabs" ? "←→ switch · Enter open · Ctrl+K jump · ? menu"
@@ -1230,7 +1240,7 @@ export class ConsoleApp {
     }
     const focused = this.focus === "composer";
     const label = `to ${target.kind === "channel" ? "#" : ""}${target.name}`;
-    const boxed = width >= 6 && maxRows >= 3;
+    const boxed = width >= 6 && maxRows >= (this.mention?.key === key ? 4 : 3);
     const inset = boxed ? 1 : 0;
     const innerWidth = width - 2 * inset;
     const promptWidth = Math.min(2, Math.max(0, innerWidth - 1));
@@ -1238,7 +1248,11 @@ export class ConsoleApp {
     const hintWidth = terminalTextWidth(hint);
     const textWidth = Math.max(1, innerWidth - promptWidth - hintWidth - (hint ? 1 : 0));
     const layout = editorLayout(text, this.cursor, textWidth);
-    const count = Math.min(maxRows - 2 * inset, Math.max(1, layout.rows.length));
+    const picker = this.mention?.key === key ? this.mention : undefined;
+    const items = picker ? this.mentionItems(picker) : [];
+    const selected = picker ? this.mentionIndex(items) : 0;
+    const choiceRows = picker ? Math.min(Math.max(0, maxRows - 2 * inset - 1), Math.max(1, items.length)) : 0;
+    const count = Math.min(maxRows - 2 * inset - choiceRows, Math.max(1, layout.rows.length));
     const first = Math.max(0, Math.min(layout.cursorRow - count + 1, layout.rows.length - count));
     const content: TerminalLine[] = [];
     for (let index = 0; index < count; index++) {
@@ -1250,6 +1264,20 @@ export class ConsoleApp {
         [{ text: prompt, style: focused ? theme.human : theme.dim }, { text: value, ...(!text && !focused ? { style: theme.dim } : {}) }],
         index === 0 && hint ? [{ text: hint, style: theme.dim }] : [], innerWidth,
       ));
+    }
+    if (picker && choiceRows) {
+      if (selected < picker.top) picker.top = selected;
+      if (selected >= picker.top + choiceRows) picker.top = selected - choiceRows + 1;
+      picker.top = Math.max(0, Math.min(picker.top, items.length - choiceRows));
+      if (!items.length) content.push(clipSpans([{ text: "No matching mentions", style: theme.dim }], innerWidth));
+      for (const item of items.slice(picker.top, picker.top + choiceRows)) {
+        const chosen = item.key === picker.selected;
+        content.push(justify([
+          this.marker(chosen),
+          { text: `@${item.name}`, style: chosen ? theme.accentBold : theme.bold },
+          ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
+        ], [{ text: item.session ? item.session.role ?? "member" : "keyword", style: theme.dim }], innerWidth, chosen ? theme.selected : undefined));
+      }
     }
     const rows = boxed ? roundedPanel(
       [{ text: label, style: focused ? theme.accentBold : theme.bold }, ...(this.sending ? [{ text: " sending…", style: theme.warn }] : [])],
@@ -1533,6 +1561,62 @@ export class ConsoleApp {
     if (this.cursorKey !== key) [this.cursorKey, this.cursor] = [key, draft.length];
     this.drafts.set(key, draft.slice(0, this.cursor) + text + draft.slice(this.cursor));
     this.cursor += text.length;
+    this.updateMention();
+  }
+
+  /** Derive completion from the real draft and cursor, never a separate input buffer. */
+  private updateMention(): void {
+    const target = this.composeTarget();
+    if (target?.kind !== "channel" || this.focus !== "composer") {
+      this.mention = undefined;
+      return;
+    }
+    const key = this.draftKey(target);
+    const draft = this.drafts.get(key) ?? "";
+    const match = /@([A-Za-z0-9_-]*)$/.exec(draft.slice(0, this.cursor));
+    if (!match || match.index + match[0].length !== this.cursor || !hasMentionOpening(draft, match.index)) {
+      this.mention = undefined;
+      return;
+    }
+    const query = match[1];
+    const start = match.index;
+    const end = this.cursor + (/^[A-Za-z0-9_-]*/.exec(draft.slice(this.cursor))?.[0].length ?? 0);
+    const previous = this.mention;
+    this.mention = previous?.key === key && previous.start === start && previous.query === query
+      ? { ...previous, end }
+      : { key, start, end, query, top: 0 };
+  }
+
+  private mentionItems(picker: MentionPicker): MentionItem[] {
+    const channel = this.channels.find((c) => `channel:${c.name}` === picker.key);
+    const query = picker.query.toLowerCase();
+    const items: MentionItem[] = MENTION_KEYWORDS.filter((name) => name.startsWith(query))
+      .map((name) => ({ key: `k:${name}`, name }));
+    for (const id of channel?.memberIds ?? []) {
+      const session = this.session(id);
+      if (!session || MENTION_KEYWORDS.includes(session.name)) continue;
+      const former = session.previousNames.find((name) => name.toLowerCase().startsWith(query));
+      if (!session.name.toLowerCase().startsWith(query) && !former) continue;
+      items.push({ key: `s:${session.id}`, name: session.name, session,
+        ...(!session.name.toLowerCase().startsWith(query) && former ? { former } : {}) });
+    }
+    return items.sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+  }
+
+  private mentionIndex(items: MentionItem[]): number {
+    const picker = this.mention!;
+    const index = Math.max(0, items.findIndex((item) => item.key === picker.selected));
+    picker.selected = items[index]?.key;
+    return index;
+  }
+
+  private acceptMention(item: MentionItem): void {
+    const picker = this.mention!;
+    const draft = this.drafts.get(picker.key) ?? "";
+    const token = `@${item.name}`;
+    this.drafts.set(picker.key, draft.slice(0, picker.start) + token + draft.slice(picker.end));
+    this.cursor = picker.start + token.length;
+    this.mention = undefined;
   }
 
   private async composerKey(k: KeyInput): Promise<void> {
@@ -1544,6 +1628,24 @@ export class ConsoleApp {
     const key = this.draftKey(target);
     const draft = this.drafts.get(key) ?? "";
     if (this.cursorKey !== key) [this.cursorKey, this.cursor] = [key, draft.length];
+    if (this.mention?.key === key) {
+      const items = this.mentionItems(this.mention);
+      const selected = this.mentionIndex(items);
+      if (k.name === "ESCAPE") {
+        this.mention = undefined;
+        return this.render();
+      }
+      if (k.name === "UP" || k.name === "DOWN") {
+        const index = Math.max(0, Math.min(items.length - 1, selected + (k.name === "UP" ? -1 : 1)));
+        this.mention.selected = items[index]?.key;
+        return this.render();
+      }
+      if (k.name === "ENTER" || k.name === "KP_ENTER") {
+        if (items[selected]) this.acceptMention(items[selected]);
+        return this.render();
+      }
+      this.mention = undefined;
+    }
     const set = (text: string, cursor: number): void => {
       if (text) this.drafts.set(key, text);
       else this.drafts.delete(key);
@@ -1561,11 +1663,13 @@ export class ConsoleApp {
       case "BACKSPACE": {
         const start = stepGrapheme(draft, this.cursor, -1);
         set(draft.slice(0, start) + draft.slice(this.cursor), start);
+        this.updateMention();
         break;
       }
       case "DELETE": {
         const end = stepGrapheme(draft, this.cursor, 1);
         set(draft.slice(0, this.cursor) + draft.slice(end), this.cursor);
+        this.updateMention();
         break;
       }
       case "LEFT": this.cursor = stepGrapheme(draft, this.cursor, -1); break;

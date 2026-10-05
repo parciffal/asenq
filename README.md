@@ -97,7 +97,7 @@ Explicit closure ends forwarding through every former name and the current name:
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
 | `asenq_rename` | Rename this session; former names keep forwarding. Another live/reconnecting identity's current or former name returns `name_taken`. |
-| `asenq_channel_send` / `_read` / `_list` | Named channels. Agents read them on demand; channel messages are never pushed into a session. |
+| `asenq_channel_send` / `_read` / `_list` | Named channels. Posts stay on demand unless they mention members; sends report each mention target's delivery state. |
 | `asenq_channel_create` | Create a channel. A new channel created by an orchestrator atomically includes it as the first member; creating an existing channel does not join it. |
 | `asenq_channel_add` / `_remove` / `_members` | Edit or inspect identity-backed rosters. An orchestrator may join an existing channel itself; editing other members requires membership. Reads are unrestricted. |
 | `asenq_set_role` | Set `orchestrator`, `worker` or `unset` on a session sharing a channel with the caller, who must be an orchestrator. |
@@ -122,11 +122,37 @@ Channels have durable names and rosters of session identities. A session may bel
 
 The human can create channels and edit any roster through the CLI or **? → Create channel / Add channel member / Remove channel member** in the TUI. An orchestrator can create a new channel with itself as first member, or add itself to any existing channel; it can edit other members only in channels it belongs to. Workers and unset-role sessions cannot create channels or edit rosters. Adding requires a live target. Removal resolves current names before former names within that roster and refuses ambiguous matches; the human can instead pass `--session-id` to remove a specific identity, including an archived member. The TUI always removes by identity.
 
-Posting to an unknown channel still creates it, with an empty roster and no automatic membership. Existing post-only channels migrate with empty rosters. Add/remove/member queries require an existing channel. Channel reads remain unrestricted and posts stay on demand: membership alone does not push channel posts. Mention delivery is a separate change.
+Posting to an unknown channel still creates it, with an empty roster and no automatic membership. Existing post-only channels migrate with empty rosters. Add/remove/member queries require an existing channel. Channel reads remain unrestricted: membership alone does not push channel posts. Mention delivery is opt-in per post.
 
 An agent's `"*"` direct-message broadcast reaches each **live** session sharing any of its channels, once even if several channels overlap, and never the sender. A member with no live co-members reaches nobody; it does not fall back to machine-wide delivery. A sender belonging to no channel reaches every other live session on the machine. Human broadcasts remain machine-wide, and the human is never a broadcast target. Named direct messages remain unrestricted by membership; broadcasts use the same inbound policy, rate limits and delivery handling as other direct messages.
 
 The Channels tab lists each roster under its channel with role and lifecycle state. Selecting a member keeps the channel conversation and composer in channel scope, not a direct message. Purging retained posts keeps the channel; deleting an identity through retention removes its memberships.
+
+### Channel mentions
+
+Mention a member's current or former name to deliver a channel post as a direct message. Group keywords take precedence over member names:
+
+| Token | Targets |
+|---|---|
+| `@orch`, `@orchestrator`, `@orchestrators` | Members with the orchestrator role |
+| `@wrk`, `@worker`, `@workers` | Members with the worker role |
+| `@all` | All channel members |
+
+Every group excludes the posting session; the human is never a target. Each resolved identity is targeted once per post, even when named repeatedly or included by several groups. A group with no matching members is valid and produces no direct messages. Current names take precedence over former names within the roster; an ambiguous former name is an error.
+
+Mentions start at the beginning of text, after whitespace, or after `(`, `[`, `{`, `<`, `"`, `'`, or a backtick. A token ends at the first character outside ASCII letters, digits, `_` and `-`: `(@alpha)`, `"@alpha"` and `@alpha,` address `alpha`. Other preceding characters block mentions, so `foo@alpha`, `foo+@alpha.example` and `foo-@alpha.example` stay literal. Parsing is case-sensitive and has no Markdown or code-block exceptions.
+
+An unknown, ambiguous or non-member token fails the **whole post** with `unknown_mention`, listing valid members and any ambiguous candidates. No channel, retained post or direct message is created by that failed request. Use `asenq_channel_members` to inspect the roster before posting.
+
+```sh
+asenq channel send work "Review @alpha; status from @workers"
+```
+
+The pushed direct-message header names the channel and poster; the post body is unchanged. Direct-message policies still apply: agent posts to held targets remain held, refused targets are rejected, and human posts bypass hold just as ordinary human direct messages do. Sends return the post's `msgId` and per-target `results` with real states, rather than claiming that a held or rejected target was delivered. The CLI and `asenq_channel_send` show those target names and states. Posts without mentions remain on demand.
+
+Auto-removed members retain their identity and membership: accepted mention messages queue under that stable identity and deliver after revival, including across daemon restarts. Closing an identity removes its memberships and excludes it from group mentions. Its current and former names fail with `unknown_mention` unless another eligible member now resolves that token.
+
+In the TUI channel composer, type `@` to open a member and keyword picker, then keep typing to filter. Arrow keys choose a token; **Enter inserts it without posting**. A later Enter sends the draft. Escape dismisses the picker without discarding the draft. Direct-message composers and email text do not open it.
 
 ### File references
 
@@ -234,7 +260,7 @@ Select the **Archive** heading or an archived conversation and use `?` for **Pur
 
 The header's **failed** counter covers all retained failed or expired direct messages, not just the loaded conversation. Status events update it live; pruning retained history reduces it.
 
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 13).
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 14).
 
 ## How delivery works
 

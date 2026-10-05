@@ -1,4 +1,4 @@
-export const PROTOCOL = 13;
+export const PROTOCOL = 14;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -18,10 +18,18 @@ export const KINDS: Kind[] = ["chat", "task", "result", "status", "control"];
 export type ControlAction = "pause" | "resume" | "cancel";
 export const CONTROL_ACTIONS: readonly ControlAction[] = ["pause", "resume", "cancel"];
 export const INBOUND: Inbound[] = ["accept", "hold", "refuse"];
+export const MENTION_KEYWORDS: readonly string[] = ["orch", "orchestrator", "orchestrators", "wrk", "worker", "workers", "all"];
+
+const MENTION_OPENING = /[\s(\[<{"'`]/;
+
+/** Whether a candidate @ may open a mention at this UTF-16 offset. */
+export function hasMentionOpening(text: string, index: number): boolean {
+  return index === 0 || (index > 0 && MENTION_OPENING.test(text[index - 1]));
+}
 
 export type ErrCode =
   | "bad_request" | "unknown_target" | "name_taken" | "invalid_name"
-  | "unknown_channel" | "not_live" | "ambiguous_target"
+  | "unknown_channel" | "not_live" | "ambiguous_target" | "unknown_mention"
   | "too_large" | "not_registered" | "not_permitted" | "no_session" | "rate_limited" | "internal";
 
 export type Req = { id: number; op: string; [k: string]: unknown };
@@ -36,7 +44,7 @@ export type WireMsg = {
   kind?: Kind; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean;
   /** The reply target is no longer retained or is not readable by this caller. */
   replyToMissing?: boolean;
-  text: string; file?: FileReference; createdAt: number;
+  text: string; file?: FileReference; createdAt: number; sourceChannel?: string;
 };
 
 export type MsgStatus =
@@ -150,6 +158,7 @@ export type Push =
   | { push: "event"; position: number; event: TailEvent };
 
 export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unknown_target"; reason?: string };
+export type ChannelSendResult = { msgId: string; results: SendResult[] };
 
 export type SendOptions = {
   kind?: Kind;

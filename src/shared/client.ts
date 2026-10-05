@@ -24,7 +24,7 @@ export type Reply = Record<string, unknown>;
 type Pending = { resolve(v: Reply): void; reject(e: Error): void; timer: NodeJS.Timeout };
 
 /** Ops that may wait for a delivery ack or harness pong on the daemon side. */
-const SLOW_OPS: Record<string, true> = { send: true, release: true, ping: true };
+const SLOW_OPS: Record<string, true> = { send: true, release: true, ping: true, channel_send: true };
 
 export function ensureDaemon(): void {
   const cfg = readConfig();
