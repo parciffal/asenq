@@ -126,7 +126,7 @@ test("list staleness follows the last targeted ping, not contact or busy reports
     const beta = (await responsive.request("register", {
       harness: "opencode", key: "beta", name: "beta", caps: ["ping"],
     })).session as { id: string };
-    await env.adapter("omp", "unknown", "unknown");
+    await env.adapter("omp", "unknown", "unknown", { pingSupport: false });
     env.clock.advance(10);
     const responding = (await human.request("ping", { sessionId: beta.id })).results as { sessionId: string; ping: string }[];
     assert.deepEqual(responding.map((row) => [row.sessionId, row.ping]), [[beta.id, "responding"]]);

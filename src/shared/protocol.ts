@@ -1,4 +1,4 @@
-export const PROTOCOL = 14;
+export const PROTOCOL = 15;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -89,7 +89,7 @@ export type ListedSession = {
   cwd: string | null;
   state: "live" | "gone" | "stale";
   stale: boolean;
-  ping: "responding" | "not_responding" | "unknown" | null;
+  ping: PingStatus | null;
   inbound: Inbound;
   role: Role | null;
   channels: string[];

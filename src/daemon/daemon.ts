@@ -1064,7 +1064,7 @@ export class Daemon {
       pending.settle("not_responding");
       return {};
     }
-    this.lastSeen.set(pending.sessionId, this.now());
+    this.touchContact(pending.sessionId);
     pending.settle("responding");
     return {};
   }
