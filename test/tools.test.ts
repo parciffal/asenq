@@ -504,7 +504,9 @@ test("clipped control metadata retains its action and full recovery preserves th
   const msgId = await send(env.human(), "receiver", "Keep this control body", { kind: "control", action: "cancel", thread });
   const clipped = await callTool(receiver.client, "asenq_inbox", { unread_only: false });
   assert.ok(clipped.length <= 16_000);
-  assert.ok(clipped.includes(` · ${msgId} · kind=control · action=cancel`), "clipping optional metadata keeps the control intent");
+  assert.deepEqual(messageIds(clipped), [msgId], "clipped output retains the recovery id");
+  assert.ok(clipped.includes("kind=control"), "clipping optional metadata keeps the control kind");
+  assert.ok(clipped.includes("action=cancel"), "clipping optional metadata keeps the control action");
   assert.ok(clipped.includes("Keep this control body"));
   assert.match(clipped, /truncated/);
   for (const recovered of [
