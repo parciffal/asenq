@@ -18,6 +18,7 @@ import {
 } from "./terminal.js";
 import { roundedPanel } from "./panel.js";
 import { hintSpans } from "./chrome.js";
+import { heldBar } from "./held.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -140,7 +141,9 @@ export class ConsoleApp {
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
   private readStates = new Map<string, ReadState>();
-  private heldIds = new Set<string>();
+  private heldMessages = new Map<string, StoredMessage>();
+  private shownHeldId?: string;
+  private heldActionPending = false;
   private heldDirty = false;
   private streams = new Map<string, Stream>();
   private activity: PositionedEvent[] = [];
@@ -298,20 +301,37 @@ export class ConsoleApp {
     return target.kind === "session" ? `session:${target.id}` : `channel:${target.name}`;
   }
 
+  /** Selects the oldest incoming held message by durable target identity, independent of names. */
+  private heldForSession(sessionId: string): { message: StoredMessage; count: number } | undefined {
+    let message: StoredMessage | undefined;
+    let count = 0;
+    for (const held of this.heldMessages.values()) {
+      if (held.toSessionId !== sessionId) continue;
+      count++;
+      if (!message || held.order < message.order) message = held;
+    }
+    return message ? { message, count } : undefined;
+  }
+
+  /** Replaces held state from the authoritative operation, including transitions missed by replay. */
+  private async refreshHeld(): Promise<void> {
+    const held = await this.client.request("held");
+    this.heldMessages = new Map((held.messages as StoredMessage[]).map((m) => [m.id, m]));
+    this.heldDirty = false;
+  }
+
   private async hydrate(): Promise<void> {
     if (this.closed || this.syncing) return;
     this.syncing = true;
     try {
       const previous = this.watermark;
       const snapshot = await this.client.sync();
-      const [summaries, events, held] = await Promise.all([
-        this.client.inboxSummaries(), this.client.recentEvents(), this.client.request("held"),
+      const [summaries, events] = await Promise.all([
+        this.client.inboxSummaries(), this.client.recentEvents(), this.refreshHeld(),
       ]);
       this.applySnapshot(snapshot);
       this.summaries = summaries;
       this.activity = events;
-      this.heldIds = new Set((held.messages as StoredMessage[]).map((m) => m.id));
-      this.heldDirty = false;
       if (previous) this.watermark = previous; // replay missed events before trusting the new watermark
       this.connection = "connected";
       if (this.notice?.kind === "error" && this.notice.text.startsWith("Disconnected")) this.notice = undefined;
@@ -355,11 +375,7 @@ export class ConsoleApp {
       }
       // Refresh only after relevant replay transitions; the held op is authoritative even
       // when a hold and its release both occurred between snapshots.
-      if (this.heldDirty && !this.resync) {
-        const held = await this.client.request("held");
-        this.heldIds = new Set((held.messages as StoredMessage[]).map((m) => m.id));
-        this.heldDirty = false;
-      }
+      if (this.heldDirty && !this.resync) await this.refreshHeld();
     } catch (e) {
       this.connection = "offline";
       this.say(`Disconnected: ${stringify(e)} · reconnecting`, "error");
@@ -383,7 +399,7 @@ export class ConsoleApp {
     }
     const e = item.event;
     if (e.type === "message") {
-      if (e.status === "held" || this.heldIds.has(e.msg.id)) this.heldDirty = true;
+      if (e.status === "held" || this.heldMessages.has(e.msg.id)) this.heldDirty = true;
       const m: StoredMessage = { ...e.msg, status: e.status, ...(e.reason ? { reason: e.reason } : {}) };
       if (!e.reason) delete m.reason;
       if (!m.channel) {
@@ -807,6 +823,7 @@ export class ConsoleApp {
     const { columns: width, rows: height } = this.screen.size;
     this.hits = [];
     this.shown = undefined;
+    this.shownHeldId = undefined;
     const top = height >= 4 ? 1 : 0;
     const bottom = height >= 2 ? 1 : 0;
     const bodyHeight = Math.max(0, height - top - bottom);
@@ -835,7 +852,7 @@ export class ConsoleApp {
     const counters = [
       { count: this.sessions.filter((s) => s.state === "live").length, label: "live", short: "L", style: theme.dim },
       { count: this.sessions.filter((s) => s.state === "gone").length, label: "reconnecting", short: "R", style: theme.warn },
-      { count: this.heldIds.size, label: "held", short: "H", style: theme.warn },
+      { count: this.heldMessages.size, label: "held", short: "H", style: theme.warn },
       { count: inboxUnread + channelUnread, label: "unread", short: "U", style: theme.unread },
     ];
     const connection: TerminalSpan = this.connection === "connected"
@@ -906,7 +923,7 @@ export class ConsoleApp {
   }
 
   private footer(width: number): TerminalLine {
-    const hints = this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
+    let hints = this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
       : this.palette ? "type to filter · ↑↓ · Enter run · Esc close · Ctrl+K jump"
       : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel · Ctrl+K jump"
       : this.searching ? "type name · ↑↓ · Enter keep · Esc clear · Ctrl+K jump"
@@ -914,6 +931,9 @@ export class ConsoleApp {
       : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · Ctrl+K jump · ? menu"
       : this.focus === "tabs" ? "←→ switch · Enter open · Ctrl+K jump · ? menu"
       : "↑↓ move · Enter open · Tab focus · Ctrl+K jump · ? menu";
+    if (this.shownHeldId && !this.finder && !this.palette && !this.form && !this.searching && this.focus !== "composer") {
+      hints += " · r release · x drop";
+    }
     const notice = this.notice;
     if (!notice) return padSpans(hintSpans(hints, width), width);
     const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
@@ -1036,15 +1056,20 @@ export class ConsoleApp {
     if (titled) rows.push(this.title(width, narrow, y0, x0));
     if (this.panel) return this.panelPane(rows, width, height, y0, x0);
     const target = this.composeTarget();
+    const scope = this.scope();
     const available = height - rows.length;
+    // Held controls follow the viewed identity, including read-only archived conversations.
+    const held = scope?.scope === "session" ? this.heldForSession(scope.sessionId) : undefined;
+    // Reserve one transcript row and the editor's input before held chrome. A full bar
+    // needs three rows; short panes use one, and the smallest panes hide it entirely.
+    const heldRows = held ? heldBar(held.message, held.count, width, available >= 8 ? 3 : available >= 3 ? 1 : 0) : [];
     // Keep two transcript rows in previews; focused editors may borrow one, but never
     // lose their input row to chrome. Short panes use an unboxed editor instead.
     const composerRoom = this.focus === "composer" ? Math.max(1, available - 1) : available >= 5 ? available - 2 : 0;
     let composer: Pane | undefined;
-    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, composerRoom), x0);
-    const transcriptHeight = height - rows.length - (composer?.rows.length ?? 0);
+    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, Math.max(1, composerRoom - heldRows.length)), x0);
+    const transcriptHeight = height - rows.length - heldRows.length - (composer?.rows.length ?? 0);
     const transcriptY = y0 + rows.length;
-    const scope = this.scope();
     let body: TerminalLine[];
     if (!scope) {
       const text = this.connection === "offline" && !this.sessions.length
@@ -1087,6 +1112,10 @@ export class ConsoleApp {
       this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: { kind: "transcript" } });
     }
     rows.push(...body);
+    if (held && heldRows.length) {
+      rows.push(...heldRows);
+      this.shownHeldId = held.message.id;
+    }
     if (!composer) return { rows };
     const composerY = y0 + rows.length;
     composer.rows.forEach((_, index) => {
@@ -1481,6 +1510,9 @@ export class ConsoleApp {
     if (this.form) return this.formKey(k);
     if (this.searching) return this.searchKey(k);
     if (this.focus === "composer") return this.composerKey(k);
+    if (this.shownHeldId && (k.text === "r" || k.text === "x")) {
+      return this.heldAction(k.text === "r" ? "release" : "drop");
+    }
     const name = k.name;
     if (name === "TAB" || name === "SHIFT_TAB") {
       this.cycleFocus(name === "TAB" ? 1 : -1);
@@ -1711,6 +1743,29 @@ export class ConsoleApp {
   }
 
   // ------------------------------------------------------------------ forms & actions
+
+  private async heldAction(action: "release" | "drop"): Promise<void> {
+    const msgId = this.shownHeldId;
+    if (!msgId || !this.heldMessages.has(msgId) || this.heldActionPending) return;
+    this.heldActionPending = true;
+    try {
+      const reply = await this.client.request(action, { msgId });
+      this.heldMessages.delete(msgId);
+      this.say(`${msgId}: ${action === "drop" ? "dropped" : String(reply.status)}`);
+    } catch (e) {
+      this.say(stringify(e), "error");
+    } finally {
+      try {
+        await this.refreshHeld();
+        await this.replay();
+      } catch (e) {
+        this.say(stringify(e), "error");
+      } finally {
+        this.heldActionPending = false;
+        this.render();
+      }
+    }
+  }
 
   private openForm(title: string, fields: Field[], submit: Form["submit"], description?: string[]): void {
     this.form = { title, fields, focus: 0, submit, ...(description ? { description } : {}) };

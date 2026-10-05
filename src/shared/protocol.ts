@@ -1,4 +1,4 @@
-export const PROTOCOL = 8;
+export const PROTOCOL = 9;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -39,7 +39,8 @@ export type MsgStatus =
   | "queued" | "delivered" | "held" | "rejected" | "failed"
   | "expired" | "posted" | "dropped";
 
-/** A retained message together with its durable paging order and current delivery state. */
+/** Retained history and held replies include durable order and delivery state.
+ * Scope held actions by session ids; historical from/to names can outlive a rename. */
 export type StoredMessage = WireMsg & {
   order: number;
   fromSessionId?: string;

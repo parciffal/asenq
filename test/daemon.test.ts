@@ -616,6 +616,27 @@ test("control honors hold and refuse while released and queued deliveries retain
   );
 });
 
+test("held payload keeps stable target identity across rename and exposes oldest-first order", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-shape-sender", "alpha");
+  const target = await env.adapter("omp", "held-shape-target", "beta");
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  const [first] = await send(sender.client, "beta", "before rename");
+  await human.request("rename", { from: "beta", name: "renamed" });
+  const [second] = await send(sender.client, "renamed", "after rename");
+
+  const held = (await human.request("held")).messages as StoredMessage[];
+  assert.deepEqual(held.map(({ id, fromSessionId, toSessionId, status }) => ({
+    id, fromSessionId, toSessionId, status,
+  })), [first, second].map(({ msgId }) => ({
+    id: msgId, fromSessionId: sender.session.id, toSessionId: target.session.id, status: "held",
+  })));
+  assert.deepEqual(held.map(({ to }) => to), ["beta", "renamed"]);
+  assert.ok(Number.isSafeInteger(held[0].order) && held[0].order > 0);
+  assert.ok(held[1].order > held[0].order, "oldest-first selection uses durable storage order");
+});
+
 test("policy: hold, refuse, duplicate drop and rate limit", async () => {
   env = await startEnv();
   const human = env.human();

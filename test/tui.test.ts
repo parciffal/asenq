@@ -2,14 +2,15 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import type { AsenqClient } from "../src/shared/client.js";
-import { ConsoleApp } from "../src/tui/app.js";
+import { AsenqClient } from "../src/shared/client.js";
+import type { SendResult, StoredMessage } from "../src/shared/protocol.js";
+import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
   changedTerminalRows, normalizeTerminalLine, terminalTextWidth, translateKeyboardInput, truncateTerminalText, wrapTerminalText,
   type TerminalAdapterOptions, type TerminalFrame, type TerminalLine, type TerminalSize,
 } from "../src/tui/terminal.js";
-import { startEnv, type TestEnv } from "./helpers.js";
+import { logOf, startEnv, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 let open: Console | undefined;
@@ -37,11 +38,12 @@ const lineText = (line: TerminalLine | undefined): string =>
   line === undefined ? "" : typeof line === "string" ? line : line.map((span) => span.text).join("");
 
 /** Runs the real ui against the test daemon with a recording screen instead of a TTY. */
-async function startConsole(columns: number, rows: number): Promise<Console> {
+async function startConsole(columns: number, rows: number, client?: ConsoleDeps["client"]): Promise<Console> {
   let handlers: TerminalAdapterOptions = {};
   let frame: TerminalFrame = { lines: [] };
   const size = { columns, rows };
   const app = new ConsoleApp({
+    ...(client ? { client } : {}),
     screen: (options) => {
       handlers = options;
       return { size, start() {}, render(next) { frame = next; }, cleanup() {} };
@@ -111,6 +113,169 @@ test("file-only direct messages show the summary and path in transcript rows", a
   assert.ok(rows.includes("File report ready"), rows);
   assert.ok(rows.includes(path), rows);
   assert.ok(!rows.includes("private report contents"));
+  assertWithin(ui);
+});
+
+test("held shortcuts retain search, palette and form typing and cannot act from hidden surfaces", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-typing-sender", "alpha");
+  const target = await env.adapter("omp", "held-typing-target", "rx-target");
+  await human.request("set_inbound", { name: "rx-target", mode: "hold" });
+  const reply = await sender.client.request("send", { to: "rx-target", text: "await human decision" });
+  const msgId = (reply.results as { msgId: string }[])[0].msgId;
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("rx");
+  assert.ok(ui.rows().some((row) => row.includes("/ rx")), "r and x enter the session filter");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("⏸") && row.includes("held")), "target bar is visible before opening overlays");
+
+  await ui.press("?");
+  await ui.type("rx");
+  assert.ok(ui.rows().some((row) => row.startsWith("? rx")), "r and x enter the palette filter");
+  await ui.press("ESCAPE");
+  await ui.press("CTRL_E");
+  await ui.type("rx");
+  await ui.press("CTRL_D");
+  await ui.until(() => target.deliveries.length > 0, "expected form message delivery");
+  assert.equal((await target.nextDelivery()).msg.text, "rx", "form typing reaches the target as a human message");
+  assert.equal((await logOf(human, msgId)).status, "held");
+
+  await ui.press("a");
+  await ui.type("rx");
+  assert.equal((await logOf(human, msgId)).status, "held", "activity cannot act on the previous bar");
+  ui.size.columns = 60;
+  await ui.press("s");
+  await ui.type("rx");
+  assert.equal((await logOf(human, msgId)).status, "held", "narrow picker cannot act on a hidden bar");
+  assert.ok(!ui.rows().some((row) => row.includes("⏸") && row.includes("held")), "picker has no actionable bar");
+  assertWithin(ui);
+});
+
+test("held actions stay bound to the target identity across rename and name reuse", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-rename-sender", "alpha");
+  const target = await env.adapter("omp", "held-rename-target", "beta");
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  const first = await sender.client.request("send", { to: "beta", text: "first identity-held message" });
+  const second = await sender.client.request("send", { to: "beta", text: "second identity-held message" });
+  const firstId = (first.results as { msgId: string }[])[0].msgId;
+  const secondId = (second.results as { msgId: string }[])[0].msgId;
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("beta");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  await human.request("rename", { from: "beta", name: "renamed" });
+  await ui.until(() => ui.rows().some((row) => row.includes("to renamed")), "bound target rename");
+  await ui.press("r");
+  await ui.until(() => target.deliveries.length > 0, "expected oldest held message delivery after rename");
+  assert.equal((await target.nextDelivery()).msg.id, firstId);
+  assert.equal((await logOf(human, secondId)).status, "held");
+  const replacement = await env.adapter("omp", "held-rename-replacement", "beta");
+  assert.notEqual(replacement.session.id, target.session.id);
+  await ui.until(() => ui.rows()[0].includes("3 live"), "name reused by another identity");
+  await ui.press("ESCAPE");
+  const listWidth = paneWidths(120)!.list;
+  const replacementRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("beta") && !row.includes("renamed"));
+  assert.ok(replacementRow >= 0);
+  await ui.click(3, replacementRow);
+  assert.ok(!ui.rows().some((row) => row.includes("⏸") && row.includes("held")), "new beta does not inherit renamed target's held messages");
+  await ui.type("rx");
+  assert.equal((await logOf(human, secondId)).status, "held");
+  const renamedRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("renamed"));
+  assert.ok(renamedRow >= 0);
+  await ui.click(3, renamedRow);
+  await ui.press("x");
+  assert.equal((await logOf(human, secondId)).status, "dropped");
+  assert.equal(replacement.deliveries.length, 0);
+  assertWithin(ui);
+});
+
+test("stale held actions refresh without consuming the next message or a newly opened target", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-stale-sender", "alpha");
+  const beta = await env.adapter("omp", "held-stale-beta", "beta");
+  await env.adapter("omp", "held-stale-gamma", "gamma");
+  for (const name of ["beta", "gamma"]) await human.request("set_inbound", { name, mode: "hold" });
+  const gamma = await sender.client.request("send", { to: "gamma", text: "gamma must remain held" });
+  const first = await sender.client.request("send", { to: "beta", text: "externally released oldest" });
+  const second = await sender.client.request("send", { to: "beta", text: "next beta must remain held" });
+  const gammaId = (gamma.results as { msgId: string }[])[0].msgId;
+  const firstId = (first.results as { msgId: string }[])[0].msgId;
+  const secondId = (second.results as { msgId: string }[])[0].msgId;
+  let interleave: (() => void) | undefined;
+  const overlapping: Promise<void>[] = [];
+  let delayRelease = true;
+  const ui = await startConsole(120, 32, (options) => new class extends AsenqClient {
+    override async request(op: string, params: Record<string, unknown> = {}) {
+      if (op === "release" && delayRelease) {
+        delayRelease = false;
+        await human.request("release", { msgId: firstId });
+        interleave?.();
+      }
+      return super.request(op, params);
+    }
+  }(options));
+  await ui.press("/");
+  await ui.type("beta");
+  await ui.press("ENTER");
+  await ui.press("ESCAPE");
+  const listWidth = paneWidths(120)!.list;
+  const gammaRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("gamma"));
+  assert.ok(gammaRow >= 0);
+  interleave = () => {
+    overlapping.push(ui.click(3, gammaRow));
+    assert.ok(ui.rows().some((row) => row.includes("⏸") && row.includes("held") && row.includes("gamma")), "the overlapping shortcuts see gamma's actionable bar");
+    overlapping.push(ui.press("r"), ui.press("x"), ui.press("c"), ui.press("r"), ui.press("x"));
+  };
+  await ui.press("r");
+  await Promise.all(overlapping);
+  await ui.until(() => beta.deliveries.length > 0, "expected competing release delivery");
+  assert.equal((await beta.nextDelivery()).msg.id, firstId);
+  assert.equal((await logOf(human, secondId)).status, "held", "a stale captured ID never falls through to the next beta message");
+  assert.equal((await logOf(human, gammaId)).status, "held", "overlapping keys do not act on the newly opened target");
+  assert.ok(ui.rows().some((row) => row.includes("not held")), "stale release retains the existing error notice");
+  assert.ok(ui.rows().some((row) => row.includes("to gamma")), "action completion keeps the new target");
+  assert.ok(ui.rows().some((row) => row.includes("› rx")), "action completion keeps the new target's draft");
+  assert.match(ui.rows()[0], /2 held/);
+  assertWithin(ui);
+});
+
+test("archived conversation keeps held controls while release queues until the same identity revives", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "archived-held-sender", "orch");
+  const target = await env.adapter("omp", "archived-held-target", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  const [drop] = (await sender.client.request("send", { to: "worker", text: "archived-drop-preview" })).results as SendResult[];
+  const [release] = (await sender.client.request("send", { to: "worker", text: "archived-release-preview" })).results as SendResult[];
+  await target.client.request("unregister");
+  const ui = await startConsole(120, 32);
+  await ui.press("CTRL_K");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("archived · read only")), "archived conversation opened");
+  assert.ok(ui.rows().some((row) => row.includes("⏸ held 2") && row.includes("archived-drop-preview")));
+  assert.equal(ui.frame().cursor, undefined, "archived conversation has no editable composer");
+  assert.ok(!ui.rows().some((row) => row.includes("Write to worker")));
+  await ui.press("x");
+  assert.equal((await logOf(human, drop.msgId!)).status, "dropped");
+  await ui.until(() => ui.rows().some((row) => row.includes("⏸ held") && row.includes("archived-release-preview")), "next archived held preview");
+  await ui.press("r");
+  assert.equal((await logOf(human, release.msgId!)).status, "queued");
+  assert.equal(target.deliveries.length, 0, "release cannot deliver to the removed transport");
+  assert.ok(!ui.rows().some((row) => row.includes("⏸ held")));
+  assert.match(ui.rows()[0], /0 held/);
+  const revived = await env.adapter("omp", "archived-held-target", "ignored-name");
+  assert.equal(revived.session.id, target.session.id);
+  await ui.until(() => revived.deliveries.length === 1, "queued release delivered on revival");
+  assert.equal((await revived.nextDelivery()).msg.id, release.msgId);
+  assert.equal((await logOf(human, release.msgId!)).status, "delivered");
   assertWithin(ui);
 });
 
@@ -607,6 +772,115 @@ test("rounded panes resize at the wide boundary without overflowing or moving mo
   }
 });
 
+test("held bar is target-scoped and hidden by non-session surfaces and text overlays", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "held-scopes-orch", "orch");
+  const worker = await env.adapter("omp", "held-scopes-worker", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  await orch.client.request("send", { to: "worker", text: "target-held-preview" });
+  await worker.client.request("send", { to: "human", text: "grouped-inbox-message" });
+  await human.request("channel_send", { channel: "held-scopes", text: "channel-message" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("orch");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "sending a held message does not give the sender a bar");
+  await ui.press("/");
+  await ui.press("ESCAPE");
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("⏸ held")), "target bar");
+  await ui.press("ENTER");
+  await ui.press("?");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "palette hides the bar");
+  await ui.press("ESCAPE");
+  await ui.press("CTRL_E");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "full editor hides the bar");
+  await ui.press("ESCAPE");
+  await ui.press("i");
+  assert.ok(ui.rows().some((row) => row.includes("target-held-preview")), "grouped inbox opens the same target identity");
+  await ui.press("v");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "aggregate inbox is not a target conversation");
+  await ui.press("#");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "channel has no session bar");
+  await ui.press("a");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held")), "activity has no bar");
+  assertWithin(ui);
+});
+
+test("held bar keeps a sanitized preview and monochrome emphasis without stealing a resized draft's input", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "held-resize-orch", "orch");
+  const worker = await env.adapter("omp", "held-resize-worker", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  const [held] = (await orch.client.request("send", { to: "worker", text: "safe-preview\nsecond-line \u001b[31mred\u001b[0m" })).results as SendResult[];
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  const barRow = ui.rows().findIndex((row) => row.includes("⏸ held"));
+  assert.ok(barRow >= 0);
+  assert.match(ui.rows()[barRow]!, /"safe-preview second-line red"/);
+  const spans = normalizeTerminalLine(ui.frame().lines[barRow], ui.size.columns);
+  assert.ok(spans.some((span) => span.text.includes("⏸ held") && span.style?.foreground === "yellow" && span.style.bold));
+  assert.ok(spans.some((span) => span.text.includes("│") && span.style?.foreground === "yellow" && span.style.dim));
+  const monochrome = normalizeTerminalLine(ui.frame().lines[barRow], ui.size.columns, false);
+  assert.ok(monochrome.some((span) => span.text.includes("⏸ held") && span.style?.bold && !span.style.foreground));
+  assert.ok(monochrome.some((span) => span.text.includes("│") && span.style?.dim && !span.style.foreground));
+  const composerRow = ui.rows().findIndex((row) => row.includes("Write to worker"));
+  assert.ok(composerRow > barRow, "composer input stays below the held bar");
+  const promptColumn = ui.rows()[composerRow]!.indexOf("› ");
+  await ui.click(promptColumn, composerRow);
+  await ui.press("r");
+  await ui.press("x");
+  for (const [columns, height, visible] of [[79, 8, true], [79, 6, true], [79, 5, false], [79, 3, false], [7, 6, false], [80, 8, true], [120, 32, true]] as const) {
+    Object.assign(ui.size, { columns, rows: height });
+    await ui.press("LEFT");
+    assertWithin(ui);
+    assert.equal(ui.rows().some((row) => row.includes("⏸ held")), visible, `${columns}×${height}: held chrome visibility`);
+    const cursor = ui.frame().cursor;
+    assert.ok(cursor && cursor.row >= 0 && cursor.row < height && cursor.column >= 0 && cursor.column < columns);
+    assert.ok(!"╭╮╰╯│─".includes(ui.rows()[cursor.row]![cursor.column]!), "draft cursor stays off the held and composer borders");
+  }
+  assert.deepEqual(((await human.request("held")).messages as StoredMessage[]).map((message) => message.id), [held.msgId], "typing and resizing never release or drop the held message");
+  await ui.press("ENTER");
+  await ui.until(() => worker.deliveries.length === 1, "draft survives held-bar resizing");
+  assert.equal((await worker.nextDelivery()).msg.text, "rx", "composer r/x remain editable text through held-bar resize");
+});
+
+test("held chrome does not read a hidden or scrolled-away newest incoming row", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "held-reader-orch", "orch");
+  const worker = await env.adapter("omp", "held-reader-worker", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  await orch.client.request("send", { to: "worker", text: "held-reader-preview" });
+  await worker.client.request("send", { to: "human", text: `${"long incoming paragraph\n".repeat(40)}latest-incoming-tail` });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  ui.size.columns = 80;
+  ui.size.rows = 4;
+  await ui.press("ENTER");
+  assert.ok(ui.rows().every((row) => !row.includes("⏸ held") && !row.includes("latest-incoming-tail")));
+  assert.equal(await unread(human, worker.session.id), 1, "hidden body and bar do not expose the incoming row");
+  ui.size.columns = 120;
+  ui.size.rows = 32;
+  await ui.press("u");
+  await ui.press("HOME");
+  assert.ok(ui.rows().some((row) => row.includes("held-reader-preview")));
+  assert.ok(ui.rows().every((row) => !row.includes("latest-incoming-tail")));
+  assert.equal(await unread(human, worker.session.id), 1, "a visible held preview is not the incoming message");
+  await ui.press("END");
+  assert.ok(ui.rows().some((row) => row.includes("latest-incoming-tail")));
+  assert.equal(await unread(human, worker.session.id), 0, "only the reached newest incoming row advances the marker");
+  assertWithin(ui);
+});
+
 test("wide bordered conversation keeps every wrapped body row reachable and reads only the visible last incoming row", async () => {
   env = await startEnv();
   const human = env.human();
@@ -1012,4 +1286,64 @@ test("quick jump keeps the highlighted identity through live result reordering",
   assert.ok(ui.rows().some((row) => row.includes("› #zebra")), "channel insertion retains the highlighted channel");
   await ui.press("ENTER");
   await ui.until(() => ui.rows().some((row) => row.includes("stable-zebra-history")), "Enter opens highlighted channel");
+});
+
+test("held bar scopes to the open target and releases then drops its oldest shown messages", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-bar-sender", "orch");
+  const target = await env.adapter("omp", "held-bar-target", "worker");
+  const other = await env.adapter("omp", "held-bar-other", "other");
+  for (const name of ["worker", "other"]) await human.request("set_inbound", { name, mode: "hold" });
+  await sender.client.request("send", { to: "worker", text: "oldest-review-preview" });
+  await sender.client.request("send", { to: "worker", text: "next-review-preview" });
+  await sender.client.request("send", { to: "other", text: "other-target-preview" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  const bar = () => ui.rows().find((row) => row.includes("⏸") && row.includes("held"));
+  assert.ok(bar(), "held messages for the open target expose the bar");
+  assert.ok(bar()!.includes("orch → worker") && bar()!.includes("oldest-review-preview"), "the oldest message is shown with its sender and target");
+  assert.match(bar()!, /held.*2/, "multiple held messages show a count");
+  assert.ok(!bar()!.includes("other-target-preview"), "another target's held messages are not mixed in");
+  assert.match(ui.rows()[0], /3 held/, "header counts held messages across targets");
+  await ui.press("r");
+  await ui.until(() => target.deliveries.length === 1, "oldest held message released");
+  assert.equal((await target.nextDelivery()).msg.text, "oldest-review-preview", "release acts on the displayed oldest message");
+  await ui.until(() => bar()?.includes("next-review-preview") ?? false, "next held preview");
+  assert.match(ui.rows()[0], /2 held/);
+  await ui.press("x");
+  await ui.until(() => bar() === undefined, "empty target hides its held bar");
+  const held = (await human.request("held")).messages as { text: string }[];
+  assert.deepEqual(held.map((message) => message.text), ["other-target-preview"], "drop removes only the shown target's message");
+  assert.match(ui.rows()[0], /1 held/);
+  assert.equal(target.deliveries.length, 1, "drop never delivers the second message");
+  assert.equal(other.deliveries.length, 0);
+  assertWithin(ui);
+});
+
+test("r and x remain ordinary draft characters while a held bar is visible", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "safe-held-sender", "orch");
+  const target = await env.adapter("omp", "safe-held-target", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  await sender.client.request("send", { to: "worker", text: "held-while-typing" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("⏸") && row.includes("held-while-typing")));
+  await ui.press("c");
+  await ui.type("rx");
+  assert.equal(((await human.request("held")).messages as unknown[]).length, 1, "draft typing does not mutate held messages");
+  assert.equal(target.deliveries.length, 0, "draft typing does not release");
+  await ui.press("ENTER");
+  await ui.until(() => target.deliveries.length === 1, "draft delivered without releasing held message");
+  assert.equal((await target.nextDelivery()).msg.text, "rx", "both characters stay in the sent draft");
+  assert.equal(((await human.request("held")).messages as unknown[]).length, 1, "human draft delivery bypasses hold without releasing agent messages");
+  assertWithin(ui);
 });
