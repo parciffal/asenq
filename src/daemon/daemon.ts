@@ -1301,11 +1301,13 @@ export class Daemon {
       throw new AsenqError("bad_request", "action is only valid for kind control");
     }
     if (p.done !== undefined && typeof p.done !== "boolean") throw new AsenqError("bad_request", '"done" must be a boolean');
-    let stableTarget: RouteTarget | undefined;
+    let stableTarget: SessionIdentity | undefined;
     if (targetSessionId !== undefined) {
       this.requireHuman(s, "send by stable session identity");
       stableTarget = this.store.identity(targetSessionId);
-      if (!stableTarget) throw new AsenqError("unknown_target", `unknown retained session ${targetSessionId}`);
+      if (!stableTarget || stableTarget.closedAt !== undefined) {
+        throw new AsenqError("unknown_target", `unknown retained session ${targetSessionId}`);
+      }
       if (to !== undefined && to !== stableTarget.name) {
         throw new AsenqError("unknown_target", `session ${targetSessionId} is now named ${stableTarget.name}, not ${to}`);
       }
@@ -1347,6 +1349,7 @@ export class Daemon {
   }
 
   private routeOne(s: Sender, target: RouteTarget, row: MsgRow): Promise<SendResult> | SendResult {
+    if (this.store.identity(target.id)?.closedAt !== undefined) throw this.unknownTarget(target.name);
     const now = row.created_at;
     const finish = (status: MsgStatus, reason?: string): SendResult => {
       this.insert({ ...row, status, reason: reason ?? null });

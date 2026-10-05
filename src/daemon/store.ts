@@ -545,12 +545,13 @@ export class Store {
     return row && toIdentity(row);
   }
 
-  /** Active current-name holders win; multiple retained holders require a stable id. */
+  /** Active current-name holders win; multiple non-closed retained holders require a stable id. */
   identityByName(name: string): SessionIdentity | { candidates: SessionIdentity[] } | undefined {
     const active = this.sessionByName(name);
-    if (active) return this.identity(active.id);
+    const identity = active && this.identity(active.id);
+    if (identity && identity.closedAt === undefined) return identity;
     const candidates = this.db.all<IdentityRow>(
-      "SELECT * FROM session_identities WHERE name=? ORDER BY id", name,
+      "SELECT * FROM session_identities WHERE name=? AND closed_at IS NULL ORDER BY id", name,
     ).map(toIdentity);
     return candidates.length > 1 ? { candidates } : candidates[0];
   }
