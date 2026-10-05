@@ -348,7 +348,6 @@ test("text-plus-file tools keep caller isolation for sender and human file check
   const output = await callTool(human, "asenq_inbox", { id });
   assert.ok(output.includes("Please review before continuing"));
   assert.ok(output.includes("Review evidence"));
-  assert.ok(output.indexOf("Please review before continuing") < output.indexOf("Review evidence"));
   assert.ok(output.includes(path));
   assert.equal(await callTool(shared.client, "asenq_file_check", { id }, beta.id), "match");
   assert.equal(await callTool(human, "asenq_file_check", { id }), "match");

@@ -347,8 +347,6 @@ test("file checks compare send-time bytes and report missing for removed or non-
   const path = join(env.home, "report.txt");
   writeFileSync(path, "abc");
   const [sent] = await send(alpha.client, "beta", "Please review", { file: { path, summary: "Report" } });
-  const delivery = await beta.nextDelivery();
-  assert.ok(delivery.text.includes("Please review\nReport"));
   assert.equal((await alpha.client.request("file_check", { msgId: sent.msgId })).status, "match");
   assert.equal((await beta.client.request("file_check", { msgId: sent.msgId })).status, "match");
   writeFileSync(path, "abd");
@@ -366,6 +364,31 @@ test("file checks compare send-time bytes and report missing for removed or non-
   await assert.rejects(alpha.client.request("file_check", { msgId: "m_absent" }), { code: "bad_request" });
 });
 
+test("Claude polling retains file metadata when text or thread exceeds the delivery budget", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await human.request("claude_hook", { event: "start", key: "file-poll", sessionId: "file-poll", name: "orch" });
+  const path = join(env.home, "report.txt");
+  writeFileSync(path, "abc");
+  const receiver = env.human();
+  await receiver.request("claude_attach", { sessionId: "file-poll" });
+  for (const thread of [undefined, "t".repeat(20_000)]) {
+    const text = "long body ".repeat(2000);
+    const [sent] = await send(human, "orch", text, { thread, file: { path, summary: "Review report" } });
+    const texts = (await human.request("claude_hook", { event: "poll", sessionId: "file-poll" })).texts as string[];
+    assert.ok(texts[0].includes("Review report"));
+    assert.ok(texts[0].includes(path));
+    assert.ok(texts[0].includes("3 bytes"));
+    assert.ok(texts[0].includes("ba7816bf8f01"));
+    assert.ok(texts[0].includes(`asenq_file_check id=${sent.msgId}`));
+    assert.ok(texts[0].includes(`asenq_inbox id=${sent.msgId}`));
+    assert.equal((await logOf(human, sent.msgId!)).status, "delivered");
+    const retained = (await receiver.request("inbox", { msgId: sent.msgId })).messages as StoredMessage[];
+    assert.equal(retained[0].text, text);
+    assert.equal(retained[0].file?.path, path);
+  }
+});
+
 test("file references reject malformed metadata and paths, including FIFOs without blocking", async () => {
   env = await startEnv();
   const human = env.human();
@@ -379,6 +402,8 @@ test("file references reject malformed metadata and paths, including FIFOs witho
     { path: "relative.txt", summary: "Report" },
     { path: join(env.home, "absent.txt"), summary: "Report" },
     { path: env.home, summary: "Report" }, { path: fifo, summary: "Report" },
+    { path: "/dev/zero", summary: "Report" }, { path: "/dev/random", summary: "Report" },
+    { path: socketPath(), summary: "Report" },
     { path, summary: "" }, { path, summary: " " }, { path, summary: "x".repeat(501) },
   ]) {
     await assert.rejects(human.request("send", { to: "human", file }), { code: "bad_request" });

@@ -4,7 +4,7 @@ export function renderMessageBody(msg: Pick<WireMsg, "id" | "text" | "file">): s
   if (!msg.file) return msg.text;
   const file = msg.file;
   const reference = `${file.summary}\n${file.path}\n${file.size} bytes · sha256=${file.sha256.slice(0, 12)}\nread the file; verify with asenq_file_check id=${msg.id}`;
-  return msg.text ? `${msg.text}\n${reference}` : reference;
+  return msg.text ? `${reference}\n${msg.text}` : reference;
 }
 
 export function renderInbound(msg: WireMsg, role?: Role): string {

@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, mkdirSync, openSync, readSync, rmSync } from "node:fs";
+import { chmodSync, constants, createReadStream, mkdirSync, rmSync } from "node:fs";
+import { open } from "node:fs/promises";
 import net from "node:net";
 import { isAbsolute, join } from "node:path";
 import {
@@ -102,26 +103,22 @@ function readScope(p: Params): ReadScope {
 
 const newId = (prefix: string): string => prefix + randomBytes(6).toString("hex");
 
-/** Open nonblocking so a FIFO cannot stall the daemon; inspect and read the same descriptor. */
-function hashFile(path: string): { sha256: string; size: number } {
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+/** Inspect the nonblocking descriptor before streaming so special files cannot hang a read. */
+async function hashFile(path: string): Promise<{ sha256: string; size: number }> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
-    if (!fstatSync(fd).isFile()) throw new Error("not a regular file");
+    const stat = await file.stat();
+    if (!stat.isFile()) throw new Error("not a regular file");
     const hash = createHash("sha256");
-    const buffer = Buffer.allocUnsafe(64 * 1024);
-    let size = 0;
-    let bytes: number;
-    while ((bytes = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
-      hash.update(buffer.subarray(0, bytes));
-      size += bytes;
-    }
-    return { sha256: hash.digest("hex"), size };
+    const stream = createReadStream(path, { fd: file.fd, autoClose: false });
+    for await (const chunk of stream) hash.update(chunk);
+    return { sha256: hash.digest("hex"), size: stat.size };
   } finally {
-    closeSync(fd);
+    await file.close();
   }
 }
 
-function fileParam(value: unknown): FileReference | undefined {
+async function fileParam(value: unknown): Promise<FileReference | undefined> {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new AsenqError("bad_request", "file must contain path and summary");
@@ -134,7 +131,7 @@ function fileParam(value: unknown): FileReference | undefined {
     throw new AsenqError("bad_request", "file summary must be nonempty and at most 500 characters");
   }
   try {
-    return { path, summary, ...hashFile(path) };
+    return { path, summary, ...await hashFile(path) };
   } catch (error) {
     throw new AsenqError("bad_request", `cannot read regular file "${path}": ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -445,7 +442,7 @@ export class Daemon {
       : { sql: "channel IS NULL AND (from_name='human' OR to_name='human')", params: [] };
   }
 
-  private opFileCheck(s: Sender, p: Params): Result {
+  private async opFileCheck(s: Sender, p: Params): Promise<Result> {
     const scope = this.directScope(s);
     const row = this.store.db.get<MsgRow>(
       `SELECT * FROM messages WHERE id=? AND ${scope.sql}`, str(p, "msgId", true), ...scope.params,
@@ -453,7 +450,7 @@ export class Daemon {
     if (!row?.file) throw new AsenqError("bad_request", "no retained file reference for the caller");
     const file = toWire(row).file!;
     try {
-      return { status: hashFile(file.path).sha256 === file.sha256 ? "match" : "changed" };
+      return { status: (await hashFile(file.path)).sha256 === file.sha256 ? "match" : "changed" };
     } catch {
       return { status: "missing" };
     }
@@ -979,9 +976,12 @@ export class Daemon {
       let total = 0;
       const role = this.store.identity(row.id)?.role ?? undefined;
       for (const m of this.store.queuedFor(row.id)) {
-        let text = renderInbound(toWire(m), role);
+        const msg = toWire(m);
+        let text = renderInbound(msg, role);
         if (texts.length === 0 && text.length > POLL_BUDGET) {
-          text = text.slice(0, POLL_BUDGET) + `… (truncated; full text: asenq log --id ${m.id})`;
+          if (msg.file) text = renderInbound({ ...msg, thread: undefined, replyTo: undefined }, role);
+          const recovery = msg.file ? `asenq_inbox id=${m.id}` : `asenq log --id ${m.id}`;
+          text = text.slice(0, POLL_BUDGET) + `… (truncated; full text: ${recovery})`;
         } else if (total + text.length > POLL_BUDGET) break;
         texts.push(text);
         total += text.length;
@@ -1054,7 +1054,7 @@ export class Daemon {
   async send(s: Sender, p: Params): Promise<SendResult[]> {
     const targetSessionId = str(p, "toSessionId");
     let to = str(p, "to");
-    const file = fileParam(p.file);
+    const file = await fileParam(p.file);
     const text = str(p, "text") ?? "";
     if (text.length === 0 && !file) throw new AsenqError("bad_request", "text is empty; provide text or a file reference");
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);

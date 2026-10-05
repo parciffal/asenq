@@ -119,6 +119,8 @@ Call `asenq_send` with this object; `text` may be omitted when `file` is present
 
 The daemon reads the file once at send time and stores only its **path, summary, SHA-256 hash and byte size**, never its contents. Delivery and agent inbox/thread reads show the summary, path, size, a 12-character hash prefix and a check hint. The recipient reads the source file on demand under the same OS user's filesystem permissions; asenq does not copy, upload, freeze or grant access to the file. File references are direct-message metadata, not channel attachments. Sending references and checking them are exposed through agent tools; the CLI and TUI have no file-reference composer.
 
+Hashing streams asynchronously after checking the open file's type; byte size comes from that check. There is no file-byte limit, and existing request timeouts still apply to very large or slow files. File metadata appears before optional text, including in the TUI's existing message views; a clipped Claude delivery points to `asenq_inbox id=…` for full recovery.
+
 Use `asenq_file_check { id: "m_…" }` to compare the current file with the full send-time hash:
 
 - `match`: the current contents match the snapshot.
