@@ -11,7 +11,7 @@ const ESSENTIAL: Record<string, true> = { asenq_send: true, asenq_list: true };
 export default function asenq(pi: ExtensionAPI): void {
   let client: AsenqClient | undefined;
   let ctxRef: ExtensionContext | undefined;
-  let binding: { key: string; name: string } | undefined;
+  let binding: { id: string; key: string; name: string } | undefined;
 
   const warn = (message: string): void => {
     try { pi.logger.warn(`asenq: ${message}`); } catch {}
@@ -26,8 +26,18 @@ export default function asenq(pi: ExtensionAPI): void {
   const register = async (key: string, name: string | undefined): Promise<void> => {
     if (!client || !ctxRef) return;
     const r = await client.request("register", { harness: "omp", key, name, cwd: ctxRef.cwd, caps: ["ping"] });
-    binding = { key, name: (r.session as { name: string }).name };
+    const session = r.session as { id: string; name: string };
+    binding = { id: session.id, key, name: session.name };
     setStatus();
+  };
+
+  const reportStatus = async (ctx: ExtensionContext, busy: boolean): Promise<void> => {
+    if (ctx.agent.kind === "sub" || !client || !binding || binding.key !== ctx.sessionManager.getSessionId()) return;
+    try {
+      await client.request("session_status", { as: binding.id, busy });
+    } catch (e) {
+      warn(`session_status: ${e instanceof Error ? e.message : String(e)}`);
+    }
   };
 
   const onPush = (p: Push): void => {
@@ -100,6 +110,14 @@ export default function asenq(pi: ExtensionAPI): void {
     } catch (e) {
       warn(`session_switch: ${e instanceof Error ? e.message : String(e)}`);
     }
+  });
+
+  pi.on("agent_start", async (_e, ctx) => {
+    await reportStatus(ctx, true);
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
+    await reportStatus(ctx, event.willContinue === true);
   });
 
   pi.on("session_shutdown", () => {

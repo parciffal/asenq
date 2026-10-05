@@ -41,6 +41,8 @@ export type ExtensionAPI = {
   on(event: "session_start", handler: Handler<{ type: "session_start" }>): void;
   on(event: "session_switch", handler: Handler<{ type: "session_switch"; reason: "new" | "resume" | "fork" }>): void;
   on(event: "session_shutdown", handler: Handler<{ type: "session_shutdown" }>): void;
+  on(event: "agent_start", handler: Handler<{ type: "agent_start" }>): void;
+  on(event: "agent_end", handler: Handler<{ type: "agent_end"; messages: unknown[]; willContinue?: boolean }>): void;
   registerTool(tool: ToolDefinition): void;
   sendUserMessage(content: string, options?: { deliverAs?: "steer" | "followUp" | "aside"; attribution?: "user" | "agent" }): void;
   getActiveTools(): string[];
