@@ -24,13 +24,13 @@ export const TOOLS: ToolSpec[] = [
     description:
       "Send a message with text, a file reference, or both to another agent session on this machine (Claude Code, OpenCode or omp) through asenq. " +
       "An idle target starts a new turn; a busy target sees it between tool calls. " +
-      `${NAMES_HINT} Use "*" to broadcast to every live session, or "human" to reach the user. ` +
+      `${NAMES_HINT} Use "*" to broadcast once to each other live session sharing any of your channels; if you belong to no channel, it reaches every other live session on the machine. Use "human" to reach the user. ` +
       "Prefer a file reference for anything over ~4,000 characters: use an absolute readable regular-file path and a required summary of at most 500 characters. " +
       "The daemon records path, summary, byte size and a send-time SHA-256 snapshot, never copies contents; the receiver reads on demand with the same OS user's permissions. " +
       "Files can change or disappear; use asenq_file_check to compare the current file with the snapshot. " +
       "Control messages carry urgent pause/resume/cancel labels; asenq only delivers them and never changes session state or inbound policy.",
     params: {
-      to: { type: "string", description: 'Target session name, "*" for all live sessions, or "human"' },
+      to: { type: "string", description: 'Target session name, "*" for live co-members (machine-wide if you belong to no channel), or "human"' },
       text: { type: "string", optional: true, description: "Message text; required unless file is present. Prefer a file reference for anything over ~4,000 characters." },
       file: {
         type: "object", optional: true, description: "On-demand file reference, not an attachment; contents are never copied.",
