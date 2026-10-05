@@ -788,14 +788,6 @@ export class ConsoleApp {
     return { rows: [...header, ...visible], ...(cursor ? { cursor } : {}) };
   }
 
-  private rule(left: TerminalSpan[], right: TerminalSpan[], width: number): TerminalSpan[] {
-    const rightSpans = clipSpans(right, Math.max(0, Math.floor(width / 2)));
-    const rightWidth = rightSpans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-    const leftSpans = clipSpans(left, Math.max(0, width - rightWidth - 1));
-    const leftWidth = leftSpans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-    return [...leftSpans, { text: "─".repeat(Math.max(0, width - leftWidth - rightWidth)), style: theme.accent }, ...rightSpans];
-  }
-
   private title(width: number, narrow: boolean, y0: number, x0: number): TerminalLine {
     const scope = this.scope();
     const back: TerminalSpan[] = narrow ? [{ text: "‹ ", style: theme.accentBold }] : [];
@@ -828,9 +820,12 @@ export class ConsoleApp {
     if (titled) rows.push(this.title(width, narrow, y0, x0));
     if (this.panel) return this.panelPane(rows, width, height, y0, x0);
     const target = this.composeTarget();
-    const composerRoom = height - rows.length >= 4 ? Math.max(1, height - rows.length - 3) : 0;
+    const available = height - rows.length;
+    // Keep two transcript rows in previews; focused editors may borrow one, but never
+    // lose their input row to chrome. Short panes use an unboxed editor instead.
+    const composerRoom = this.focus === "composer" ? Math.max(1, available - 1) : available >= 5 ? available - 2 : 0;
     let composer: Pane | undefined;
-    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(6, composerRoom), x0);
+    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, composerRoom), x0);
     const transcriptHeight = height - rows.length - (composer?.rows.length ?? 0);
     const transcriptY = y0 + rows.length;
     const scope = this.scope();
@@ -878,7 +873,10 @@ export class ConsoleApp {
     rows.push(...body);
     if (!composer) return { rows };
     const composerY = y0 + rows.length;
-    composer.rows.forEach((_, index) => this.hits.push({ row: composerY + index, start: x0, end: x0 + width, target: { kind: "composer" } }));
+    const composerInset = width >= 6 && composer.rows.length >= 3 ? 1 : 0;
+    composer.rows.forEach((_, index) => {
+      this.hits.push({ row: composerY + index, start: x0 + composerInset, end: x0 + width - composerInset, target: { kind: "composer" } });
+    });
     rows.push(...composer.rows);
     return { rows, ...(composer.cursor ? { cursor: { ...composer.cursor, row: composerY + composer.cursor.row } } : {}) };
   }
@@ -891,22 +889,35 @@ export class ConsoleApp {
       this.cursor = text.length;
     }
     const focused = this.focus === "composer";
-    const label = target.kind === "session" ? `to ${target.name}` : `#${target.name}`;
-    const hint = focused ? "Enter send" : "c write";
-    const rows: TerminalLine[] = [];
-    const layout = editorLayout(text, this.cursor, Math.max(1, width - 2));
-    const count = Math.min(maxRows, Math.max(1, layout.rows.length));
+    const label = `to ${target.kind === "channel" ? "#" : ""}${target.name}`;
+    const boxed = width >= 6 && maxRows >= 3;
+    const inset = boxed ? 1 : 0;
+    const innerWidth = width - 2 * inset;
+    const promptWidth = Math.min(2, Math.max(0, innerWidth - 1));
+    const hint = innerWidth >= 60 ? "⏎ send ⇧⏎ newline ^E editor" : innerWidth >= 30 ? "⏎ send" : "";
+    const hintWidth = terminalTextWidth(hint);
+    const textWidth = Math.max(1, innerWidth - promptWidth - hintWidth - (hint ? 1 : 0));
+    const layout = editorLayout(text, this.cursor, textWidth);
+    const count = Math.min(maxRows - 2 * inset, Math.max(1, layout.rows.length));
     const first = Math.max(0, Math.min(layout.cursorRow - count + 1, layout.rows.length - count));
-    rows.push(this.rule([{ text: "── ", style: theme.accent }, { text: label, style: focused ? theme.accentBold : theme.bold }, { text: this.sending ? " sending… " : " ", style: theme.warn }], [{ text: ` ${hint}`, style: theme.dim }], width));
-    if (!text && !focused) {
-      rows.push([{ text: "› ", style: theme.dim }, { text: ellipsize(`Write to ${target.kind === "session" ? target.name : `#${target.name}`} — press c`, width - 2), style: theme.dim }]);
-    } else {
-      for (let index = 0; index < count; index++) {
-        rows.push([{ text: index + first === 0 ? "› " : "  ", style: theme.human }, { text: layout.rows[first + index] ?? "" }]);
-      }
+    const content: TerminalLine[] = [];
+    for (let index = 0; index < count; index++) {
+      const prompt = (index + first === 0 ? "› " : "  ").slice(0, promptWidth);
+      const value = !text && !focused
+        ? ellipsize(`Write to ${target.kind === "session" ? target.name : `#${target.name}`} — press c`, textWidth)
+        : layout.rows[first + index] ?? "";
+      content.push(justify(
+        [{ text: prompt, style: focused ? theme.human : theme.dim }, { text: value, ...(!text && !focused ? { style: theme.dim } : {}) }],
+        index === 0 && hint ? [{ text: hint, style: theme.dim }] : [], innerWidth,
+      ));
     }
-    // Cursor row is relative to the composer's first row; the caller places the composer.
-    return focused ? { rows, cursor: { row: 1 + layout.cursorRow - first, column: x0 + 2 + layout.cursorColumn } } : { rows };
+    const rows = boxed ? roundedPanel(
+      [{ text: label, style: focused ? theme.accentBold : theme.bold }, ...(this.sending ? [{ text: " sending…", style: theme.warn }] : [])],
+      content, width, content.length + 2, focused,
+    ) : content;
+    // Both the prompt and the hard-wrap budget exclude borders and hints. The cursor
+    // stays on an input cell, including at a full-width wrap or in the short fallback.
+    return focused ? { rows, cursor: { row: inset + layout.cursorRow - first, column: x0 + inset + promptWidth + layout.cursorColumn } } : { rows };
   }
 
   private panelPane(rows: TerminalLine[], width: number, height: number, y0: number, x0: number): Pane {

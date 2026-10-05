@@ -269,7 +269,7 @@ test("new arrivals keep a scrolled reader in place, and the composer sends once 
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(alpha.deliveries.length, pending + 1, "sent exactly once");
   assert.equal(alpha.deliveries.at(-1)!.msg.text, "hello\nthere");
-  assert.ok(!ui.rows().some((row) => row.startsWith("› hello") || row.includes("› there")), "draft cleared after send");
+  assert.ok(!ui.rows().some((row) => row.includes("› hello") || row.includes("› there")), "draft cleared after send");
 });
 
 test("session list shows short harness labels without losing state or unread badges", async () => {
@@ -330,7 +330,7 @@ test("rounded panes resize at the wide boundary without overflowing or moving mo
         assert.ok(rendered.length <= height, `${columns}×${height}: frame exceeds the terminal height`);
         for (const row of rendered) assert.ok(terminalTextWidth(row) <= columns, `${columns}×${height}: ${row}`);
         if (columns < 80) {
-          assert.ok(rendered.every((row) => !row.includes("╭") && !row.includes("╰")), "narrow picker stays unboxed");
+          assert.ok(rendered.every((row) => !row.includes("╭") || row.startsWith("╭─ to ")), "only the composer may be boxed in narrow mode");
           continue;
         }
         const top = height >= 4 ? 1 : 0;
@@ -382,16 +382,43 @@ test("rounded panes resize at the wide boundary without overflowing or moving mo
     assert.equal(await unread(human, alpha.session.id), 1, "the conversation border is not a transcript hit");
     await click(listWidth + 2, messageRow);
     assert.equal(await unread(human, alpha.session.id), 0, "the inset transcript hit reads the visible newest row");
-    const composerRow = rows().findIndex((row) => row.slice(listWidth + 2).startsWith("› "));
+    const composerRow = rows().findIndex((row) => row.slice(listWidth + 2).startsWith("│› "));
     assert.ok(composerRow > messageRow);
-    await click(listWidth + 2, composerRow);
+    const promptColumn = rows()[composerRow]!.indexOf("› ", listWidth + 2);
+    await click(promptColumn, composerRow);
+    const beforeTyping = frame;
     await press("x");
-    assert.deepEqual(frame.cursor, { row: composerRow, column: listWidth + 5 }, "composer cursor includes border and prompt insets");
+    assert.deepEqual(frame.cursor, { row: composerRow, column: promptColumn + terminalTextWidth("› x") }, "composer cursor follows the typed text inside both borders");
+    assert.deepEqual(changedTerminalRows(beforeTyping, frame, size), [composerRow], "typing without a wrap redraws only the input row");
     await resize(80, 8);
     assert.ok(frame.cursor && frame.cursor.column > paneWidths(80)!.list + 1 && frame.cursor.column < 79);
     assert.ok(frame.cursor.row >= 2 && frame.cursor.row < 6, "resized composer cursor stays above the bottom border");
     await press("ENTER");
     assert.equal((await alpha.nextDelivery()).msg.text, "x", "mouse-focused composer sends to the selected identity after resize");
+
+    await press("ESCAPE");
+    await resize(79, 18);
+    const narrowPromptRow = rows().findIndex((row) => row.startsWith("│› "));
+    assert.ok(narrowPromptRow >= 0, "the narrow conversation exposes the boxed composer");
+    assert.ok(rows().filter((row) => row.includes("╭")).every((row) => row.startsWith("╭─ to ")), "the narrow picker has no outer box");
+    await click(1, narrowPromptRow);
+    const draft = "0123456789abcdefghijklmnopqrstuvwxyz";
+    for (const character of draft) await press(character);
+    await press("ALT_ENTER");
+    await press("z");
+    await press("CTRL_J");
+    await press("y");
+    for (const [columns, height] of [[20, 8], [5, 6], [79, 5], [79, 3], [79, 1], [80, 5], [100, 18]] as const) {
+      await resize(columns, height);
+      assert.ok(rows().length <= height);
+      for (const row of rows()) assert.ok(terminalTextWidth(row) <= columns);
+      assert.ok(frame.cursor, `${columns}×${height}: focused editor has an input cell`);
+      assert.ok(frame.cursor.row >= 0 && frame.cursor.row < height);
+      assert.ok(frame.cursor.column >= 0 && frame.cursor.column < columns);
+      assert.ok(!"╭╮╰╯│─".includes(rows()[frame.cursor.row]![frame.cursor.column]!), "wrapped cursor never lands on a border");
+    }
+    await press("ENTER");
+    assert.equal((await alpha.nextDelivery()).msg.text, `${draft}\nz\ny`, "hard-wrapping and short-pane fallbacks preserve the full multiline draft");
 
     await press("ESCAPE");
     await press("a");
