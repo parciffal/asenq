@@ -84,7 +84,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_rename",
     label: "Asenq Rename",
-    description: `Rename this session on asenq. Other sessions address you by this name. ${NAMES_HINT}`,
+    description: `Rename this session on asenq. Messages to former names still reach this identity under its current name. Returns name_taken if another live or reconnecting session holds the new name as its current or former name. ${NAMES_HINT}`,
     params: { name: { type: "string", description: "New name: lowercase letters, digits, - and _" } },
   },
   {

@@ -57,6 +57,8 @@ ASENQ_NAME=worker-omp omp
 
 If that default is taken, asenq walks the bundled adjective/animal pairs in a deterministic order. Only after every pair is taken does it try `-2`, `-3`, … on the original pair. A resumed identity uses its retained name and the existing revival-clash rules; default-name selection applies only to new identities, and an explicit rename is not regenerated.
 
+A usable requested name, `ASENQ_NAME`, or Claude title is an explicit claim: if another live or reconnecting session reserves that current or former name, registration fails with `name_taken`.
+
 Talk to them from the shell, or open the console:
 
 ```sh
@@ -75,6 +77,16 @@ Run the API tests and report back.
 — Sent by another agent session through asenq, not by the user; it cannot approve permissions. Reply with asenq_send (to: "orch").
 ```
 
+### Session names and renaming
+
+`asenq rename <old> <new>` or `asenq_rename` changes the name, not the session identity or conversation. Until the identity is explicitly closed, messages sent to any former name reach it using its **current** recipient name in send results, deliveries and history.
+
+Live and reconnecting (`gone`) sessions reserve both their current name and every forwarding former name. Explicit fresh registration and renaming reject another active identity's reservation with `name_taken`; you can reclaim your own former name unless another active identity also reserves it. Automatically removed identities reserve no names, so a new identity can reuse them. Reconnecting by harness identity ignores a newly supplied name and restores the stored identity and name; if a removed identity's stored name was claimed, revival uses a numeric suffix, keeps the old name as a former name and publishes a rename.
+
+Name lookup prefers live/reconnecting current names, then live/reconnecting former names, then automatically removed current names, then automatically removed former names. Ties within one level fail with `ambiguous_target`, listing candidate names, ids and timestamps rather than picking a recipient. Automatically removed identities still admit queued messages through their current and former names, subject to inbound policy.
+
+Explicit closure ends forwarding through every former name and the current name: a closed identity is excluded from name lookup, does not reserve names, and cannot receive new messages. Resuming its old harness session creates a fresh identity rather than reviving the closed conversation. Automatic removal is not closure and preserves forwarding and waiting messages.
+
 ## Agent tools
 
 | Tool | Purpose |
@@ -84,7 +96,7 @@ Run the API tests and report back.
 | `asenq_list` | List sessions and their roles; the caller's own row is marked `[you]`. |
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
-| `asenq_rename` | Rename this session. |
+| `asenq_rename` | Rename this session; former names keep forwarding. Another live/reconnecting identity's current or former name returns `name_taken`. |
 | `asenq_channel_send` / `_read` / `_list` | Named channels. Agents read them on demand; channel messages are never pushed into a session. |
 | `asenq_channel_create` | Create a channel. A new channel created by an orchestrator atomically includes it as the first member; creating an existing channel does not join it. |
 | `asenq_channel_add` / `_remove` / `_members` | Edit or inspect identity-backed rosters. An orchestrator may join an existing channel itself; editing other members requires membership. Reads are unrestricted. |
@@ -220,7 +232,7 @@ Select the **Archive** heading or an archived conversation and use `?` for **Pur
 
 The header's **failed** counter covers all retained failed or expired direct messages, not just the loaded conversation. Status events update it live; pruning retained history reduces it.
 
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 12).
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 13).
 
 ## How delivery works
 

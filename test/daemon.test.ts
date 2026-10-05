@@ -104,13 +104,14 @@ test("client rejects an old daemon before requesting new history operations", as
   }
 });
 
-test("registration: different harness ids in the same cwd stay distinct, even when the requested name is gone", async () => {
+test("registration rejects explicit occupied names without merging distinct harness identities or gone queues", async () => {
   env = await startEnv();
   const human = env.human();
   const k1 = await env.adapter("opencode", "k1", "Worker API");
   assert.equal(k1.session.name, "worker-api");
-  const k2 = await env.adapter("opencode", "k2", "Worker API");
-  assert.equal(k2.session.name, "worker-api-2");
+  await assert.rejects(env.adapter("opencode", "k2", "Worker API"), { code: "name_taken" });
+  const k2 = await env.adapter("opencode", "k2", "worker-two");
+  assert.equal(k2.session.name, "worker-two");
   assert.notEqual(k2.session.id, k1.session.id);
 
   const gone = await env.watch(isSession("gone", "worker-api"));
@@ -119,21 +120,496 @@ test("registration: different harness ids in the same cwd stay distinct, even wh
   const [queued] = await send(human, "worker-api", "while you were away");
   assert.equal(queued.status, "queued");
 
-  const k3 = await env.adapter("opencode", "k3", "Worker API");
-  assert.equal(k3.session.name, "worker-api-3");
+  await assert.rejects(env.adapter("opencode", "k3", "Worker API"), { code: "name_taken" });
+  const k3 = await env.adapter("opencode", "k3", "worker-three");
+  assert.equal(k3.session.name, "worker-three");
   assert.notEqual(k3.session.id, k1.session.id);
   assert.equal(await sessionState(human, "worker-api"), "gone");
   assert.equal((await logOf(human, queued.msgId!)).status, "queued");
   assert.deepEqual(k3.deliveries, []);
 
   const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
-  const resumed = await env.adapter("opencode", "k1", "ignored-request");
+  const resumed = await env.adapter("opencode", "k1", "worker-two");
   assert.deepEqual(resumed.session, k1.session);
   assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
   await delivered.event;
-  const other = await env.adapter("opencode", "k4", "Worker API", { cwd: "/elsewhere" });
-  assert.equal(other.session.name, "worker-api-4");
+  await assert.rejects(env.adapter("opencode", "k4", "Worker API", { cwd: "/elsewhere" }), { code: "name_taken" });
+  const other = await env.adapter("opencode", "k4", "worker-four", { cwd: "/elsewhere" });
+  assert.notEqual(other.session.id, k1.session.id);
 });
+
+test("former-name send after original to niche-manager rename delivers to the same identity with canonical history", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = await env.adapter("omp", "original-key", "original");
+  await original.client.request("rename", { name: "niche-manager" });
+
+  const [sent] = await send(human, "original", "late reply to the original address");
+  assert.deepEqual([sent.to, sent.status], ["niche-manager", "delivered"]);
+  const received = await original.nextDelivery();
+  assert.deepEqual([received.session, received.msg.id, received.msg.to, received.msg.text], [
+    original.session.id, sent.msgId, "niche-manager", "late reply to the original address",
+  ]);
+  const history = await human.historyPage({ scope: "session", sessionId: original.session.id });
+  assert.deepEqual(history.messages.map((message) => [message.id, message.to, message.toSessionId]), [
+    [sent.msgId, "niche-manager", original.session.id],
+  ]);
+});
+
+test("closing a renamed identity ends former-name delivery, releases both names and makes harness revival fresh", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("opencode", "closure-forward-sender", "sender");
+  const original = await env.adapter("omp", "closure-forward-original", "original");
+  await original.client.request("rename", { name: "niche-manager" });
+  const [forwarded] = await send(sender.client, "original", "forward before closure");
+  assert.deepEqual([forwarded.to, forwarded.status], ["niche-manager", "delivered"]);
+  const received = await original.nextDelivery();
+  assert.deepEqual([received.session, received.msg.id, received.msg.to], [
+    original.session.id, forwarded.msgId, "niche-manager",
+  ]);
+  assert.deepEqual(((await original.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map(
+    (message) => [message.id, message.toSessionId],
+  ), [[forwarded.msgId, original.session.id]]);
+
+  const removed = await env.watch(isSession("removed", "niche-manager"));
+  await human.request("close", { identity: original.session.id });
+  const event = await removed.event;
+  assert.ok(event.type === "session");
+  assert.deepEqual([event.session.id, event.session.closedAt], [original.session.id, env.clock.now()]);
+  const scope = { scope: "session" as const, sessionId: original.session.id };
+  const sealed = (await human.historyPage(scope)).messages;
+  assert.deepEqual(sealed.map((message) => [message.id, message.to, message.toSessionId]), [
+    [forwarded.msgId, "niche-manager", original.session.id],
+  ]);
+  for (const name of ["original", "niche-manager"]) {
+    for (const client of [human, sender.client]) {
+      await assert.rejects(send(client, name, `no new delivery through ${name}`), { code: "unknown_target" });
+    }
+  }
+  assert.deepEqual((await human.historyPage(scope)).messages, sealed);
+  assert.deepEqual(original.deliveries.map((delivery) => delivery.msg.id), [forwarded.msgId]);
+  assert.deepEqual((await sender.client.request("inbox", { unread_only: true })).messages, []);
+
+  const freshClaim = await env.adapter("opencode", "closure-forward-fresh", "original");
+  const renameClaim = await env.adapter("omp", "closure-forward-rename", "claimant");
+  await renameClaim.client.request("rename", { name: "niche-manager" });
+  const resumedHarness = await env.adapter("omp", "closure-forward-original", "fresh-return");
+  assert.notEqual(freshClaim.session.id, original.session.id);
+  assert.notEqual(resumedHarness.session.id, original.session.id);
+  assert.equal(resumedHarness.session.name, "fresh-return");
+  assert.deepEqual((await resumedHarness.client.request("inbox", { unread_only: true })).messages, []);
+  assert.deepEqual(resumedHarness.deliveries, []);
+  for (const [name, recipient] of [["original", freshClaim], ["niche-manager", renameClaim]] as const) {
+    const [sent] = await send(human, name, `new claim for ${name}`);
+    const delivery = await recipient.nextDelivery();
+    assert.deepEqual([delivery.session, delivery.msg.id, delivery.msg.to], [recipient.session.id, sent.msgId, name]);
+  }
+  assert.deepEqual((await human.historyPage(scope)).messages, sealed);
+  assert.deepEqual(original.deliveries.map((delivery) => delivery.msg.id), [forwarded.msgId]);
+});
+
+test("closed current and former names do not shadow a queueable removed former-name holder", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const closed = await env.adapter("omp", "closed-forward-holder", "original");
+  await closed.client.request("rename", { name: "niche-manager" });
+  await human.request("close", { identity: closed.session.id });
+  const retained = await env.adapter("opencode", "retained-forward-holder", "original");
+  await retained.client.request("rename", { name: "niche-manager" });
+  await retained.client.request("rename", { name: "queueable" });
+  const gone = await env.watch(isSession("gone", "queueable"));
+  retained.client.close();
+  await gone.event;
+  const removed = await env.watch(isSession("removed", "queueable"));
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  await removed.event;
+
+  const ids: string[] = [];
+  for (const name of ["original", "niche-manager"]) {
+    const [queued] = await send(human, name, `queued through ${name}`);
+    assert.deepEqual([queued.to, queued.status], ["queueable", "queued"]);
+    ids.push(queued.msgId!);
+  }
+  const retainedScope = { scope: "session" as const, sessionId: retained.session.id };
+  const closedScope = { scope: "session" as const, sessionId: closed.session.id };
+  assert.deepEqual((await human.historyPage(retainedScope)).messages.map(
+    (message) => [message.id, message.to, message.toSessionId, message.status],
+  ), ids.map((id) => [id, "queueable", retained.session.id, "queued"]));
+  assert.deepEqual((await human.historyPage(closedScope)).messages, []);
+  const delivered = await env.watch(isStatus(ids[1], "delivered"));
+  const revived = await env.adapter("opencode", "retained-forward-holder", "ignored");
+  assert.deepEqual(revived.session, { id: retained.session.id, name: "queueable" });
+  await delivered.event;
+  assert.deepEqual(revived.deliveries.map((delivery) => [delivery.session, delivery.msg.id, delivery.msg.to]),
+    ids.map((id) => [retained.session.id, id, "queueable"]));
+  assert.deepEqual(((await revived.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map(
+    (message) => message.id,
+  ), ids);
+  assert.deepEqual(closed.deliveries, []);
+  assert.deepEqual((await human.historyPage(closedScope)).messages, []);
+});
+
+test("removed current names outrank removed former names and queue only for the current holder's stable identity", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const former = await env.adapter("omp", "removed-former-holder", "foo");
+  await former.client.request("rename", { name: "alpha" });
+  const formerGone = await env.watch(isSession("gone", "alpha"));
+  former.client.close();
+  await formerGone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const current = await env.adapter("opencode", "removed-current-holder", "foo");
+  const currentGone = await env.watch(isSession("gone", "foo"));
+  current.client.close();
+  await currentGone.event;
+  const removed = await env.watch(isSession("removed", "foo"));
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  await removed.event;
+
+  const [queued] = await send(human, "foo", "only the removed current holder receives this");
+  assert.deepEqual([queued.to, queued.status], ["foo", "queued"]);
+  const currentScope = { scope: "session" as const, sessionId: current.session.id };
+  const formerScope = { scope: "session" as const, sessionId: former.session.id };
+  assert.deepEqual((await human.historyPage(currentScope)).messages.map(
+    (message) => [message.id, message.to, message.toSessionId, message.status],
+  ), [[queued.msgId, "foo", current.session.id, "queued"]]);
+  assert.deepEqual((await human.historyPage(formerScope)).messages, []);
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const revivedCurrent = await env.adapter("opencode", "removed-current-holder", "ignored");
+  assert.deepEqual(revivedCurrent.session, current.session);
+  const received = await revivedCurrent.nextDelivery();
+  assert.deepEqual([received.session, received.msg.id, received.msg.to], [current.session.id, queued.msgId, "foo"]);
+  await delivered.event;
+  const revivedFormer = await env.adapter("omp", "removed-former-holder", "ignored");
+  assert.deepEqual(revivedFormer.session, { id: former.session.id, name: "alpha" });
+  assert.deepEqual((await revivedFormer.client.request("inbox", { unread_only: true })).messages, []);
+  assert.deepEqual(revivedFormer.deliveries, []);
+  assert.deepEqual((await human.historyPage(formerScope)).messages, []);
+  assert.deepEqual((await human.historyPage(currentScope)).messages.map(
+    (message) => [message.id, message.toSessionId, message.status],
+  ), [[queued.msgId, current.session.id, "delivered"]]);
+});
+
+test("rename chains forward every former name and let the identity reclaim its own former name", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = await env.adapter("opencode", "chain-key", "original");
+  await original.client.request("rename", { name: "middle" });
+  await original.client.request("rename", { name: "final" });
+  const ids: string[] = [];
+  for (const name of ["original", "middle", "final"]) {
+    const [sent] = await send(human, name, `reply via ${name}`);
+    assert.deepEqual([sent.to, sent.status], ["final", "delivered"]);
+    const received = await original.nextDelivery();
+    assert.deepEqual([received.session, received.msg.id, received.msg.to], [original.session.id, sent.msgId, "final"]);
+    ids.push(sent.msgId!);
+  }
+  await original.client.request("rename", { name: "original" });
+  for (const name of ["middle", "final"]) {
+    const [sent] = await send(human, name, `after reclamation via ${name}`);
+    assert.deepEqual([sent.to, sent.status], ["original", "delivered"]);
+    assert.equal((await original.nextDelivery()).msg.id, sent.msgId);
+    ids.push(sent.msgId!);
+  }
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+    (message) => [message.id, message.to, message.toSessionId],
+  ), ids.map((id, index) => [id, index < 3 ? "final" : "original", original.session.id]));
+});
+
+for (const state of ["live", "gone"] as const) {
+  test(`${state} current and former names reject explicit fresh claims and renames without diverting delivery`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const owner = await env.adapter("omp", "owner-key", "former");
+    await owner.client.request("rename", { name: "current" });
+    const claimant = await env.adapter("opencode", "claimant-key", "claimant");
+    if (state === "gone") {
+      const gone = await env.watch(isSession("gone", "current"));
+      owner.client.close();
+      await gone.event;
+    }
+    for (const name of ["current", "former"]) {
+      for (const harness of ["omp", "opencode"] as const) {
+        await assert.rejects(env.adapter(harness, `${harness}-${name}`, name), { code: "name_taken" });
+      }
+      await assert.rejects(human.request("claude_hook", {
+        event: "start", key: `claude-${name}`, sessionId: `claude-${name}`, name, socket: null,
+      }), { code: "name_taken" });
+      await assert.rejects(claimant.client.request("rename", { name }), { code: "name_taken" });
+      await assert.rejects(human.request("rename", { from: "claimant", name }), { code: "name_taken" });
+    }
+    const [sent] = await send(human, "former", "only the reserved identity receives this");
+    assert.deepEqual([sent.to, sent.status], ["current", state === "gone" ? "queued" : "delivered"]);
+    const receiver = state === "gone" ? await env.adapter("omp", "owner-key", "claimant") : owner;
+    assert.equal(receiver.session.id, owner.session.id);
+    const received = await receiver.nextDelivery();
+    assert.deepEqual([received.session, received.msg.id, received.msg.to], [owner.session.id, sent.msgId, "current"]);
+    assert.deepEqual(claimant.deliveries, []);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: claimant.session.id })).messages, []);
+  });
+}
+
+test("generated fallback skips current and forwarding former reservations without taking over either identity", async () => {
+  env = await startEnv({ defaultNameWords: { adjectives: ["calm"], animals: ["fox"] } });
+  const human = env.human();
+  const former = await env.adapter("omp", "former-key", "omp-calm-fox");
+  await former.client.request("rename", { name: "renamed-default" });
+  const current = await env.adapter("omp", "current-key", "omp-calm-fox-2");
+  const generated = await env.adapter("omp", "generated-123456");
+  assert.equal(generated.session.name, "omp-calm-fox-3");
+  assert.notEqual(generated.session.id, former.session.id);
+  assert.notEqual(generated.session.id, current.session.id);
+  for (const [name, recipient] of [["omp-calm-fox", former], ["omp-calm-fox-2", current], ["omp-calm-fox-3", generated]] as const) {
+    const [sent] = await send(human, name, `for ${name}`);
+    assert.equal((await recipient.nextDelivery()).session, recipient.session.id);
+    assert.equal((await human.historyPage({ scope: "session", sessionId: recipient.session.id })).messages[0].id, sent.msgId);
+  }
+});
+
+test("automatically removed current and former names reserve nothing and new claims keep separate histories", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = await env.adapter("omp", "removed-key", "former");
+  await original.client.request("rename", { name: "current" });
+  const gone = await env.watch(isSession("gone", "current"));
+  original.client.close();
+  await gone.event;
+  const [queued] = await send(human, "former", "retained for the removed identity");
+  const removed = await env.watch(isSession("removed", "current"));
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  await removed.event;
+  const fresh = await env.adapter("omp", "fresh-key", "former");
+  const claimant = await env.adapter("opencode", "rename-key", "claimant");
+  await claimant.client.request("rename", { name: "current" });
+  assert.notEqual(fresh.session.id, original.session.id);
+  const [toFresh] = await send(human, "former", "new former-name owner");
+  const [toClaimant] = await send(human, "current", "new current-name owner");
+  assert.equal((await fresh.nextDelivery()).msg.id, toFresh.msgId);
+  assert.equal((await claimant.nextDelivery()).msg.id, toClaimant.msgId);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+    (message) => [message.id, message.toSessionId, message.status],
+  ), [[queued.msgId, original.session.id, "queued"]]);
+  assert.equal((await human.historyPage({ scope: "session", sessionId: fresh.session.id })).messages[0].toSessionId, fresh.session.id);
+  assert.equal((await human.historyPage({ scope: "session", sessionId: claimant.session.id })).messages[0].toSessionId, claimant.session.id);
+});
+
+for (const state of ["live", "gone"] as const) {
+  test(`${state} current names outrank active former names after revival`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const first = await env.adapter("omp", "first-key", "foo");
+    await first.client.request("rename", { name: "alpha" });
+    const gone = await env.watch(isSession("gone", "alpha"));
+    first.client.close();
+    await gone.event;
+    env.clock.advance(GRACE_MS);
+    env.daemon.sweep();
+    const current = await env.adapter("opencode", "current-key", "foo");
+    const revived = await env.adapter("omp", "first-key", "ignored");
+    assert.deepEqual(revived.session, { id: first.session.id, name: "alpha" });
+    if (state === "gone") {
+      const goneCurrent = await env.watch(isSession("gone", "foo"));
+      current.client.close();
+      await goneCurrent.event;
+    }
+    const [sent] = await send(human, "foo", "current name wins over active forwarding");
+    assert.deepEqual([sent.to, sent.status], ["foo", state === "gone" ? "queued" : "delivered"]);
+    const receiver = state === "gone" ? await env.adapter("opencode", "current-key", "ignored") : current;
+    assert.equal((await receiver.nextDelivery()).session, current.session.id);
+    assert.deepEqual(revived.deliveries, []);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: revived.session.id })).messages, []);
+    assert.equal((await human.historyPage({ scope: "session", sessionId: current.session.id })).messages[0].id, sent.msgId);
+  });
+}
+
+for (const state of ["live", "gone"] as const) {
+  test(`${state} former names outrank removed current names`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const removed = await env.adapter("omp", "removed-key", "foo");
+    const gone = await env.watch(isSession("gone", "foo"));
+    removed.client.close();
+    await gone.event;
+    env.clock.advance(GRACE_MS);
+    env.daemon.sweep();
+    const active = await env.adapter("opencode", "active-key", "foo");
+    await active.client.request("rename", { name: "beta" });
+    if (state === "gone") {
+      const activeGone = await env.watch(isSession("gone", "beta"));
+      active.client.close();
+      await activeGone.event;
+    }
+    const [sent] = await send(human, "foo", "active former wins over removed current");
+    assert.deepEqual([sent.to, sent.status], ["beta", state === "gone" ? "queued" : "delivered"]);
+    const receiver = state === "gone" ? await env.adapter("opencode", "active-key", "ignored") : active;
+    const received = await receiver.nextDelivery();
+    assert.deepEqual([received.session, received.msg.id, received.msg.to], [active.session.id, sent.msgId, "beta"]);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: removed.session.id })).messages, []);
+  });
+}
+
+for (const level of ["current", "former"] as const) {
+  test(`removed ${level} name ties return candidate ids and removal timestamps without reserving the name`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const candidates: { id: string; name: string; timestamp: number }[] = [];
+    for (const name of ["alpha", "beta"]) {
+      const original = await env.adapter("omp", name, "foo");
+      if (level === "former") await original.client.request("rename", { name });
+      env.clock.advance(1000);
+      await send(original.client, "human", `traffic from ${name}`);
+      const currentName = level === "former" ? name : "foo";
+      const gone = await env.watch(isSession("gone", currentName));
+      original.client.close();
+      await gone.event;
+      env.clock.advance(GRACE_MS);
+      env.daemon.sweep();
+      candidates.push({ id: original.session.id, name: currentName, timestamp: env.clock.now() });
+    }
+    await env.restart();
+    const observer = env.human();
+    await assert.rejects(send(observer, "foo", "never choose a tied removed identity"), (error: unknown) => {
+      assert.ok(error instanceof Error && "code" in error);
+      assert.equal(error.code, "ambiguous_target");
+      const message = error.message;
+      for (const candidate of candidates) {
+        assert.ok(message.includes(candidate.id), message);
+        assert.ok(message.includes(candidate.name), message);
+        assert.ok(message.includes(String(candidate.timestamp)), message);
+      }
+      return true;
+    });
+    for (const candidate of candidates) {
+      assert.deepEqual((await observer.historyPage({ scope: "session", sessionId: candidate.id })).messages.map(
+        (message) => [message.to, message.text],
+      ), [["human", `traffic from ${candidate.id === candidates[0].id ? "alpha" : "beta"}`]]);
+    }
+    const claimant = await env.adapter("opencode", "claimant-key", "claimant");
+    await claimant.client.request("rename", { name: "foo" });
+    const [renamedSend] = await send(observer, "foo", "rename also ignores removed-only ambiguity");
+    assert.equal((await claimant.nextDelivery()).msg.id, renamedSend.msgId);
+    await claimant.client.request("unregister");
+    const fresh = await env.adapter("omp", "fresh-key", "foo");
+    const [sent] = await send(observer, "foo", "fresh claim resolves the removed tie");
+    assert.equal((await fresh.nextDelivery()).msg.id, sent.msgId);
+    assert.ok(!candidates.some((candidate) => candidate.id === fresh.session.id));
+  });
+}
+
+test("revived active former-name ties are ambiguous and block fresh claims and own-name reclamation", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const first = await env.adapter("omp", "first-key", "foo");
+  const firstCreatedAt = env.clock.now();
+  await first.client.request("rename", { name: "alpha" });
+  const gone = await env.watch(isSession("gone", "alpha"));
+  first.client.close();
+  await gone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const secondCreatedAt = env.clock.now();
+  const second = await env.adapter("opencode", "second-key", "foo");
+  await second.client.request("rename", { name: "beta" });
+  const revived = await env.adapter("omp", "first-key", "ignored");
+  assert.deepEqual(revived.session, { id: first.session.id, name: "alpha" });
+  env.clock.advance(5000);
+  await send(revived.client, "human", "traffic must not change candidate timestamps");
+  await assert.rejects(send(human, "foo", "ambiguous forwarding"), (error: unknown) => {
+    assert.ok(error instanceof Error && "code" in error);
+    assert.equal(error.code, "ambiguous_target");
+    const message = error.message;
+    for (const value of [first.session.id, second.session.id, "alpha", "beta", String(firstCreatedAt), String(secondCreatedAt)]) {
+      assert.ok(message.includes(value), message);
+    }
+    return true;
+  });
+  await assert.rejects(env.adapter("omp", "fresh-key", "foo"), { code: "name_taken" });
+  await assert.rejects(revived.client.request("rename", { name: "foo" }), { code: "name_taken" });
+  await assert.rejects(second.client.request("rename", { name: "foo" }), { code: "name_taken" });
+  assert.deepEqual(revived.deliveries, []);
+  assert.deepEqual(second.deliveries, []);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: second.session.id })).messages, []);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: first.session.id })).messages.map(
+    (message) => [message.to, message.text],
+  ), [["human", "traffic must not change candidate timestamps"]]);
+});
+
+test("former-name forwarding preserves hold, refuse, duplicate suppression and the recipient inbox identity", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const recipient = await env.adapter("opencode", "recipient-key", "former");
+  await recipient.client.request("rename", { name: "current" });
+  await human.request("set_inbound", { name: "current", mode: "hold" });
+  const [held] = await send(sender.client, "former", "approval still required");
+  assert.deepEqual([held.to, held.status], ["current", "held"]);
+  assert.equal(recipient.deliveries.length, 0);
+  assert.deepEqual((await recipient.client.request("inbox", { unread_only: true })).messages, []);
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+  assert.equal((await recipient.nextDelivery()).msg.id, held.msgId);
+  assert.deepEqual(((await recipient.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map(
+    (message) => [message.id, message.to, message.toSessionId],
+  ), [[held.msgId, "current", recipient.session.id]]);
+  assert.deepEqual((await recipient.client.request("inbox", { unread_only: true })).messages, []);
+
+  await human.request("set_inbound", { name: "current", mode: "refuse" });
+  for (const client of [sender.client, human]) {
+    const [refused] = await send(client, "former", "refusal still applies");
+    assert.deepEqual([refused.to, refused.status, refused.reason], ["current", "rejected", "target refuses messages"]);
+  }
+  await human.request("set_inbound", { name: "current", mode: "accept" });
+  const [first] = await send(sender.client, "former", "one message across both addresses");
+  assert.equal((await recipient.nextDelivery()).msg.id, first.msgId);
+  const [duplicate] = await send(sender.client, "current", "one message across both addresses");
+  assert.deepEqual([duplicate.status, duplicate.reason], ["dropped", "duplicate"]);
+  assert.deepEqual(recipient.deliveries.map((delivery) => delivery.msg.id), [held.msgId, first.msgId]);
+});
+
+for (const holderState of ["live", "gone"] as const) {
+  test(`revival suffixes a stored name reserved only as a ${holderState} former name and keeps its queued identity`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const original = await env.adapter("omp", "original-key", "original");
+    await original.client.request("rename", { name: "alpha" });
+    const gone = await env.watch(isSession("gone", "alpha"));
+    original.client.close();
+    await gone.event;
+    const [queued] = await send(human, "original", "waiting for the original identity");
+    assert.deepEqual([queued.to, queued.status], ["alpha", "queued"]);
+    env.clock.advance(GRACE_MS);
+    env.daemon.sweep();
+
+    const holder = await env.adapter("opencode", "holder-key", "alpha");
+    await holder.client.request("rename", { name: "beta" });
+    if (holderState === "gone") {
+      const holderGone = await env.watch(isSession("gone", "beta"));
+      holder.client.close();
+      await holderGone.event;
+    }
+    const renamed = await env.watch(isSession("renamed", "alpha-2"));
+    const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+    const revived = await env.adapter("omp", "original-key", "beta");
+    assert.deepEqual(revived.session, { id: original.session.id, name: "alpha-2" });
+    assert.equal((await revived.nextDelivery()).msg.id, queued.msgId);
+    await delivered.event;
+    const event = await renamed.event;
+    assert.ok(event.type === "session");
+    assert.deepEqual([event.oldName, event.name, event.session.id], ["alpha", "alpha-2", original.session.id]);
+    const snapshot = await human.sync();
+    assert.deepEqual(snapshot.sessions.find((session) => session.id === original.session.id)?.previousNames, ["original", "alpha"]);
+    assert.equal(snapshot.sessions.find((session) => session.id === holder.session.id)?.state, holderState);
+    assert.deepEqual(holder.deliveries, []);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: holder.session.id })).messages, []);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+      (message) => [message.id, message.toSessionId, message.status],
+    ), [[queued.msgId, original.session.id, "delivered"]]);
+  });
+}
 
 test("human roles validate, publish identity updates and survive rename and gone reconnection", async () => {
   env = await startEnv();
@@ -445,6 +921,24 @@ for (const { harness, otherSeed, fullNames, collisionSeeds, pairOrder } of defau
     assert.equal(new Set([live.session.id, gone.session.id, ...registered.map((session) => session.id)]).size, 6);
   });
 }
+
+test("default name skips a live session's former name and keeps its late replies on that identity", async () => {
+  env = await startEnv({ defaultNameWords: { adjectives: ["calm", "swift"], animals: ["fox", "owl"] } });
+  const human = env.human();
+  const former = await env.adapter("omp", "former-word-pair", "omp-calm-owl");
+  await former.client.request("rename", { name: "niche-manager" });
+  const generated = await env.adapter("omp", "fixture-AAAAAA");
+  assert.equal(generated.session.name, "omp-swift-fox");
+  assert.notEqual(generated.session.id, former.session.id);
+  const [late] = await send(human, "omp-calm-owl", "late reply to the reserved former word pair");
+  assert.deepEqual([late.to, late.status], ["niche-manager", "delivered"]);
+  assert.equal((await former.nextDelivery()).msg.id, late.msgId);
+  const [fresh] = await send(human, "omp-swift-fox", "message for the generated identity");
+  assert.equal((await generated.nextDelivery()).msg.id, fresh.msgId);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: former.session.id })).messages.map(
+    (message) => [message.id, message.to, message.toSessionId],
+  ), [[late.msgId, "niche-manager", former.session.id]]);
+});
 
 test("delivery: push carries the rendered text; ack marks delivered; no ack leaves it queued", async () => {
   // A 200 ms ack timeout exercises the daemon's real ack timer without the 10 s production wait.
@@ -1518,11 +2012,14 @@ test("Claude sessions with different ids and process keys in the same cwd do not
   await env.daemon.probeClaude();
   const [queued] = await send(human, "same-name", "only for A");
   assert.equal(queued.status, "queued");
-  const second = (await human.request("claude_hook", {
+  await assert.rejects(human.request("claude_hook", {
     event: "start", key: "process2", socket: null, sessionId: "B", name: "same-name", cwd: "/work",
+  }), { code: "name_taken" });
+  const second = (await human.request("claude_hook", {
+    event: "start", key: "process2", socket: null, sessionId: "B", name: "other-name", cwd: "/work",
   })).session as { id: string; name: string };
   assert.notEqual(second.id, first.id);
-  assert.equal(second.name, "same-name-2");
+  assert.equal(second.name, "other-name");
   assert.equal(await sessionState(human, "same-name"), "gone");
   assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: "B" })).texts, []);
   assert.equal((await logOf(human, queued.msgId!)).status, "queued");
@@ -1757,10 +2254,12 @@ for (const harness of ["claude", "omp"] as const) {
         : holderAdapter!.session;
       if (harness === "claude") {
         await human.request("claude_hook", {
-          event: "start", key: "suffix-process", socket: null, sessionId: "C", name: "niche-manager", cwd: "/work",
+          event: "start", key: "suffix-process", socket: null, sessionId: "C", name: "niche-manager-2", cwd: "/work",
         });
+        await human.request("rename", { from: "niche-manager-2", name: "suffix-holder" });
       } else {
-        await env.adapter("omp", "suffix-key", "niche-manager");
+        const suffix = await env.adapter("omp", "suffix-key", "niche-manager-2");
+        await suffix.client.request("rename", { name: "suffix-holder" });
       }
       if (holderState === "gone") {
         if (harness === "claude") {
@@ -1895,9 +2394,10 @@ test("harness-scoped adapter keys revive distinct identities when omp and OpenCo
   env = await startEnv();
   const human = env.human();
   const omp = await env.adapter("omp", "shared-id", "shared-name");
-  const opencode = await env.adapter("opencode", "shared-id", "shared-name");
+  await assert.rejects(env.adapter("opencode", "shared-id", "shared-name"), { code: "name_taken" });
+  const opencode = await env.adapter("opencode", "shared-id", "opencode-peer");
   assert.notEqual(omp.session.id, opencode.session.id);
-  assert.equal(opencode.session.name, "shared-name-2");
+  assert.equal(opencode.session.name, "opencode-peer");
   const ompGone = await env.watch(isSession("gone", omp.session.name));
   const opencodeGone = await env.watch(isSession("gone", opencode.session.name));
   omp.client.close();

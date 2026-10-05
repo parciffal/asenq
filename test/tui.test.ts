@@ -190,9 +190,11 @@ test("held actions stay bound to the target identity across rename and name reus
   await ui.until(() => target.deliveries.length > 0, "expected oldest held message delivery after rename");
   assert.equal((await target.nextDelivery()).msg.id, firstId);
   assert.equal((await logOf(human, secondId)).status, "held");
+  await assert.rejects(env.adapter("omp", "held-rename-blocked", "beta"), { code: "name_taken" });
+  await target.client.request("unregister");
   const replacement = await env.adapter("omp", "held-rename-replacement", "beta");
   assert.notEqual(replacement.session.id, target.session.id);
-  await ui.until(() => ui.rows()[0].includes("3 live"), "name reused by another identity");
+  await ui.until(() => ui.rows()[0].includes("2 live"), "removed identity's name reused");
   await ui.press("ESCAPE");
   const listWidth = paneWidths(120)!.list;
   const replacementRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("beta") && !row.includes("renamed"));
@@ -201,9 +203,10 @@ test("held actions stay bound to the target identity across rename and name reus
   assert.ok(!ui.rows().some((row) => row.includes("⏸") && row.includes("held")), "new beta does not inherit renamed target's held messages");
   await ui.type("rx");
   assert.equal((await logOf(human, secondId)).status, "held");
-  const renamedRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("renamed"));
-  assert.ok(renamedRow >= 0);
-  await ui.click(3, renamedRow);
+  await ui.press("CTRL_K");
+  await ui.type("renamed");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("archived · read only")), "original held conversation opened");
   await ui.press("x");
   assert.equal((await logOf(human, secondId)).status, "dropped");
   assert.equal(replacement.deliveries.length, 0);
@@ -1386,6 +1389,31 @@ test("quick jumps preserve separate identity and channel drafts and send once to
   assert.ok(!peerHistory.messages.some((message) => message.text === "identity draft"), "no send to another identity");
   await quickJump(ui, "peer", "peer-draft-history");
   assert.ok(ui.rows().some((row) => row.includes("peer draft")), "unsent peer draft is intact");
+});
+
+test("late replies to a former name appear in the already selected canonical conversation", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = await env.adapter("omp", "former-reply-key", "original");
+  const peer = await env.adapter("opencode", "late-reply-key", "peer");
+  await original.client.request("send", { to: "human", text: "original-conversation-marker" });
+  const ui = await startConsole(120, 32);
+  await quickJump(ui, "original", "original-conversation-marker");
+  await original.client.request("rename", { name: "niche-manager" });
+  await ui.until(() => ui.rows().some((row) => row.includes("niche-manager")), "selected identity rename");
+
+  await peer.client.request("send", { to: "original", text: "late-former-name-reply-marker" });
+  const received = await original.nextDelivery();
+  assert.deepEqual([received.session, received.msg.to, received.msg.text], [
+    original.session.id, "niche-manager", "late-former-name-reply-marker",
+  ]);
+  await ui.until(() => ui.rows().some((row) => row.includes("late-former-name-reply-marker")), "late reply in selected conversation");
+  assert.ok(ui.rows().some((row) => row.includes("original-conversation-marker")), "the same conversation retains its earlier exchange");
+  const history = await human.historyPage({ scope: "session", sessionId: original.session.id });
+  assert.deepEqual(history.messages.map((message) => message.text), [
+    "original-conversation-marker", "late-former-name-reply-marker",
+  ]);
+  assertWithin(ui);
 });
 
 test("quick jump empty results cannot open or send and Backspace recovers without changing the draft", async () => {
