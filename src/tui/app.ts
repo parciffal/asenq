@@ -1176,6 +1176,8 @@ export class ConsoleApp {
     if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, Math.max(1, composerRoom - heldRows.length)), x0);
     const transcriptHeight = height - rows.length - heldRows.length - (composer?.rows.length ?? 0);
     const transcriptY = y0 + rows.length;
+    let visibleHeight = transcriptHeight;
+    let latestHint = false;
     let body: TerminalLine[];
     if (!scope) {
       const text = this.connection === "offline" && !this.sessions.length
@@ -1185,26 +1187,27 @@ export class ConsoleApp {
     } else {
       const key = keyOf(scope);
       const stream = this.streams.get(key);
+      latestHint = stream?.viewport.follow === false && transcriptHeight >= 2;
+      if (latestHint) visibleHeight--;
       const readScope = scope.scope === "inbox" ? undefined : scope;
       const state = readScope && this.readStates.get(key);
       const firstUnread = readScope && state?.unread
         ? stream?.messages.find((m) => this.eligible(readScope, m) && (m.order > state.position || m.order === state.reminder))
         : undefined;
-      const leading: TerminalLine[] = [[{
-        text: ellipsize(stream?.loading ? "Loading…" : stream?.hasMore ? "↑ older messages · scroll up or PgUp" : "Beginning of retained history", width),
-        style: theme.dim,
-      }]];
+      const historyText = ellipsize(stream?.loading ? "Loading…" : stream?.hasMore ? "↑ older messages · scroll up or PgUp" : "· beginning of retained history ·", width);
+      const historyIndent = !stream?.loading && !stream?.hasMore ? Math.max(0, Math.floor((width - terminalTextWidth(historyText)) / 2)) : 0;
+      const leading: TerminalLine[] = [[{ text: " ".repeat(historyIndent) + historyText, style: theme.dim }]];
       const layout = layoutTranscript(stream?.messages ?? [], {
         width,
         ...(stream?.selectedId && this.focus === "transcript" ? { selectedId: stream.selectedId } : {}),
         expanded: (id) => stream?.expanded.has(id) ?? false,
-        ...(firstUnread ? { firstUnreadId: firstUnread.id } : {}),
+        ...(firstUnread ? { firstUnreadId: firstUnread.id, unreadCount: state?.unread } : {}),
         leading,
         empty: stream?.loaded ? "No retained messages" : "",
       });
-      const top = viewportTop(layout, stream?.viewport ?? { follow: true }, transcriptHeight);
-      this.shown = { key, layout, top, height: transcriptHeight };
-      body = layout.rows.slice(top, top + transcriptHeight);
+      const top = viewportTop(layout, stream?.viewport ?? { follow: true }, visibleHeight);
+      this.shown = { key, layout, top, height: visibleHeight };
+      body = layout.rows.slice(top, top + visibleHeight);
       const rowIds: (string | undefined)[] = new Array(layout.rows.length);
       for (const [id, range] of layout.ranges) for (let row = range.start; row <= range.end; row++) rowIds[row] = id;
       body.forEach((_, index) => {
@@ -1212,10 +1215,14 @@ export class ConsoleApp {
         this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: id ? { kind: "message", id } : { kind: "transcript" } });
       });
     }
-    body = body.slice(0, transcriptHeight);
-    for (let index = body.length; index < transcriptHeight; index++) {
+    body = body.slice(0, visibleHeight);
+    for (let index = body.length; index < visibleHeight; index++) {
       body.push("");
       this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: { kind: "transcript" } });
+    }
+    if (latestHint) {
+      body.push(justify([], [{ text: "End ↓ latest", style: theme.dim }], width));
+      this.hits.push({ row: transcriptY + visibleHeight, start: x0, end: x0 + width, target: { kind: "transcript" } });
     }
     rows.push(...body);
     if (held && heldRows.length) {

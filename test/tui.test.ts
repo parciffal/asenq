@@ -2194,6 +2194,7 @@ test("design A transcript separates status and kind, counts unread and compacts 
   const alpha = await env.adapter("omp", "restyle-chat-alpha", "alpha");
   const peer = await env.adapter("omp", "restyle-chat-beta", "beta");
   await human.sendToSession(alpha.session.id, "human-out-full");
+  await alpha.client.request("send", { to: "human", text: "human-in-first" });
   await alpha.client.request("send", { to: "human", text: "human-in-full" });
   await alpha.client.request("send", { to: "beta", text: "compact-first", kind: "task" });
   await peer.client.request("send", { to: "alpha", text: "compact-second", kind: "result" });
@@ -2204,7 +2205,7 @@ test("design A transcript separates status and kind, counts unread and compacts 
   const rows = ui.rows();
   assert.ok(rows.some((row) => /you → alpha\s{2,}✓ delivered/.test(row)));
   assert.ok(rows.some((row) => row.includes("alpha → you")));
-  const divider = rows.findIndex((row) => row.includes("1 new") && row.includes("┄"));
+  const divider = rows.findIndex((row) => row.includes("2 new") && row.includes("┄"));
   assert.ok(divider >= 0);
   const firstBody = rows.findIndex((row) => row.includes("compact-first"));
   const secondHeader = rows.findIndex((row) => row.includes("beta → alpha"));
@@ -2219,10 +2220,49 @@ test("design A transcript separates status and kind, counts unread and compacts 
   }
   const taskHeader = rows.findIndex((row) => row.includes("alpha → beta"));
   assert.ok(normalizeTerminalLine(ui.frame().lines[taskHeader], ui.size.columns).some((span) => span.text.includes("task") && span.style?.inverse && span.style.foreground === "yellow"));
-  assert.equal(await unread(human, alpha.session.id), 1, "visible list preview and new-divider preserve unread");
+  assert.equal(await unread(human, alpha.session.id), 2, "visible list preview and new-divider preserve unread");
   await ui.press("ENTER");
   assert.equal(await unread(human, alpha.session.id), 0);
   await ui.press("u");
   assert.equal(await unread(human, alpha.session.id), 1, "explicit unread reminder survives the restyle");
+  assertWithin(ui);
+});
+
+test("compact agent bodies remain fully reachable and latest hint never reads the hidden human tail", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "restyle-long-alpha", "alpha");
+  const beta = await env.adapter("omp", "restyle-long-beta", "beta");
+  const agentText = [...Array.from({ length: 18 }, (_, index) => `agent paragraph ${index} retains its complete wrapped words`), "last-agent-body-row"].join("\n");
+  await beta.client.request("send", { to: "alpha", text: agentText, kind: "result" });
+  await alpha.client.request("send", { to: "human", text: `${"human paragraph keeps scrolling\n".repeat(22)}last-human-body-row` });
+  const ui = await startConsole(80, 10);
+  await ui.press("CTRL_K");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("last-human-body-row")), "human tail initially visible");
+  await ui.press("u");
+  await ui.press("HOME");
+  assert.ok(ui.rows().some((row) => row.includes("End ↓ latest")));
+  assert.ok(!ui.rows().some((row) => row.includes("last-human-body-row")));
+  const seen = new Set<string>();
+  const inset = paneWidths(80)!.list + 2;
+  for (let step = 0; step < 100; step++) {
+    const rows = ui.rows();
+    for (const row of rows) {
+      const text = row.slice(inset, -1).trim();
+      if (text.startsWith("agent paragraph") || text.includes("last-agent-body-row")) seen.add(text);
+    }
+    assert.equal(await unread(human, alpha.session.id), 1, "agent rows and navigation hint never clear the hidden human reminder");
+    if (rows.some((row) => row.includes("last-agent-body-row"))) break;
+    await ui.press("PAGE_DOWN");
+  }
+  for (const row of wrapTerminalText(agentText, paneWidths(80)!.conversation - 4)) {
+    assert.ok(seen.has(row.trim()), `agent body row remains reachable: ${row}`);
+  }
+  await ui.press("END");
+  assert.ok(ui.rows().some((row) => row.includes("last-human-body-row")));
+  assert.ok(!ui.rows().some((row) => row.includes("End ↓ latest")));
+  assert.equal(await unread(human, alpha.session.id), 0, "only reaching the actual human tail clears its reminder");
   assertWithin(ui);
 });
