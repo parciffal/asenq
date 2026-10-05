@@ -3703,6 +3703,32 @@ test("human ping distinguishes quiet responsive, hung, dead Claude, hook-only Cl
     .map((session) => session.id).sort(), [responsive.session.id, hookOnly.session.id, legacy.session.id].sort());
 });
 
+test("several unanswered pings share one timeout window and outlive the ordinary client timeout", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const pingTimeoutMs = 6000;
+  env = await startEnv({ pingTimeoutMs });
+  const human = env.human();
+  const targets = await Promise.all(["alpha", "beta", "gamma"].map((name) =>
+    env!.adapter("omp", `parallel-ping-${name}`, name, { autoPong: false })));
+  const pending = human.request("ping");
+  let settled = false;
+  let failure: unknown;
+  void pending.then(() => { settled = true; }, (error: unknown) => { settled = true; failure = error; });
+  await Promise.all(targets.map((target) => target.nextPing()));
+  env.clock.advance(5001);
+  context.mock.timers.tick(5001);
+  env.daemon.sweep();
+  await human.request("list");
+  assert.equal(failure, undefined, "ping must not inherit the ordinary five-second client deadline");
+  assert.equal(settled, false, "all targets are still inside their shared ping deadline");
+  env.clock.advance(pingTimeoutMs - 5001);
+  context.mock.timers.tick(pingTimeoutMs - 5001);
+  env.daemon.sweep();
+  assert.deepEqual((await pending).results, targets.map((target) => ({
+    sessionId: target.session.id, name: target.session.name, ping: "not_responding",
+  })));
+});
+
 test("ping targets current names or stable ids and denies every bound agent, even on multi-session connections", async () => {
   env = await startEnv();
   const human = env.human();
@@ -3941,7 +3967,7 @@ test("close and purge remove memberships while preserving channels, unrelated me
   const events = (await human.replay(before.watermark)).events.filter(({ event }) => event.type === "channel");
   for (const name of ["work", "review"]) {
     assert.deepEqual(events.filter(({ event }) => event.type === "channel" && event.channel.name === name)
-      .map(({ event }) => event.type === "channel" && event.channel.memberIds.slice().sort()), [
+      .map(({ event }) => event.type === "channel" && event.channel.memberIds?.slice().sort()), [
       [purging.session.id, kept.session.id].sort(), [kept.session.id],
     ]);
   }
