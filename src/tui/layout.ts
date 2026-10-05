@@ -167,7 +167,7 @@ function detailLines(message: StoredMessage): string[] {
     `status ${message.status}${message.reason ? `: ${message.reason}` : ""} · order ${message.order} · ${new Date(message.createdAt).toLocaleString()}`,
   ];
   if (message.thread) lines.push(`thread ${message.thread}`);
-  if (message.replyTo) lines.push(`reply to ${message.replyTo}`);
+  if (message.replyTo) lines.push(`reply to ${message.replyTo}${message.replyToMissing ? " (purged message)" : ""}`);
   return lines;
 }
 

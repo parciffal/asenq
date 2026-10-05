@@ -515,14 +515,6 @@ export class Store {
     });
   }
 
-  claudeIds(identityId: string): string[] {
-    return this.db.all<{ harness_id: string }>(
-      "SELECT harness_id FROM session_harness_ids WHERE identity_id=? AND harness='claude' AND kind='session' ORDER BY rowid",
-      identityId,
-    ).map((row) => row.harness_id);
-  }
-
-
   sessions(): SessionRow[] {
     return this.db.all<SessionRow>("SELECT * FROM sessions ORDER BY created_at");
   }

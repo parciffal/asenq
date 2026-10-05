@@ -10,7 +10,7 @@ import {
   changedTerminalRows, normalizeTerminalLine, terminalTextWidth, translateKeyboardInput, truncateTerminalText, wrapTerminalText,
   type TerminalAdapterOptions, type TerminalFrame, type TerminalLine, type TerminalSize,
 } from "../src/tui/terminal.js";
-import { logOf, startEnv, type TestEnv } from "./helpers.js";
+import { logOf, startEnv, type Adapter, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 let open: Console | undefined;
@@ -33,6 +33,7 @@ type Console = {
   resize(columns: number, rows: number): Promise<void>;
   close(): void;
   type(text: string): Promise<void>;
+  paste(text: string): Promise<void>;
   until(predicate: () => boolean | Promise<boolean>, what: string): Promise<void>;
 };
 
@@ -46,6 +47,7 @@ async function startConsole(columns: number, rows: number, client?: ConsoleDeps[
   const size = { columns, rows };
   const app = new ConsoleApp({
     ...(client ? { client } : {}),
+    now: () => env!.clock.now(),
     screen: (options) => {
       handlers = options;
       return { size, start() {}, render(next) { frame = next; }, cleanup() {} };
@@ -85,6 +87,10 @@ async function startConsole(columns: number, rows: number, client?: ConsoleDeps[
     close: () => handlers.onInterrupt?.(),
     async type(text) {
       for (const character of text) await ui.press(character);
+    },
+    async paste(text) {
+      handlers.onPaste?.(text);
+      await app.idle();
     },
     async until(predicate, what) {
       const deadline = Date.now() + 3000;
@@ -1480,5 +1486,210 @@ test("r and x remain ordinary draft characters while a held bar is visible", asy
   await ui.until(() => target.deliveries.length === 1, "draft delivered without releasing held message");
   assert.equal((await target.nextDelivery()).msg.text, "rx", "both characters stay in the sent draft");
   assert.equal(((await human.request("held")).messages as unknown[]).length, 1, "human draft delivery bypasses hold without releasing agent messages");
+  assertWithin(ui);
+});
+
+async function paletteAction(ui: Console, action: string): Promise<void> {
+  await ui.press("?");
+  await ui.type(action);
+  await ui.press("ENTER");
+}
+
+async function selectSession(ui: Console, name: string): Promise<void> {
+  await ui.press("s");
+  await ui.press("/");
+  await ui.type(name);
+  await ui.press("ENTER");
+}
+
+test("Ctrl+X closes only a selected session row after one-key confirmation and leaves composer input alone", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "close-alpha", "alpha");
+  const beta = await env.adapter("omp", "close-beta", "beta");
+  const ui = await startConsole(120, 24);
+  await selectSession(ui, "alpha");
+  assert.ok(ui.rows().at(-1)!.includes("Ctrl+X"), "close is discoverable on the selected row");
+  await ui.press("CTRL_X");
+  assert.ok(ui.rows().some((row) => row.includes(alpha.session.id)), "confirmation identifies the pinned target");
+  assert.ok(ui.rows().at(-1)!.includes("confirm") && ui.rows().at(-1)!.includes("cancel"));
+  await ui.press("ENTER");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === alpha.session.id)!.state, "live", "Enter cannot accidentally confirm");
+  await ui.paste("y");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === alpha.session.id)!.state, "live", "pasted text cannot accidentally confirm");
+  await ui.press("n");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === alpha.session.id)!.state, "live", "cancel leaves the target live");
+
+  await ui.press("ENTER");
+  await ui.press("CTRL_X");
+  assert.ok(!ui.rows().some((row) => row.includes("y confirm")), "conversation focus does not close a row");
+  await ui.press("c");
+  await ui.type("draft");
+  await ui.press("CTRL_X");
+  await ui.type("y");
+  await ui.press("ENTER");
+  assert.equal((await alpha.nextDelivery()).msg.text, "drafty", "Ctrl+X does not intercept the composer");
+  await ui.press("ESCAPE");
+  await ui.press("LEFT");
+  await ui.press("CTRL_X");
+  await human.request("rename", { from: "alpha", name: "renamed" });
+  await ui.press("y");
+  await ui.until(() => ui.rows()[0].includes("1 live"), "closed target leaves live rows");
+  const snapshot = await human.sync();
+  assert.equal(snapshot.sessions.find((s) => s.id === alpha.session.id)!.state, "removed", "confirmation stays bound across rename");
+  assert.equal(snapshot.sessions.find((s) => s.id === beta.session.id)!.state, "live", "the other row stays live");
+  await ui.press("ESCAPE");
+  await ui.press("END");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("renamed") && row.includes("archived")), "closed conversation is reachable in the archive");
+  assertWithin(ui);
+});
+
+test("close all stale refreshes configuration and direct activity and pins the confirmed identities", async () => {
+  env = await startEnv({ staleHours: 2 });
+  const human = env.human();
+  const idle: Adapter[] = [];
+  for (let index = 0; index < 12; index++) idle.push(await env.adapter("omp", `idle-${index}`, `idle-${index}`));
+  const active = await env.adapter("omp", "active-key", "active");
+  const ui = await startConsole(120, 28);
+  env.clock.advance(2 * 3_600_000);
+  await idle[0].client.request("channel_send", { channel: "updates", text: "channel activity is not direct activity" });
+  await active.client.request("send", { to: "human", text: "recent direct activity" });
+  const gone = await env.adapter("omp", "gone-key", "gone");
+  const goneEvent = await env.watch((event) => event.type === "session" && event.action === "gone" && event.name === "gone");
+  gone.client.close();
+  await goneEvent.event;
+  const archived = await env.adapter("omp", "archive-key", "archived");
+  await human.request("close", { identity: archived.session.id });
+  const targetIds = new Set(idle.map((a) => a.session.id));
+  targetIds.add(gone.session.id);
+  const preview = async (): Promise<void> => {
+    await paletteAction(ui, "Close all stale");
+    const rows = ui.rows().join("\n");
+    assert.ok(rows.includes("13"), "all twelve idle sessions and the recently gone session are counted");
+    const snapshot = await human.sync();
+    for (const session of snapshot.sessions.filter((s) => targetIds.has(s.id)).slice(0, 10)) {
+      assert.ok(rows.includes(`${session.name} (${session.id})`), "preview shows the first ten targets by name and identity");
+    }
+    assert.ok(rows.includes("and 3 more"), "omitted names have an explicit count");
+    assert.ok(!rows.includes(active.session.id) && !rows.includes(archived.session.id), "active and archived sessions are excluded");
+  };
+  await preview();
+  await ui.press("n");
+  assert.equal((await human.sync()).sessions.filter((s) => targetIds.has(s.id) && s.state === "removed").length, 0, "cancel closes no targets");
+  await preview();
+  const later = await env.adapter("omp", "later-key", "later");
+  env.clock.advance(2 * 3_600_000);
+  await ui.press("y");
+  await ui.until(() => ui.rows()[0].includes("2 live"), "confirmed stale batch closes");
+  const snapshot = await human.sync();
+  for (const id of targetIds) assert.equal(snapshot.sessions.find((s) => s.id === id)!.state, "removed");
+  assert.equal(snapshot.sessions.find((s) => s.id === active.session.id)!.state, "live", "newly stale session is not silently included");
+  assert.equal(snapshot.sessions.find((s) => s.id === later.session.id)!.state, "live", "new session is not silently included");
+  assertWithin(ui);
+});
+
+test("archive purge conversation cancels safely then removes cached direct content from every surface without deleting channel posts", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const retired = await env.adapter("omp", "retired-key", "retired");
+  const live = await env.adapter("omp", "survivor-key", "survivor");
+  await retired.client.request("send", { to: "human", text: "purged-private-marker" });
+  await retired.client.request("channel_send", { channel: "updates", text: "retained-channel-marker" });
+  await live.client.request("send", { to: "human", text: "retained-private-marker" });
+  await human.request("close", { identity: retired.session.id });
+  const ui = await startConsole(120, 30);
+  await ui.press("i");
+  await ui.press("v");
+  await ui.press("#");
+  await ui.press("a");
+  await selectSession(ui, "retired");
+  assert.ok(ui.rows().some((row) => row.includes("purged-private-marker")), "archived conversation is loaded");
+  assert.ok(ui.rows().at(-1)!.includes("purge"), "archive surface advertises purge");
+  await paletteAction(ui, "Purge conversation");
+  assert.ok(ui.rows().some((row) => row.includes(retired.session.id)), "confirmation pins the selected archive");
+  await ui.press("n");
+  assert.ok((await human.sync()).sessions.some((s) => s.id === retired.session.id));
+  assert.ok(ui.rows().some((row) => row.includes("purged-private-marker")), "cancel preserves the conversation");
+  await paletteAction(ui, "Purge conversation");
+  await ui.press("y");
+  await ui.until(async () => !(await human.sync()).sessions.some((s) => s.id === retired.session.id)
+    && !ui.rows().some((row) => row.includes("purged-private-marker")), "purge resets the open conversation");
+  assert.ok(ui.rows()[0].includes("2 unread"), "purge clears only the archived identity's unread marker");
+  await ui.press("ESCAPE");
+  await ui.press("END");
+  await ui.press("ENTER");
+  assert.ok(!ui.rows().some((row) => row.includes("retired") || row.includes("purged-private-marker")), "archive no longer lists the purged identity");
+  await ui.press("i");
+  await ui.press("v");
+  assert.ok(!ui.rows().some((row) => row.includes("purged-private-marker") || row.includes("retired")), "grouped inbox no longer leaks purged content");
+  await ui.press("v");
+  assert.ok(!ui.rows().some((row) => row.includes("purged-private-marker")), "cached chronological inbox is refreshed");
+  assert.ok(ui.rows().some((row) => row.includes("retained-private-marker")), "unrelated direct content survives");
+  await ui.press("a");
+  assert.ok(!ui.rows().some((row) => row.includes("purged-private-marker")), "retained activity no longer leaks purged direct content");
+  assert.ok(ui.rows().some((row) => row.includes("retained-channel-marker")), "channel activity remains");
+  await ui.press("#");
+  assert.ok(ui.rows().some((row) => row.includes("retained-channel-marker")), "purged author's channel post remains");
+  assert.equal((await human.sync()).sessions.find((s) => s.id === live.session.id)!.state, "live");
+  assertWithin(ui);
+});
+
+test("purge all archives cancels safely and never enlarges the confirmed archive snapshot", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "purge-alpha", "alpha");
+  const beta = await env.adapter("omp", "purge-beta", "beta");
+  const later = await env.adapter("omp", "purge-later", "later");
+  for (const adapter of [alpha, beta]) await human.request("close", { identity: adapter.session.id });
+  const ui = await startConsole(120, 24);
+  await ui.press("END");
+  assert.ok(ui.rows().at(-1)!.includes("purge"), "collapsed archive offers purge actions");
+  await paletteAction(ui, "Purge all archives");
+  for (const adapter of [alpha, beta]) assert.ok(ui.rows().some((row) => row.includes(adapter.session.id)));
+  assert.ok(!ui.rows().some((row) => row.includes(later.session.id)));
+  await ui.press("n");
+  let snapshot = await human.sync();
+  for (const adapter of [alpha, beta]) assert.ok(snapshot.sessions.some((s) => s.id === adapter.session.id), "cancel preserves each archive");
+  await paletteAction(ui, "Purge all archives");
+  await human.request("close", { identity: later.session.id });
+  await ui.press("y");
+  await ui.until(async () => {
+    snapshot = await human.sync();
+    return [alpha, beta].every((adapter) => !snapshot.sessions.some((s) => s.id === adapter.session.id));
+  }, "confirmed archives purged");
+  assert.ok(snapshot.sessions.some((s) => s.id === later.session.id && s.state === "removed"), "archive created after preview is not deleted");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("later") && row.includes("archived")), "unconfirmed archive remains visible");
+  assert.ok(!ui.rows().some((row) => /\b(alpha|beta)\b/.test(row)), "confirmed archive rows disappear");
+  assertWithin(ui);
+});
+
+test("retained sender notices show the original reply identity as a purged message in rendered details", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "notice-sender", "sender");
+  const target = await env.adapter("omp", "notice-target", "target");
+  await human.request("set_inbound", { name: "target", mode: "hold" });
+  const held = await sender.client.request("send", { to: "target", text: "held-private-marker" });
+  const original = (held.results as { msgId: string }[])[0].msgId;
+  await human.request("close", { identity: target.session.id });
+  const notice = (await sender.nextDelivery()).msg;
+  assert.equal(notice.replyTo, original);
+  const ui = await startConsole(120, 30);
+  await selectSession(ui, "sender");
+  await ui.press("ENTER");
+  await ui.press("END");
+  await ui.press("DOWN");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes(`reply to ${original}`)), "notice details retain the original message identity");
+  await human.request("purge", { identity: target.session.id });
+  await ui.until(() => !ui.rows().some((row) => row.includes("held-private-marker")), "purge refreshes cached sender conversation");
+  await ui.press("END");
+  await ui.press("DOWN");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("(purged message)")), "missing reply reference has a visible label");
+  assert.ok(ui.rows().some((row) => row.includes(`reply to ${original}`)), "purge does not discard the reference");
+  assert.ok(ui.rows().some((row) => row.includes("not delivered")), "independent sender notice remains visible");
   assertWithin(ui);
 });

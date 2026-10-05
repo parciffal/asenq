@@ -6,7 +6,7 @@ import { formatSendResults } from "../shared/tools.js";
 
 type LoggedMsg = {
   id: string; from: string; to: string; text: string; createdAt: number;
-  kind?: string; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean; status: string; reason?: string;
+  kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; done?: boolean; status: string; reason?: string;
 };
 
 const out = (s: string): void => void process.stdout.write(s + "\n");
@@ -18,7 +18,7 @@ const oneLine = (s: string, n: number): string => {
 
 function msgLine(m: Omit<LoggedMsg, "status"> & { status?: string; reason?: string }): string {
   const status = m.status ? ` (${m.status}${m.reason ? `: ${m.reason}` : ""})` : "";
-  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""} ${oneLine(m.text, 120)}${status}`;
+  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""}${m.replyToMissing && m.replyTo ? ` reply-to=${m.replyTo} (purged message)` : ""} ${oneLine(m.text, 120)}${status}`;
 }
 
 function need(args: string[], n: number, usage: string): void {
@@ -135,7 +135,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       if (values.id) {
         const m = msgs[0];
         out(`${m.id} ${m.from} → ${m.to} ${new Date(m.createdAt).toISOString()} ${m.status}${m.reason ? ` (${m.reason})` : ""}`);
-        const meta = [m.kind && `kind=${m.kind}`, m.action && `action=${m.action}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}`, m.done && "done"].filter(Boolean);
+        const meta = [m.kind && `kind=${m.kind}`, m.action && `action=${m.action}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}`, m.done && "done"].filter(Boolean);
         if (meta.length) out(meta.join(" · "));
         out("");
         out(m.text);
@@ -149,9 +149,50 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       const msgs = (r.messages as LoggedMsg[]).reverse();
       if (msgs.length === 0) out("no messages");
       for (const m of msgs) {
-        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}` : ""}${m.done ? " · done" : ""}`);
+        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}` : ""}${m.done ? " · done" : ""}`);
         out(m.text);
         out("");
+      }
+      return 0;
+    }
+    case "close": case "purge": {
+      const { values, positionals } = parseArgs({
+        args: argv, allowPositionals: true,
+        options: cmd === "purge" ? { all: { type: "boolean" } } : {},
+      });
+      if (values.all ? positionals.length !== 0 : positionals.length !== 1) {
+        throw new Error(`usage: asenq ${cmd} <name|identity>${cmd === "purge" ? " | asenq purge --all" : ""}`);
+      }
+      if (values.all) {
+        const reply = await client.request("purge", { all: true });
+        const purged = reply.purged as string[];
+        out(purged.length ? purged.map((id) => `purged ${id}`).join("\n") : "no archived conversations");
+        return 0;
+      }
+      const target = positionals[0];
+      const { sessions } = await client.sync();
+      let session = sessions.find((s) => s.id === target);
+      if (!session) {
+        const matching = sessions.filter((s) => s.name === target);
+        const active = matching.filter((s) => s.state !== "removed");
+        if (cmd === "purge" && active.length) {
+          throw new Error(`cannot purge live or reconnecting name "${target}"; use an archived identity ID`);
+        }
+        const candidates = cmd === "close" && active.length ? active : matching;
+        if (!candidates.length) throw new Error(`unknown current session name or identity "${target}"`);
+        if (candidates.length > 1) {
+          throw new Error(`ambiguous session name "${target}"; use an identity ID: ${candidates.map((s) => s.id).join(", ")}`);
+        }
+        session = candidates[0];
+      }
+      if (cmd === "close") {
+        const reply = await client.request("close", { identity: session.id });
+        const closed = reply.session as SessionIdentity;
+        out(`closed ${closed.name} (${closed.id})`);
+      } else {
+        const reply = await client.request("purge", { identity: session.id });
+        const purged = reply.purged as string[];
+        out(purged.length ? purged.map((id) => `purged ${id}`).join("\n") : "no archived conversations purged");
       }
       return 0;
     }

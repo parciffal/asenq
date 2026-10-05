@@ -168,7 +168,7 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
-type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; kind?: string; action?: ControlAction; thread?: string };
+type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
