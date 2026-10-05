@@ -150,6 +150,8 @@ asenq channel send work "Review @alpha; status from @workers"
 
 The pushed direct-message header names the channel and poster; the post body is unchanged. Direct-message policies still apply: agent posts to held targets remain held, refused targets are rejected, and human posts bypass hold just as ordinary human direct messages do. Sends return the post's `msgId` and per-target `results` with real states, rather than claiming that a held or rejected target was delivered. The CLI and `asenq_channel_send` show those target names and states. Posts without mentions remain on demand.
 
+Auto-removed members retain their identity and membership: mention messages queue under that stable identity and deliver after revival, including across daemon restarts. Closing an identity removes its memberships; its current and former names then fail with `unknown_mention`, and group mentions no longer include it.
+
 In the TUI channel composer, type `@` to open a member and keyword picker, then keep typing to filter. Arrow keys choose a token; **Enter inserts it without posting**. A later Enter sends the draft. Escape dismisses the picker without discarding the draft. Direct-message composers and email text do not open it.
 
 ### File references

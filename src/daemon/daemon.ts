@@ -1728,8 +1728,7 @@ export class Daemon {
     };
     this.insert(row);
     const results = await Promise.all([...targets.values()].map((member): Promise<SendResult> | SendResult => {
-      const target = this.store.session(member.id);
-      if (!target) return { to: member.name, status: "failed", reason: "archived member; not delivered" };
+      const target = this.store.session(member.id) ?? member;
       return this.routeOne(s, target, {
         ...row, id: newId("m_"), to_name: target.name, to_session: member.id,
         channel: null, source_channel: channel, status: "queued", ord: 0,
