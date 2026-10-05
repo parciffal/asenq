@@ -1,4 +1,5 @@
 import type { MsgStatus, PositionedEvent, StoredMessage } from "../shared/protocol.js";
+import { renderMessageBody } from "../shared/render.js";
 import {
   sanitizeTerminalText, terminalTextWidth, truncateTerminalText, wrapTerminalText,
   type TerminalLine, type TerminalSpan, type TerminalStyle,
@@ -119,7 +120,7 @@ function wrappedBody(message: StoredMessage, width: number): string[] {
   let rows = wrapCache.get(key);
   if (!rows) {
     if (wrapCache.size > 4000) wrapCache.clear();
-    rows = wrapTerminalText(message.text, width);
+    rows = wrapTerminalText(renderMessageBody(message), width);
     wrapCache.set(key, rows);
   }
   return rows;
@@ -299,7 +300,7 @@ export function activitySpans(item: PositionedEvent, names: (id: string) => stri
       { text: ` → ${where}  ` },
       { text: event.status, style: statusStyle(event.status) },
       ...(event.reason ? [{ text: ` (${event.reason})`, style: theme.dim }] : []),
-      { text: `  ${sanitizeTerminalText(m.text)}`, style: theme.dim },
+      { text: `  ${sanitizeTerminalText(renderMessageBody(m))}`, style: theme.dim },
     ];
   }
   if (event.type === "session") {
