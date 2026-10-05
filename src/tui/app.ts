@@ -34,12 +34,13 @@ export type ConsoleDeps = {
 const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"]] as const;
 type Tab = typeof TABS[number][0];
 type Focus = "tabs" | "list" | "transcript" | "composer";
+type SessionWithRole = SessionIdentity & { role?: "orchestrator" | "worker" | null };
 
 const ACTION_GROUPS = [
   ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
-  ["Sessions", ["Rename session", "Inbound policy"]],
+  ["Sessions", ["Rename session", "Inbound policy", "Set role"]],
   ["Daemon", ["Daemon status", "Daemon start", "Daemon stop", "Reconnect", "Setup", "Remove setup", "Doctor"]],
   ["Help", ["Help", "Error details", "Quit"]],
 ] as const;
@@ -134,7 +135,7 @@ const jumpRank = (name: string, query: string): number => {
 export class ConsoleApp {
   private readonly screen: Screen;
   private readonly client: AsenqClient;
-  private sessions: SessionIdentity[] = [];
+  private sessions: SessionWithRole[] = [];
   private sessionOrders: Record<string, number> = {};
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
@@ -274,7 +275,7 @@ export class ConsoleApp {
     return scope && scope.scope !== "inbox" ? scope : undefined;
   }
 
-  private session(id: string): SessionIdentity | undefined {
+  private session(id: string): SessionWithRole | undefined {
     return this.sessions.find((s) => s.id === id);
   }
 
@@ -490,23 +491,29 @@ export class ConsoleApp {
       const matching = this.sessions
         .filter((s) => !q || s.name.includes(q) || s.previousNames.some((name) => name.includes(q)))
         .sort((a, b) => (orders[b.id] ?? 0) - (orders[a.id] ?? 0) || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
-      const row = (s: SessionIdentity): Entry => ({
+      const row = (s: SessionWithRole): Entry => ({
         key: `s:${s.id}`,
         rows: (width, selected, focused) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
           const right = [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)];
           const left = [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])];
+          const role = s.role === "orchestrator" ? "orch" : s.role === "worker" ? "wrk" : "";
+          const statusWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+          const roleBelow = !!role && width - statusWidth - role.length - 2 < 2 + Math.min(2, terminalTextWidth(s.name));
+          if (role && !roleBelow) right.unshift({ text: `${role} ` });
           const labelWidth = left.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-          // Harness metadata yields before a session name or former-name search cue.
+          // Harness metadata yields before names, roles and unread/state indicators.
           const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - labelWidth - 2);
           const harness = ellipsize(harnessShortName(s.harness), harnessWidth);
           if (harness) right.unshift({ text: `${harness} `, style: theme.dim });
-          return [justify(
+          const rows = [justify(
             left,
             right,
             width, pick(selected, focused),
           )];
+          if (roleBelow) rows.push(justify([{ text: `  ${role}` }], [], width, pick(selected, focused)));
+          return rows;
         },
       });
       const live = matching.filter((s) => s.state === "live");
@@ -1872,6 +1879,12 @@ export class ConsoleApp {
             await this.client.request("set_inbound", { name, mode });
             this.say(`${name}: ${mode}`);
           }, [selected?.name ?? "", selected?.inbound ?? "accept"], ["accept delivers, hold keeps agent messages for review, refuse rejects them."]);
+          break;
+        case "Set role":
+          this.ask("Set role", ["Session", "orchestrator/worker/unset"], async ([name, role]) => {
+            await this.client.request("set_role", { name, role: role === "unset" ? null : role });
+            this.say(`${name}: ${role}`);
+          }, [selected?.name ?? "", selected?.role ?? "unset"], ["Roles are informational only; they do not grant permissions or coordinate work."]);
           break;
         case "Daemon status": await this.executeLocal(["daemon", "status"]); break;
         case "Daemon start": await this.executeLocal(["daemon", "start"]); break;
