@@ -5172,3 +5172,26 @@ test("failedCount excludes pending, policy rejected, dropped and posted messages
   await env.restart();
   assert.equal((await env.human().request("sync")).failedCount, 2);
 });
+
+test("named channel mention delivers one direct message with channel context and retains one post", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "mention-poster", "poster");
+  const member = await env.adapter("omp", "mention-member", "member");
+  const other = await env.adapter("omp", "mention-other", "other");
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["poster", "member", "other"]) await human.request("channel_add", { channel: "work", name });
+  const reply = await poster.client.request("channel_send", { channel: "work", text: "Review @member; @member needs this." });
+  assert.equal(member.deliveries.length, 1);
+  assert.equal(poster.deliveries.length, 0);
+  assert.equal(other.deliveries.length, 0);
+  const delivery = member.deliveries[0];
+  assert.equal(delivery.msg.from, "poster");
+  assert.match(delivery.text.split("\n")[0], /#work/);
+  const results = reply.results as SendResult[];
+  assert.deepEqual(results.map((result) => [result.to, result.status, result.msgId]), [["member", "delivered", delivery.msg.id]]);
+  const posts = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  assert.deepEqual(posts.map((post) => post.id), [reply.msgId]);
+  const inbox = (await member.client.request("inbox", { unread_only: true })).messages as StoredMessage[];
+  assert.deepEqual(inbox.map((message) => message.id), [delivery.msg.id], "pushed posts remain direct inbox messages");
+});

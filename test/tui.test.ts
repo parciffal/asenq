@@ -1915,3 +1915,25 @@ test("Home and End reach list boundaries after a selected archive is hidden", as
   await ui.until(() => ui.rows().some((row) => row.includes("Live boundary conversation")), "Home opens the first live session");
   assertWithin(ui);
 });
+
+test("channel composer mention picker filters members and inserts a token without submitting", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await env.adapter("omp", "picker-alpha", "alpha");
+  await env.adapter("omp", "picker-beta", "beta");
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["alpha", "beta"]) await human.request("channel_add", { channel: "work", name });
+  const ui = await startConsole(80, 24);
+  await ui.press("#");
+  await ui.press("c");
+  await ui.type("Need ");
+  await ui.press("@");
+  assert.ok(ui.rows().some((row) => row.includes("@all")), "picker offers the all keyword");
+  await ui.type("alp");
+  assert.ok(ui.rows().some((row) => row.includes("@alpha")), "member choice follows the typed prefix");
+  assert.ok(!ui.rows().some((row) => row.includes("@beta")), "nonmatching member choices disappear");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("Need @alpha")), "acceptance inserts into the existing draft");
+  assert.deepEqual((await human.request("channel_read", { channel: "work" })).messages, [], "picker Enter never sends");
+  assertWithin(ui);
+});
