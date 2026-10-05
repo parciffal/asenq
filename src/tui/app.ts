@@ -42,6 +42,7 @@ const ACTION_GROUPS = [
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
   ["Sessions", ["Rename session", "Inbound policy", "Set role"]],
+  ["Channels", ["Create channel", "Add channel member", "Remove channel member"]],
   ["Daemon", ["Daemon status", "Daemon start", "Daemon stop", "Reconnect", "Setup", "Remove setup", "Doctor"]],
   ["Help", ["Help", "Error details", "Quit"]],
 ] as const;
@@ -60,6 +61,7 @@ const HELP = [
   "Tabs: s Sessions · i Inbox · # Channels · a Activity. Tab / Shift+Tab move focus between tabs, list, conversation and composer.",
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
   "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
+  "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
@@ -269,8 +271,21 @@ export class ConsoleApp {
       if (this.inboxFeed || !selected) return { scope: "inbox" };
       return selected.startsWith("i:n:") ? { scope: "inbox" } : { scope: "session", sessionId: selected.slice(2) };
     }
-    if (this.tab === "channels") return selected ? { scope: "channel", channel: selected.slice(2) } : undefined;
+    if (this.tab === "channels") {
+      const channel = this.selectedChannel();
+      return channel ? { scope: "channel", channel } : undefined;
+    }
     return undefined;
+  }
+
+  private selectedChannel(): string | undefined {
+    const key = this.selection.channels;
+    return key?.startsWith("m:") ? key.slice(2, key.indexOf(":", 2)) : key?.slice(2);
+  }
+
+  private selectedChannelMember(): string | undefined {
+    const key = this.selection.channels;
+    return key?.startsWith("m:") ? key.slice(key.indexOf(":", 2) + 1) : undefined;
   }
 
   private readScope(): ReadScope | undefined {
@@ -430,8 +445,8 @@ export class ConsoleApp {
       }
       if (m.channel && e.status === "posted") {
         const channel = this.channels.find((c) => c.name === m.channel);
-        if (channel) Object.assign(channel, { count: channel.count + 1, lastAt: m.createdAt, lastOrder: m.order });
-        else this.channels.push({ name: m.channel, count: 1, lastAt: m.createdAt, lastOrder: m.order });
+        if (channel && m.order > channel.lastOrder) Object.assign(channel, { count: channel.count + 1, lastAt: m.createdAt, lastOrder: m.order });
+        else if (!channel) this.channels.push({ name: m.channel, count: 1, lastAt: m.createdAt, lastOrder: m.order, memberIds: [] });
         this.channels.sort((a, b) => b.lastOrder - a.lastOrder);
       }
       const incoming = m.from !== "human" && (m.channel !== undefined || m.to === "human");
@@ -443,6 +458,11 @@ export class ConsoleApp {
       }
     } else if (e.type === "read") {
       this.readStates.set(keyOf(e.state.scope), e.state);
+    } else if (e.type === "channel") {
+      const index = this.channels.findIndex((c) => c.name === e.channel.name);
+      if (index >= 0) this.channels[index] = e.channel;
+      else this.channels.push(e.channel);
+      this.channels.sort((a, b) => b.lastOrder - a.lastOrder || a.name.localeCompare(b.name));
     } else if (e.type === "session") {
       const index = this.sessions.findIndex((s) => s.id === e.session.id);
       if (index >= 0) this.sessions[index] = e.session;
@@ -570,14 +590,34 @@ export class ConsoleApp {
       });
     }
     if (tab === "channels") {
-      return this.channels.map((channel) => ({
-        key: `c:${channel.name}`,
-        rows: (width, selected, focused) => [justify(
-          [this.marker(selected), { text: `#${channel.name}`, style: theme.accentBold }],
-          this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
-          width, pick(selected, focused),
-        )],
-      }));
+      return this.channels.flatMap((channel): Entry[] => [
+        {
+          key: `c:${channel.name}`,
+          rows: (width, selected, focused) => [justify(
+            [this.marker(selected), { text: `#${channel.name}`, style: theme.accentBold }],
+            this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
+            width, pick(selected, focused),
+          )],
+        },
+        ...(channel.memberIds ?? []).flatMap((id): Entry[] => {
+          const member = this.session(id);
+          if (!member) return [];
+          return [{
+            key: `m:${channel.name}:${id}`,
+            rows: (width, selected, focused) => {
+              const role = member.role === "orchestrator" ? "orch" : member.role === "worker" ? "wrk" : "unset";
+              const detail = [{ text: `${role} `, style: theme.dim }, this.stateLabel(member)];
+              const label = [this.marker(selected), { text: "  " }, { text: member.name, style: theme.agent }];
+              const detailWidth = detail.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+              const fill = pick(selected, focused);
+              if (width < 4 + Math.min(2, terminalTextWidth(member.name)) + 1 + detailWidth) {
+                return [padSpans(label, width, fill), padSpans([{ text: "    " }, ...detail], width, fill)];
+              }
+              return [justify(label, detail, width, fill)];
+            },
+          }];
+        }),
+      ]);
     }
     const names = (id: string): string | undefined => this.session(id)?.name;
     return this.activity
@@ -605,6 +645,13 @@ export class ConsoleApp {
       if (!current || !keys.includes(current)) {
         // Keep an archived selection that the collapsed archive merely hides.
         if (tab === "sessions" && current?.startsWith("s:") && this.session(current.slice(2))) continue;
+        if (tab === "channels" && current?.startsWith("m:")) {
+          const channelKey = `c:${this.selectedChannel()}`;
+          if (keys.includes(channelKey)) {
+            this.selection.channels = channelKey;
+            continue;
+          }
+        }
         this.selection[tab] = keys.find((key) => key !== "archive") ?? keys[0];
       }
     }
@@ -660,6 +707,12 @@ export class ConsoleApp {
     if (!item) return;
     const e = item.event;
     let sessionId: string | undefined;
+    if (e.type === "channel") {
+      this.selection.channels = `c:${e.channel.name}`;
+      await this.setTab("channels");
+      this.focus = "transcript";
+      return this.render();
+    }
     if (e.type === "message") {
       if (e.msg.channel) {
         this.selection.channels = `c:${e.msg.channel}`;
@@ -981,7 +1034,7 @@ export class ConsoleApp {
       if (this.searching) cursor = { row: y0, column: x0 + Math.min(width - 1, 2 + terminalTextWidth(this.query)) };
     } else if (tab === "activity") {
       header.push(justify(
-        [{ text: "Activity ", style: theme.accentBold }, { text: this.activityFilter === "important" ? "messages, sessions and retention" : "all events", style: theme.dim }],
+        [{ text: "Activity ", style: theme.accentBold }, { text: this.activityFilter === "important" ? "messages, sessions, channels and retention" : "all events", style: theme.dim }],
         [{ text: this.activityFilter === "important" ? "f all · Enter open" : "f important · Enter open", style: theme.dim }], width,
       ));
     } else if (tab === "inbox") {
@@ -1074,7 +1127,7 @@ export class ConsoleApp {
     if (!scope) {
       const text = this.connection === "offline" && !this.sessions.length
         ? `Daemon unavailable. ${this.notice?.text ?? ""}`
-        : this.tab === "channels" ? "Channels appear once someone posts; use ? → Post channel." : "Select a session in the list.";
+        : this.tab === "channels" ? "Use ? → Create channel or Post channel to start a channel." : "Select a session in the list.";
       body = wrapTerminalText(text, width).map((line) => [{ text: line, style: theme.dim }]);
     } else {
       const key = keyOf(scope);
@@ -1898,6 +1951,36 @@ export class ConsoleApp {
             await this.replay();
           }, ["Posts are stored for readers; agents are never pushed channel messages."]);
           break;
+        case "Create channel":
+          this.ask("Create channel", ["Channel"], async ([channel]) => {
+            await this.client.request("channel_create", { channel });
+            await this.replay();
+            this.selection.channels = `c:${channel}`;
+            await this.setTab("channels");
+          }, [scope?.scope === "channel" ? scope.channel : ""]);
+          break;
+        case "Add channel member":
+          this.ask("Add channel member", ["Channel", "Live session name"], async ([channel, name]) => {
+            await this.client.request("channel_add", { channel, name });
+            await this.replay();
+          }, [scope?.scope === "channel" ? scope.channel : "", selected?.name ?? ""], ["Membership follows the session identity across renames and reconnections."]);
+          break;
+        case "Remove channel member": {
+          const channel = scope?.scope === "channel" ? scope.channel : this.selectedChannel() ?? "";
+          const members = (this.channels.find((item) => item.name === channel)?.memberIds ?? []).flatMap((id) => {
+            const member = this.session(id);
+            return member ? [member] : [];
+          });
+          const id = this.selectedChannelMember() ?? members[0]?.id ?? "";
+          this.ask("Remove channel member", ["Channel", "Session identity ID"], async ([channel, sessionId]) => {
+            await this.client.request("channel_remove", { channel, sessionId });
+            await this.replay();
+          }, [channel, id], [
+            "Removes by stable identity, never by a reused or former name.",
+            ...members.map((member) => `${member.name} · ${member.role ?? "unset"} · ${member.state} · ${member.id}`),
+          ]);
+          break;
+        }
         case "Log by session or message ID":
           this.ask("Log", ["Session name (blank for all)", "Message ID (optional)"], async ([name, msgId]) => {
             const reply = await this.client.request("log", { name: name || undefined, msgId: msgId || undefined, limit: 200 });
@@ -1938,7 +2021,7 @@ export class ConsoleApp {
           this.ask("Set role", ["Session", "orchestrator/worker/unset"], async ([name, role]) => {
             await this.client.request("set_role", { name, role: role === "unset" ? null : role });
             this.say(`${name}: ${role}`);
-          }, [selected?.name ?? "", selected?.role ?? "unset"], ["Roles are informational only; they do not grant permissions or coordinate work."]);
+          }, [selected?.name ?? "", selected?.role ?? "unset"], ["Roles do not restrict messaging. Orchestrators can edit members and roles within their own channels."]);
           break;
         case "Daemon status": await this.executeLocal(["daemon", "status"]); break;
         case "Daemon start": await this.executeLocal(["daemon", "start"]); break;

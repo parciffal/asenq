@@ -292,6 +292,12 @@ export class Daemon {
     if (s.kind !== "human") throw new AsenqError("bad_request", `only the user (asenq CLI) can ${what}`);
   }
 
+  private requireHumanOrOrchestrator(actor: Sender, message: string): void {
+    if (actor.kind !== "human" && (actor.kind !== "agent" || this.store.identity(actor.session.id)?.role !== "orchestrator")) {
+      throw new AsenqError("not_permitted", message);
+    }
+  }
+
   private async handle(c: Conn, p: Req): Promise<Result> {
     switch (p.op) {
       case "hello":
@@ -327,14 +333,16 @@ export class Daemon {
         return {};
       }
       case "set_role": {
-        if (c.bound.size > 0 || c.attached) {
-          throw new AsenqError("not_permitted", "only the user (asenq CLI) can change session roles");
-        }
+        const actor = this.sender(c, p);
+        this.requireHumanOrOrchestrator(actor, "only the human or a shared-channel orchestrator can change session roles");
         const role = p.role;
         if (role !== null && role !== "orchestrator" && role !== "worker") {
           throw new AsenqError("bad_request", "role must be orchestrator, worker or null");
         }
         const row = this.mustSession(str(p, "name", true));
+        if (actor.kind === "agent" && !this.store.shareChannel(actor.session.id, row.id)) {
+          throw new AsenqError("not_permitted", "target does not share a channel with this orchestrator");
+        }
         this.store.setIdentityRole(row.id, role);
         this.emitSession("updated", row);
         return {};
@@ -392,6 +400,19 @@ export class Daemon {
             role: this.store.identity(r.id)?.role ?? null,
           })),
         };
+      }
+      case "channel_create": {
+        const actor = this.sender(c, p);
+        this.requireHumanOrOrchestrator(actor, "only the human or an orchestrator can create channels");
+        return this.mutateChannel(this.channelName(p), "create", actor.kind === "agent" ? actor.session.id : undefined);
+      }
+      case "channel_add":
+      case "channel_remove":
+        return this.opChannelMember(this.sender(c, p), p, p.op === "channel_add");
+      case "channel_members": {
+        const channel = this.channelName(p);
+        if (!this.store.hasChannel(channel)) throw new AsenqError("unknown_channel", `unknown channel "${channel}"`);
+        return { members: this.store.channelMembers(channel) };
       }
       case "channel_send":
         return this.opChannelSend(this.sender(c, p), p);
@@ -583,12 +604,7 @@ export class Daemon {
     if (!NAME_RE.test(scope.channel)) {
       throw new AsenqError("invalid_name", `invalid channel name "${scope.channel}"`);
     }
-    const exists = this.store.db.get<{ one: number }>(
-      `SELECT 1 AS one FROM messages WHERE channel=?
-       UNION ALL SELECT 1 AS one FROM human_read_positions WHERE scope='channel' AND stream_key=? LIMIT 1`,
-      scope.channel, scope.channel,
-    );
-    if (!exists) throw new AsenqError("bad_request", `no retained channel ${scope.channel}`);
+    if (!this.store.hasChannel(scope.channel)) throw new AsenqError("bad_request", `no retained channel ${scope.channel}`);
   }
 
   private opSync(c: Conn): Result {
@@ -917,6 +933,7 @@ export class Daemon {
         type: "session", action: "removed", name: provisional.name, harness: "claude",
         reason: `merged into ${ancestor.name}`, session: { ...provisional, state: "removed", removedAt: this.now() },
       });
+      for (const channel of transfer.channels) this.emit({ type: "channel", action: "updated", channel });
       this.emit({ type: "read", state: this.store.ensureRead({ scope: "session", sessionId: ancestor.id }) });
       setImmediate(() => void this.flush(ancestor.id));
       return this.store.session(ancestor.id)!;
@@ -1323,17 +1340,86 @@ export class Daemon {
     this.store.pruneEvents(cutoff);
     const reconciliation = this.store.reconcileReads(cutoff);
     for (const state of reconciliation.states) this.emit({ type: "read", state });
+    for (const channel of reconciliation.channels) this.emit({ type: "channel", action: "updated", channel });
     if (removedMessages + reconciliation.removedPositions + reconciliation.removedIdentities > 0) {
       this.emit({ type: "retention" });
     }
   }
 
-  private opChannelSend(s: Sender, p: Params): Result {
+  private channelName(p: Params): string {
     const channel = str(p, "channel", true);
     if (!NAME_RE.test(channel)) throw new AsenqError("invalid_name", `invalid channel name "${channel}"`);
+    return channel;
+  }
+
+  private mutateChannel(name: string, action: "create" | "add" | "remove", sessionId?: string): Result {
+    const result = this.store.transaction(() => {
+      const changed = action === "create" ? this.store.createChannel(name)
+        : action === "add" ? this.store.addChannelMember(name, sessionId!)
+        : this.store.removeChannelMember(name, sessionId!);
+      if (changed && action === "create" && sessionId !== undefined) this.store.addChannelMember(name, sessionId);
+      const channel = this.store.channelSummary(name);
+      const event = changed ? this.store.appendEvent({
+        type: "channel", action: action === "create" ? "created" : "updated", channel,
+      }, this.now()) : undefined;
+      return { channel, event };
+    });
+    if (result.event) this.publish(result.event);
+    return { channel: result.channel };
+  }
+
+  private opChannelMember(actor: Sender, p: Params, add: boolean): Result {
+    this.requireHumanOrOrchestrator(actor, "only the human or a channel's orchestrator can edit membership");
+    if (actor.kind !== "human" && p.sessionId !== undefined) {
+      throw new AsenqError("not_permitted", "only the human can remove members by identity");
+    }
+    const channel = this.channelName(p);
+    if (!this.store.hasChannel(channel)) throw new AsenqError("unknown_channel", `unknown channel "${channel}"`);
+    if (actor.kind === "agent" && !this.store.isChannelMember(channel, actor.session.id)
+      && !(add && p.name === actor.session.name)) {
+      throw new AsenqError("not_permitted", `not a member of channel "${channel}"`);
+    }
+    if (add) {
+      const name = str(p, "name", true);
+      let target: SessionRow;
+      try {
+        target = this.mustSession(name);
+      } catch (error) {
+        if (error instanceof AsenqError && error.code === "unknown_target"
+          && this.store.identities().some((identity) => identity.state !== "live"
+            && (identity.name === name || identity.previousNames.includes(name)))) {
+          throw new AsenqError("not_live", `session "${name}" is not live`);
+        }
+        throw error;
+      }
+      if (target.state !== "live") throw new AsenqError("not_live", `session "${name}" is not live`);
+      return this.mutateChannel(channel, "add", target.id);
+    }
+    const sessionId = str(p, "sessionId");
+    const name = str(p, "name");
+    if ((sessionId === undefined) === (name === undefined)) {
+      throw new AsenqError("bad_request", "supply either name or sessionId");
+    }
+    if (sessionId !== undefined) {
+      if (!this.store.identity(sessionId)) throw this.unknownTarget(sessionId);
+      return this.mutateChannel(channel, "remove", sessionId);
+    }
+    const members = this.store.channelMembers(channel);
+    const current = members.filter((member) => member.name === name);
+    const matches = current.length > 0 ? current : members.filter((member) => member.previousNames.includes(name!));
+    if (matches.length > 1) {
+      throw new AsenqError("ambiguous_target", `ambiguous member "${name}": ${matches.map((m) => `${m.id} name=${m.name} state=${m.state}`).join(", ")}`);
+    }
+    if (matches.length === 0) throw this.unknownTarget(name!);
+    return this.mutateChannel(channel, "remove", matches[0].id);
+  }
+
+  private opChannelSend(s: Sender, p: Params): Result {
+    const channel = this.channelName(p);
     const text = str(p, "text", true);
     if (text.length === 0) throw new AsenqError("bad_request", "text is empty");
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);
+    if (!this.store.hasChannel(channel)) this.mutateChannel(channel, "create");
     const now = this.now();
     const row: MsgRow = {
       id: newId("m_"), from_name: this.senderName(s), from_session: s.kind === "agent" ? s.session.id : null,

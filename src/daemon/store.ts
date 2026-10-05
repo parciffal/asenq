@@ -28,6 +28,10 @@ CREATE INDEX IF NOT EXISTS session_harness_ids_identity ON session_harness_ids(i
 CREATE TABLE IF NOT EXISTS claude_lineage(
   fingerprint TEXT NOT NULL, identity_id TEXT NOT NULL, PRIMARY KEY(fingerprint,identity_id));
 CREATE INDEX IF NOT EXISTS claude_lineage_identity ON claude_lineage(identity_id);
+CREATE TABLE IF NOT EXISTS channels(name TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS channel_members(
+  channel TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(channel,session_id));
+CREATE INDEX IF NOT EXISTS channel_members_identity ON channel_members(session_id,channel);
 CREATE TABLE IF NOT EXISTS human_read_positions(
   scope TEXT NOT NULL, stream_key TEXT NOT NULL, position INTEGER NOT NULL,
   reminder INTEGER, version INTEGER NOT NULL DEFAULT 0,
@@ -123,6 +127,7 @@ export class Store {
     this.initializeReadPositions();
     this.initializeInboxPositions();
     this.migrateIdentityRole();
+    this.migrateChannels();
   }
 
   transaction<T>(fn: () => T): T {
@@ -330,6 +335,15 @@ export class Store {
     if (!columns.some((column) => column.name === "role")) this.db.exec("ALTER TABLE session_identities ADD COLUMN role TEXT");
   }
 
+  private migrateChannels(): void {
+    if (this.meta("channel_roster_rollout") !== undefined) return;
+    this.transaction(() => {
+      this.db.run("INSERT OR IGNORE INTO channels(name) SELECT DISTINCT channel FROM messages WHERE channel IS NOT NULL");
+      this.db.run("INSERT OR IGNORE INTO channels(name) SELECT stream_key FROM human_read_positions WHERE scope='channel'");
+      this.setMeta("channel_roster_rollout", 1);
+    });
+  }
+
   deliveryWatermark(): number {
     return this.meta("delivery_sequence") ?? 0;
   }
@@ -397,10 +411,17 @@ export class Store {
   }
 
   /** Moves a provisional conversation into its recognized ancestor, without changing ancestor policy. */
-  mergeClaudeIdentity(provisionalId: string, ancestorId: string): { droppedReminder?: number } {
+  mergeClaudeIdentity(provisionalId: string, ancestorId: string): { channels: ChannelSummary[]; droppedReminder?: number } {
     return this.transaction(() => {
       const provisional = this.identity(provisionalId)!;
       const ancestor = this.identity(ancestorId)!;
+      const channels = this.db.all<{ channel: string }>("SELECT channel FROM channel_members WHERE session_id=?", provisionalId);
+      this.db.run("UPDATE session_identities SET role=COALESCE(role,?) WHERE id=?", provisional.role ?? null, ancestorId);
+      this.db.run(
+        "INSERT OR IGNORE INTO channel_members(channel,session_id) SELECT channel,? FROM channel_members WHERE session_id=?",
+        ancestorId, provisionalId,
+      );
+      this.db.run("DELETE FROM channel_members WHERE session_id=?", provisionalId);
       const previous = [...ancestor.previousNames];
       for (const name of [...provisional.previousNames, provisional.name]) {
         if (name !== ancestor.name && !previous.includes(name)) previous.push(name);
@@ -436,8 +457,11 @@ export class Store {
       this.db.run("DELETE FROM human_read_positions WHERE scope='session' AND stream_key=?", provisionalId);
       this.db.run("DELETE FROM sessions WHERE id=?", provisionalId);
       this.db.run("DELETE FROM session_identities WHERE id=?", provisionalId);
-      return ancestorRead?.reminder != null && oldRead?.reminder != null && ancestorRead.reminder !== oldRead.reminder
-        ? { droppedReminder: oldRead.reminder } : {};
+      return {
+        channels: channels.map((row) => this.channelSummary(row.channel)),
+        ...(ancestorRead?.reminder != null && oldRead?.reminder != null && ancestorRead.reminder !== oldRead.reminder
+          ? { droppedReminder: oldRead.reminder } : {}),
+      };
     });
   }
 
@@ -562,11 +586,63 @@ export class Store {
     });
   }
 
+  hasChannel(name: string): boolean {
+    return this.db.get("SELECT 1 FROM channels WHERE name=?", name) !== undefined;
+  }
+
+  createChannel(name: string): boolean {
+    const created = this.db.run("INSERT OR IGNORE INTO channels(name) VALUES(?)", name).changes > 0;
+    this.ensureRead({ scope: "channel", channel: name });
+    return created;
+  }
+
+  channelMembers(name: string): SessionIdentity[] {
+    return this.db.all<IdentityRow>(
+      `SELECT i.* FROM session_identities i JOIN channel_members m ON m.session_id=i.id
+       WHERE m.channel=? ORDER BY i.created_at,i.id`, name,
+    ).map(toIdentity);
+  }
+
+  private channelMemberIds(name: string): string[] {
+    const rows = this.db.all<{ id: string }>(
+      `SELECT i.id FROM session_identities i JOIN channel_members m ON m.session_id=i.id
+       WHERE m.channel=? ORDER BY i.created_at,i.id`, name,
+    );
+    return rows.map((row) => row.id);
+  }
+
+  isChannelMember(name: string, sessionId: string): boolean {
+    return this.db.get("SELECT 1 FROM channel_members WHERE channel=? AND session_id=?", name, sessionId) !== undefined;
+  }
+
+  shareChannel(first: string, second: string): boolean {
+    return this.db.get(
+      `SELECT 1 FROM channel_members a JOIN channel_members b ON b.channel=a.channel
+       WHERE a.session_id=? AND b.session_id=? LIMIT 1`, first, second,
+    ) !== undefined;
+  }
+
+  addChannelMember(name: string, sessionId: string): boolean {
+    return this.db.run("INSERT OR IGNORE INTO channel_members(channel,session_id) VALUES(?,?)", name, sessionId).changes > 0;
+  }
+
+  removeChannelMember(name: string, sessionId: string): boolean {
+    return this.db.run("DELETE FROM channel_members WHERE channel=? AND session_id=?", name, sessionId).changes > 0;
+  }
+
+  channelSummary(name: string): ChannelSummary {
+    const summary = this.db.get<{ count: number; lastAt: number; lastOrder: number }>(
+      `SELECT count(*) AS count,COALESCE(max(created_at),0) AS lastAt,COALESCE(max(ord),0) AS lastOrder
+       FROM messages WHERE channel=?`, name,
+    )!;
+    return { name, ...summary, memberIds: this.channelMemberIds(name) };
+  }
+
   channelSummaries(): ChannelSummary[] {
     return this.db.all<{ name: string; count: number; lastAt: number; lastOrder: number }>(
-      `SELECT channel AS name,count(*) AS count,max(created_at) AS lastAt,max(ord) AS lastOrder
-       FROM messages WHERE channel IS NOT NULL GROUP BY channel ORDER BY lastOrder DESC`,
-    );
+      `SELECT c.name,count(m.id) AS count,COALESCE(max(m.created_at),0) AS lastAt,COALESCE(max(m.ord),0) AS lastOrder
+       FROM channels c LEFT JOIN messages m ON m.channel=c.name GROUP BY c.name ORDER BY lastOrder DESC,c.name`,
+    ).map((summary) => ({ ...summary, memberIds: this.channelMemberIds(summary.name) }));
   }
 
   /** Latest retained direct-message order touching each stable identity, as sender or recipient. */
@@ -687,7 +763,7 @@ export class Store {
     };
   }
 
-  reconcileReads(cutoff: number): { states: ReadState[]; removedPositions: number; removedIdentities: number } {
+  reconcileReads(cutoff: number): { states: ReadState[]; channels: ChannelSummary[]; removedPositions: number; removedIdentities: number } {
     const changed: ReadScope[] = [];
     for (const row of this.db.all<ReadRow>("SELECT * FROM human_read_positions WHERE reminder IS NOT NULL")) {
       const scope: ReadScope = row.scope === "session"
@@ -701,27 +777,38 @@ export class Store {
         changed.push(scope);
       }
     }
-    let removedPositions = this.db.run(
-      `DELETE FROM human_read_positions WHERE scope='channel'
-       AND NOT EXISTS(SELECT 1 FROM messages WHERE channel=human_read_positions.stream_key)`,
-    ).changes;
-    removedPositions += this.db.run(
+    const removedPositions = this.db.run(
       `DELETE FROM human_read_positions WHERE scope='session'
        AND EXISTS(SELECT 1 FROM session_identities WHERE id=human_read_positions.stream_key AND state='removed' AND removed_at<?)
        AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=human_read_positions.stream_key OR to_session=human_read_positions.stream_key)`,
       cutoff,
     ).changes;
-    const removedIdentities = this.db.run(
-      `DELETE FROM session_identities WHERE state='removed' AND removed_at<?
-       AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=session_identities.id OR to_session=session_identities.id)`,
-      cutoff,
-    ).changes;
-    this.db.run(
-      "DELETE FROM session_harness_ids WHERE NOT EXISTS(SELECT 1 FROM session_identities WHERE id=session_harness_ids.identity_id)",
-    );
-    this.db.run(
-      "DELETE FROM claude_lineage WHERE NOT EXISTS(SELECT 1 FROM session_identities WHERE id=claude_lineage.identity_id)",
-    );
+    const removed = this.transaction(() => {
+      const channels = this.db.all<{ channel: string }>(
+        `SELECT DISTINCT m.channel FROM channel_members m JOIN session_identities i ON i.id=m.session_id
+         WHERE i.state='removed' AND i.removed_at<?
+         AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=i.id OR to_session=i.id)`,
+        cutoff,
+      );
+      this.db.run(
+        `DELETE FROM channel_members WHERE session_id IN (
+         SELECT id FROM session_identities WHERE state='removed' AND removed_at<?
+         AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=session_identities.id OR to_session=session_identities.id))`,
+        cutoff,
+      );
+      const identities = this.db.run(
+        `DELETE FROM session_identities WHERE state='removed' AND removed_at<?
+         AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=session_identities.id OR to_session=session_identities.id)`,
+        cutoff,
+      ).changes;
+      this.db.run(
+        "DELETE FROM session_harness_ids WHERE NOT EXISTS(SELECT 1 FROM session_identities WHERE id=session_harness_ids.identity_id)",
+      );
+      this.db.run(
+        "DELETE FROM claude_lineage WHERE NOT EXISTS(SELECT 1 FROM session_identities WHERE id=claude_lineage.identity_id)",
+      );
+      return { channels: channels.map((row) => this.channelSummary(row.channel)), identities };
+    });
     const states: ReadState[] = [];
     for (const scope of changed) {
       const key = scope.scope === "session" ? scope.sessionId : scope.channel;
@@ -731,6 +818,6 @@ export class Store {
       );
       if (row) states.push(this.readStateFromRow(row));
     }
-    return { states, removedPositions, removedIdentities };
+    return { states, channels: removed.channels, removedPositions, removedIdentities: removed.identities };
   }
 }

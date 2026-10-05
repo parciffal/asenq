@@ -308,6 +308,9 @@ export function activitySpans(item: PositionedEvent, names: (id: string) => stri
     const style = event.action === "gone" ? theme.warn : event.action === "removed" ? theme.dim : theme.ok;
     return [position, { text: "session  ", style: theme.accent }, { text: `${event.action} `, style }, { text: detail, style: theme.bold }, { text: `  ${event.harness}`, style: theme.dim }];
   }
+  if (event.type === "channel") {
+    return [position, { text: "channel  ", style: theme.accent }, { text: `${event.action} #${event.channel.name}`, style: theme.bold }, { text: `  ${event.channel.memberIds?.length ?? 0} members`, style: theme.dim }];
+  }
   if (event.type === "read") {
     const scope = event.state.scope;
     const stream = scope.scope === "session" ? names(scope.sessionId) ?? scope.sessionId : `#${scope.channel}`;

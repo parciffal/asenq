@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { AsenqClient } from "../src/shared/client.js";
-import type { SendResult, StoredMessage } from "../src/shared/protocol.js";
+import { GRACE_MS, type SendResult, type SessionIdentity, type StoredMessage } from "../src/shared/protocol.js";
 import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
@@ -27,8 +27,10 @@ type Console = {
   rows(): string[];
   frame(): TerminalFrame;
   press(name: string): Promise<void>;
+  burst(keys: string[]): Promise<void>;
   click(column: number, row?: number): Promise<void>;
   paste(text: string): Promise<void>;
+  resize(columns: number, rows: number): Promise<void>;
   close(): void;
   type(text: string): Promise<void>;
   until(predicate: () => boolean | Promise<boolean>, what: string): Promise<void>;
@@ -60,12 +62,24 @@ async function startConsole(columns: number, rows: number, client?: ConsoleDeps[
       handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: name.startsWith("CTRL_"), alt: false, shift: name.startsWith("SHIFT_") });
       await app.idle();
     },
+    async burst(keys) {
+      for (const name of keys) {
+        const text = [...name].length === 1 ? name : undefined;
+        handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: name.startsWith("CTRL_"), alt: false, shift: name.startsWith("SHIFT_") });
+      }
+      await app.idle();
+    },
     async click(column, row = 0) {
       handlers.onMouse?.({ name: "MOUSE_LEFT_BUTTON_PRESSED", column, row, action: "press", button: "left", ctrl: false, alt: false, shift: false });
       await app.idle();
     },
     async paste(text) {
       handlers.onPaste?.(text);
+      await app.idle();
+    },
+    async resize(columns, rows) {
+      Object.assign(size, { columns, rows });
+      handlers.onResize?.(size);
       await app.idle();
     },
     close: () => handlers.onInterrupt?.(),
@@ -627,6 +641,127 @@ test("human role form updates the selected session through protocol events and c
     assert.equal(sessions.find((session) => session.name === "bravo")!.role, null, "another session is unchanged");
     assertWithin(ui);
   }
+});
+
+test("channel rosters show shared identities and follow name, role and lifecycle updates without posts", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "roster-alpha", "alpha");
+  await env.adapter("omp", "roster-bravo", "bravo");
+  await env.adapter("omp", "roster-charlie", "charlie");
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await human.request("set_role", { name: "bravo", role: "worker" });
+  await human.request("channel_create", { channel: "one" });
+  await human.request("channel_create", { channel: "two" });
+  for (const name of ["alpha", "bravo", "charlie"]) await human.request("channel_add", { channel: "one", name });
+  await human.request("channel_add", { channel: "two", name: "alpha" });
+  const ui = await startConsole(120, 22);
+  await ui.press("#");
+  const listRows = (): string[] => {
+    const width = paneWidths(ui.size.columns)?.list ?? ui.size.columns;
+    return ui.rows().map((row) => truncateTerminalText(row, width));
+  };
+  assert.equal(listRows().filter((row) => row.includes("alpha") && row.includes("orch") && row.includes("live")).length, 2);
+  assert.ok(listRows().some((row) => row.includes("bravo") && row.includes("wrk") && row.includes("live")));
+  assert.ok(listRows().some((row) => row.includes("charlie") && row.includes("unset") && row.includes("live")));
+  for (const columns of [79, 80, 120]) {
+    await ui.resize(columns, 22);
+    assert.ok(listRows().some((row) => row.includes("#one")));
+    assert.ok(listRows().some((row) => row.includes("#two")));
+    assertWithin(ui);
+  }
+  await human.request("rename", { from: "alpha", name: "renamed" });
+  await human.request("set_role", { name: "renamed", role: "worker" });
+  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("wrk")).length === 2, "both rosters update the same identity");
+  const gone = await env.watch((e) => e.type === "session" && e.action === "gone" && e.session.id === alpha.session.id);
+  alpha.client.close();
+  await gone.event;
+  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("gone")).length === 2, "both rosters show gone");
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("archived")).length === 2, "both rosters show archived");
+  assert.deepEqual((await human.request("channel_read", { channel: "one" })).messages, []);
+  assertWithin(ui);
+});
+
+test("channel palette edits and member hit targets keep delivery in channel scope and removal bound to identity", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "palette-alpha", "alpha");
+  const ui = await startConsole(120, 22);
+  const palette = async (action: string): Promise<void> => {
+    await ui.press("?");
+    await ui.type(action);
+    await ui.press("ENTER");
+  };
+  await palette("Create channel");
+  await ui.type("empty");
+  await ui.press("CTRL_D");
+  await ui.until(() => ui.rows().some((row) => row.includes("#empty")), "created empty channel appears without posting");
+  assert.deepEqual((await human.request("channel_read", { channel: "empty" })).messages, []);
+  await ui.press("a");
+  const created = ui.rows().findIndex((row) => row.includes("channel") && row.includes("#empty"));
+  assert.ok(created >= 1, "empty channel creation has its own activity row");
+  await ui.click(0, created);
+  await ui.press("c");
+  assert.ok(ui.rows().some((row) => row.includes("to #empty")), "opening a channel activity event keeps the channel composer");
+  await ui.press("ESCAPE");
+  await ui.press("#");
+  await palette("Add channel member");
+  await ui.press("TAB");
+  await ui.type("alpha");
+  await ui.press("CTRL_D");
+  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("unset") && row.includes("live")), "palette add renders roster event");
+
+  for (const columns of [79, 80, 120]) {
+    await ui.resize(columns, 22);
+    await ui.press("#");
+    const width = paneWidths(columns)?.list ?? columns;
+    const row = ui.rows().findIndex((row) => truncateTerminalText(row, width).includes("alpha"));
+    assert.ok(row >= 1);
+    await ui.click(columns >= 80 ? 1 : 0, row);
+    await ui.press("ENTER");
+    await ui.press("c");
+    await ui.type(`post-${columns}`);
+    await ui.press("ENTER");
+    const posts = (await human.request("channel_read", { channel: "empty" })).messages as StoredMessage[];
+    assert.ok(posts.some((post) => post.text === `post-${columns}` && post.from === "human"));
+    assert.deepEqual(alpha.deliveries, [], "selecting a member never targets a direct message");
+    assertWithin(ui);
+    await ui.press("ESCAPE");
+  }
+  await ui.press("#");
+  await ui.press("DOWN"); // select alpha's identity, not just the channel
+  await palette("Remove channel member");
+  await human.request("rename", { from: "alpha", name: "retired" });
+  const gone = await env.watch((e) => e.type === "session" && e.action === "gone" && e.session.id === alpha.session.id);
+  alpha.client.close();
+  await gone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const replacement = await env.adapter("omp", "palette-new-alpha", "alpha");
+  await human.request("channel_add", { channel: "empty", name: "alpha" });
+  await ui.press("CTRL_D");
+  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("live")) && !ui.rows().some((row) => row.includes("retired")), "remove event leaves the new identity visible");
+  const members = (await human.request("channel_members", { channel: "empty" })).members as SessionIdentity[];
+  assert.deepEqual(members.map((member) => member.id), [replacement.session.id], "removal follows selected identity through rename, archive and name reuse");
+  assertWithin(ui);
+});
+
+test("rapid removal palette input stays in its identity form instead of sending a direct message", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "rapid-remove-alpha", "alpha");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  const ui = await startConsole(80, 22);
+  await ui.press("#");
+  await ui.press("?");
+  await ui.type("Remove channel member");
+  await ui.burst(["ENTER", "TAB", "CTRL_U", ...alpha.session.id, "CTRL_D"]);
+  const members = (await human.request("channel_members", { channel: "work" })).members as SessionIdentity[];
+  assert.deepEqual(members, []);
+  assert.deepEqual(alpha.deliveries, [], "form input must never leak into a session composer");
 });
 
 test("rounded panes resize at the wide boundary without overflowing or moving mouse and cursor targets onto borders", async () => {
