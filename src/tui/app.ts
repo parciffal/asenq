@@ -549,16 +549,16 @@ export class ConsoleApp {
     return [{ text: long ? `${state.unread} unread${reminder} · ` : `+${state.unread}${reminder} · `, style: theme.unread }];
   }
 
-  private marker(selected: boolean, listFocused?: boolean): TerminalSpan {
+  private marker(selected: boolean, list = false): TerminalSpan {
     return {
-      text: listFocused === undefined ? (selected ? "› " : "  ") : selected && listFocused ? "▌ " : "  ",
+      text: selected ? (list ? "▌ " : "› ") : "  ",
       style: theme.accentBold,
     };
   }
 
   private entries(tab: Tab): Entry[] {
     const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.dim }]] });
-    const pick = (selected: boolean, focused: boolean) => selected && focused ? theme.selected : undefined;
+    const pick = (selected: boolean) => selected ? theme.selected : undefined;
     if (tab === "sessions") {
       const q = this.query.toLowerCase();
       const orders = this.sessionOrders;
@@ -567,14 +567,14 @@ export class ConsoleApp {
         .sort((a, b) => (orders[b.id] ?? 0) - (orders[a.id] ?? 0) || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
       const row = (s: SessionIdentity): Entry => ({
         key: `s:${s.id}`,
-        rows: (width, selected, focused) => {
+        rows: (width, selected) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
           const archived = s.state === "removed";
           const left: TerminalLine = [
-            this.marker(selected, focused),
+            this.marker(selected, true),
             { text: archived ? "  " : s.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : s.state === "live" ? theme.ok : theme.warn },
-            { text: s.name, style: selected && focused ? theme.brand : archived ? theme.dim : unread ? theme.bold : {} },
+            { text: s.name, style: selected ? theme.brand : archived ? theme.dim : unread ? theme.bold : {} },
             ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : []),
           ];
           const right: TerminalSpan[] = [{ text: harnessShortName(s.harness).padEnd(3), style: theme.dim }];
@@ -584,7 +584,7 @@ export class ConsoleApp {
           const badge = this.unreadSpans(`s:${s.id}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") }));
           if (badge.length) right.push({ text: " " }, ...badge);
           const detailWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-          const fill = pick(selected, focused);
+          const fill = pick(selected);
           // Keep complete metadata and a readable name even at the narrow split boundary.
           if (width < 4 + Math.min(3, terminalTextWidth(s.name)) + 1 + detailWidth) {
             return [padSpans(left, width, fill), justify([], right, width, fill)];
@@ -602,9 +602,9 @@ export class ConsoleApp {
         const open = this.archiveOpen || q !== "";
         result.push({
           key: "archive",
-          rows: (width, selected, focused) => [justify(
-            [this.marker(selected, focused), { text: `${open ? "▾" : "▸"} archive ${archived.length}`, style: theme.dim }],
-            [], width, pick(selected, focused),
+          rows: (width, selected) => [justify(
+            [this.marker(selected, true), { text: `${open ? "▾" : "▸"} archive ${archived.length}`, style: theme.dim }],
+            [], width, pick(selected),
           )],
         });
         if (open) result.push(...archived.map(row));
@@ -616,16 +616,16 @@ export class ConsoleApp {
         const key = summary.sessionId ? `i:${summary.sessionId}` : `i:n:${summary.name}`;
         return {
           key,
-          rows: (width, selected, focused) => {
+          rows: (width, selected) => {
             const unreadKey = summary.sessionId ? `s:${summary.sessionId}` : "";
             const preview = sanitizeTerminalText(renderMessageBody(summary.latest));
             return [
               justify(
-                [this.marker(selected, focused), { text: summary.name, style: selected && focused ? theme.brand : theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
+                [this.marker(selected, true), { text: summary.name, style: selected ? theme.brand : theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
                 [...this.unreadSpans(unreadKey), { text: formatTime(summary.latest.createdAt, Date.now(), true), style: theme.dim }],
-                width, pick(selected, focused),
+                width, pick(selected),
               ),
-              padSpans([{ text: "  " }, { text: ellipsize(preview, Math.max(0, width - 2)), style: theme.dim }], width, pick(selected, focused)),
+              padSpans([{ text: "  " }, { text: ellipsize(preview, Math.max(0, width - 2)), style: theme.dim }], width, pick(selected)),
             ];
           },
         };
@@ -635,10 +635,10 @@ export class ConsoleApp {
       return this.channels.flatMap((channel): Entry[] => [
         {
           key: `c:${channel.name}`,
-          rows: (width, selected, focused) => [justify(
-            [this.marker(selected, focused), { text: `#${channel.name}`, style: selected && focused ? theme.brand : theme.accentBold }],
+          rows: (width, selected) => [justify(
+            [this.marker(selected, true), { text: `#${channel.name}`, style: selected ? theme.brand : theme.accentBold }],
             this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
-            width, pick(selected, focused),
+            width, pick(selected),
           )],
         },
         ...(channel.memberIds ?? []).flatMap((id): Entry[] => {
@@ -646,7 +646,7 @@ export class ConsoleApp {
           if (!member) return [];
           return [{
             key: `m:${channel.name}:${id}`,
-            rows: (width, selected, focused) => {
+            rows: (width, selected) => {
               const archived = member.state === "removed";
               const role = member.role === "orchestrator" ? "orch" : member.role === "worker" ? "wrk" : "unset";
               const detail: TerminalSpan[] = [
@@ -656,12 +656,12 @@ export class ConsoleApp {
               ];
               if (member.inbound !== "accept") detail.push({ text: " " }, { text: member.inbound === "hold" ? "⏸" : "refuse", style: member.inbound === "hold" ? theme.warn : theme.bad });
               const label: TerminalLine = [
-                this.marker(selected, focused), { text: "  " },
+                this.marker(selected, true), { text: "  " },
                 { text: archived ? "  " : member.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : member.state === "live" ? theme.ok : theme.warn },
-                { text: member.name, style: selected && focused ? theme.brand : archived ? theme.dim : theme.agent },
+                { text: member.name, style: selected ? theme.brand : archived ? theme.dim : theme.agent },
               ];
               const detailWidth = detail.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-              const fill = pick(selected, focused);
+              const fill = pick(selected);
               if (width < 6 + Math.min(3, terminalTextWidth(member.name)) + 1 + detailWidth) {
                 return [padSpans(label, width, fill), justify([], detail, width, fill)];
               }
@@ -676,8 +676,8 @@ export class ConsoleApp {
       .filter((item) => this.activityFilter === "all" || isImportantEvent(item))
       .map((item) => ({
         key: `e:${item.position}`,
-        rows: (width, selected, focused) => [padSpans(
-          [this.marker(selected, focused), ...activitySpans(item, names)], width, pick(selected, focused),
+        rows: (width, selected) => [padSpans(
+          [this.marker(selected, true), ...activitySpans(item, names)], width, pick(selected),
         )],
       }));
   }
