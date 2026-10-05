@@ -12,7 +12,7 @@ export function renderInbound(msg: WireMsg, role?: Role): string {
   if (msg.kind) meta += ` · kind=${msg.kind}`;
   if (msg.kind === "control") meta += ` · action=${msg.action}`;
   if (msg.thread) meta += ` · thread=${msg.thread}`;
-  if (msg.replyTo) meta += ` · reply-to=${msg.replyTo}`;
+  if (msg.replyTo) meta += ` · reply-to=${msg.replyTo}${msg.replyToMissing ? " (purged message)" : ""}`;
   if (msg.done) meta += " · done";
   if (role) meta += ` · your-role=${role}`;
   let footer: string;

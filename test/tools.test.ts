@@ -634,3 +634,43 @@ test("capped inbox preserves file metadata when oversized thread metadata is omi
   assert.ok(output.includes("2cf24dba5fb0"));
   assert.ok(output.includes(`asenq_inbox id=${msg.id}`));
 });
+
+test("purge preserves sender notices and marks missing reply targets in inbox and thread output", async () => {
+  env = await startEnv();
+  const sender = await env.adapter("omp", "notice-sender", "notice-sender");
+  const target = await env.adapter("omp", "notice-target", "notice-target");
+  const human = env.human();
+  await human.request("set_inbound", { name: target.session.name, mode: "hold" });
+  const original = await send(sender.client, target.session.name, "Waiting for the archived worker");
+  await human.request("close", { identity: target.session.id });
+  const notice = await sender.nextDelivery();
+  assert.equal(notice.msg.replyTo, original);
+  await send(sender.client, "human", "Retained follow-up", { thread: "purged-follow-up", replyTo: original });
+  assert.ok(!(await callTool(sender.client, "asenq_thread_read", { thread: "purged-follow-up" })).includes("(purged message)"));
+
+  await human.request("purge", { identity: target.session.id });
+  const inbox = await callTool(sender.client, "asenq_inbox", { unread_only: false });
+  assert.ok(inbox.includes(notice.msg.id), "the live sender keeps its delivery notice");
+  assert.ok(inbox.includes("(purged message)"), "inbox displays the missing notice target");
+  const thread = await callTool(sender.client, "asenq_thread_read", { thread: "purged-follow-up" });
+  assert.ok(thread.includes("Retained follow-up"));
+  assert.ok(thread.includes("(purged message)"), "thread recovery displays the missing target");
+});
+
+test("reply availability cannot reveal a message outside the caller's direct scope", async () => {
+  env = await startEnv();
+  const reader = await env.adapter("omp", "reply-reader", "reply-reader");
+  const privateSender = await env.adapter("omp", "private-sender", "private-sender");
+  const privateReceiver = await env.adapter("omp", "private-receiver", "private-receiver");
+  const privateId = await send(privateSender.client, privateReceiver.session.name, "Private body");
+  for (const replyTo of [privateId, "m_000000000000"]) {
+    await send(reader.client, "human", `Reference ${replyTo}`, { thread: "unavailable-replies", replyTo });
+  }
+  const result = await reader.client.request("thread_read", { thread: "unavailable-replies" });
+  const messages = result.messages as { replyTo: string; replyToMissing?: boolean }[];
+  assert.deepEqual(messages.map((message) => message.replyTo), [privateId, "m_000000000000"]);
+  assert.ok(messages.every((message) => message.replyToMissing === true));
+  const output = await callTool(reader.client, "asenq_thread_read", { thread: "unavailable-replies" });
+  assert.equal(output.match(/\(purged message\)/g)?.length, 2);
+  assert.ok(!output.includes("Private body"));
+});
