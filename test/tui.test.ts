@@ -2154,3 +2154,75 @@ test("channel mention picker uses the pinned opening boundary for typing and pas
   assert.deepEqual(posts.map((post) => post.text), expected);
   assertWithin(ui);
 });
+
+test("design A session sections expose state, harness, roles, policy and focused identity", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "restyle-alpha", "alpha");
+  const beta = await env.adapter("opencode", "restyle-beta", "beta");
+  const retired = await env.adapter("claude", "restyle-retired", "retired");
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await human.request("set_role", { name: "beta", role: "worker" });
+  await retired.client.request("send", { to: "human", text: "retained archive" });
+  await retired.client.request("unregister");
+  await alpha.client.request("send", { to: "human", text: "unread live message" });
+  await human.request("set_inbound", { name: "alpha", mode: "hold" });
+  const gone = await env.watch((event) => event.type === "session" && event.action === "gone" && event.name === "beta");
+  beta.client.close();
+  await gone.event;
+  const ui = await startConsole(120, 32);
+  const listWidth = paneWidths(120)!.list;
+  const list = ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  assert.ok(list.some((row) => row.includes("LIVE")));
+  assert.ok(list.some((row) => row.includes("RECONNECTING")));
+  assert.ok(list.some((row) => /▸ archive\s+1/.test(row)));
+  const alphaRow = list.findIndex((row) => row.includes("alpha"));
+  assert.ok(list[alphaRow].includes("▌") && list[alphaRow].includes("●") && list[alphaRow].includes("⏸"));
+  assert.match(list[alphaRow], /omp.*orch/);
+  assert.ok(list.some((row) => row.includes("◌") && row.includes("beta") && row.includes("oc") && row.includes("wrk")));
+  const alphaSpans = normalizeTerminalLine(ui.frame().lines[alphaRow], ui.size.columns);
+  assert.ok(alphaSpans.some((span) => span.text.includes("alpha") && span.style?.foreground === "brightCyan" && span.style.bold));
+  assert.ok(alphaSpans.some((span) => span.text.includes("orch") && span.style?.inverse));
+  assert.ok(list.some((row) => row.includes("/ filter sessions")));
+  assert.equal(await unread(human, alpha.session.id), 1, "styling a selected list row never marks it read");
+  assertWithin(ui);
+});
+
+test("design A transcript separates status and kind, counts unread and compacts only agent exchanges", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "restyle-chat-alpha", "alpha");
+  const peer = await env.adapter("omp", "restyle-chat-beta", "beta");
+  await human.sendToSession(alpha.session.id, "human-out-full");
+  await alpha.client.request("send", { to: "human", text: "human-in-full" });
+  await alpha.client.request("send", { to: "beta", text: "compact-first", kind: "task" });
+  await peer.client.request("send", { to: "alpha", text: "compact-second", kind: "result" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  const rows = ui.rows();
+  assert.ok(rows.some((row) => /you → alpha\s{2,}✓ delivered/.test(row)));
+  assert.ok(rows.some((row) => row.includes("alpha → you")));
+  const divider = rows.findIndex((row) => row.includes("1 new") && row.includes("┄"));
+  assert.ok(divider >= 0);
+  const firstBody = rows.findIndex((row) => row.includes("compact-first"));
+  const secondHeader = rows.findIndex((row) => row.includes("beta → alpha"));
+  assert.equal(secondHeader, firstBody + 1, "adjacent agent exchanges have no blank spacer");
+  for (const text of ["compact-first", "compact-second"]) {
+    const row = rows.findIndex((value) => value.includes(text));
+    assert.ok(normalizeTerminalLine(ui.frame().lines[row], ui.size.columns).some((span) => span.text.includes(text) && span.style?.dim));
+  }
+  for (const text of ["human-out-full", "human-in-full"]) {
+    const row = rows.findIndex((value) => value.includes(text));
+    assert.ok(normalizeTerminalLine(ui.frame().lines[row], ui.size.columns).some((span) => span.text.includes(text) && !span.style?.dim));
+  }
+  const taskHeader = rows.findIndex((row) => row.includes("alpha → beta"));
+  assert.ok(normalizeTerminalLine(ui.frame().lines[taskHeader], ui.size.columns).some((span) => span.text.includes("task") && span.style?.inverse && span.style.foreground === "yellow"));
+  assert.equal(await unread(human, alpha.session.id), 1, "visible list preview and new-divider preserve unread");
+  await ui.press("ENTER");
+  assert.equal(await unread(human, alpha.session.id), 0);
+  await ui.press("u");
+  assert.equal(await unread(human, alpha.session.id), 1, "explicit unread reminder survives the restyle");
+  assertWithin(ui);
+});
