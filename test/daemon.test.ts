@@ -3642,7 +3642,7 @@ test("purging an old terminal identity leaves the replacement harness associatio
 });
 
 test("late Claude lineage carries durable provisional direct activity after its original messages were retained away", async () => {
-  env = await startEnv({ historyDays: 1 });
+  env = await startEnv({ historyDays: 1, queueTtlMs: 7 * 86_400_000 });
   const human = env.human();
   const originalPath = join(env.home, "activity-ancestor.jsonl");
   const latePath = join(env.home, "activity-late.jsonl");
