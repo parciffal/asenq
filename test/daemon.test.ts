@@ -14,6 +14,7 @@ import { GRACE_MS, type SendResult, type SessionIdentity, type StoredMessage, ty
 import { renderInbound } from "../src/shared/render.js";
 import { isStaleSession } from "../src/shared/sessions.js";
 import { openDb } from "../src/shared/sqlite.js";
+import { callTool } from "../src/shared/tools.js";
 import { isSession, isStatus, logOf, startEnv, type Delivery, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
@@ -1690,7 +1691,7 @@ for (const harness of ["claude", "omp"] as const) {
 }
 
 test("pending queued and held messages retain a removed identity beyond its no-traffic retention window", async () => {
-  env = await startEnv({ historyDays: 7 });
+  env = await startEnv({ historyDays: 7, ...{ queueTtlMs: 10 * 86_400_000 } });
   let human = env.human();
   const sender = await env.adapter("omp", "sender", "sender");
   const original = await env.adapter("omp", "retained-key", "niche-manager");
@@ -2632,7 +2633,12 @@ test("renames preserve identity, removed history is archived, and same-name reus
   const newHistory = await human.historyPage({ scope: "session", sessionId: replacement.session.id });
   assert.deepEqual(oldHistory.messages.map((message) => message.id), [originalMessage.msgId]);
   assert.deepEqual(newHistory.messages, []);
-  await assert.rejects(human.sendToSession(original.session.id, "must not retarget"), /removed or unknown/);
+  const queued = await human.sendToSession(original.session.id, "must not retarget");
+  assert.equal(queued.status, "queued");
+  assert.deepEqual(replacement.deliveries, []);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+    (message) => [message.id, message.toSessionId, message.status],
+  ), [[originalMessage.msgId, original.session.id, "delivered"], [queued.msgId, original.session.id, "queued"]]);
   assert.equal((await human.sendToSession(replacement.session.id, "new identity")).status, "delivered");
 });
 
@@ -4012,4 +4018,115 @@ test("deadline pongs without a prior sweep expire rather than revive the target"
   await alpha.client.request("pong", { pingId: ping.pingId });
   assert.deepEqual((await pending).results, [{ sessionId: alpha.session.id, name: "alpha", ping: "not_responding" }]);
   assert.equal((await human.sync()).sessionPings[alpha.session.id], "not_responding");
+});
+
+test("new sends after grace removal queue by current name and stable id and revive after database reopen", async () => {
+  env = await startEnv();
+  let human = env.human();
+  const original = await env.adapter("omp", "offline-key", "offline");
+  const gone = await env.watch(isSession("gone", "offline"));
+  original.client.close();
+  await gone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const [byName] = await send(human, "offline", "sent after removal by name");
+  const byId = await human.sendToSession(original.session.id, "sent after removal by id");
+  assert.deepEqual([byName.status, byId.status], ["queued", "queued"]);
+  assert.deepEqual((await send(human, "never-registered", "unknown"))[0].status, "unknown_target");
+  await env.restart();
+  human = env.human();
+  const holder = await env.adapter("omp", "new-holder", "offline");
+  assert.notEqual(holder.session.id, original.session.id);
+  assert.deepEqual(holder.deliveries, []);
+  const delivered = await env.watch(isStatus(byId.msgId, "delivered"));
+  const revived = await env.adapter("omp", "offline-key", "ignored");
+  assert.equal(revived.session.id, original.session.id);
+  assert.notEqual(revived.session.name, holder.session.name);
+  await delivered.event;
+  assert.deepEqual(revived.deliveries.map((delivery) => delivery.msg.id), [byName.msgId, byId.msgId]);
+  assert.deepEqual(holder.deliveries, []);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+    (message) => [message.id, message.toSessionId, message.status],
+  ), [[byName.msgId, original.session.id, "delivered"], [byId.msgId, original.session.id, "delivered"]]);
+});
+
+test("queued messages expire at exactly the default 24-hour boundary with one live sender notice", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  const gone = await env.watch(isSession("gone", "receiver"));
+  receiver.client.close();
+  await gone.event;
+  const [queued] = await send(sender.client, "receiver", "expires after one day");
+  assert.equal(queued.status, "queued");
+  env.clock.advance(86_400_000 - 1);
+  env.daemon.sweep();
+  assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+  assert.deepEqual(sender.deliveries, []);
+  const expired = await env.watch(isStatus(queued.msgId, "expired"));
+  env.clock.advance(1);
+  env.daemon.sweep();
+  await expired.event;
+  const notice = await sender.nextDelivery();
+  assert.deepEqual([notice.msg.from, notice.msg.kind, notice.msg.replyTo], ["asenq", "status", queued.msgId]);
+  assert.ok(notice.text.includes(queued.msgId!));
+  assert.equal((await logOf(human, queued.msgId!)).status, "expired");
+  env.daemon.sweep();
+  await sender.client.request("inbox");
+  assert.deepEqual(sender.deliveries.map((delivery) => delivery.msg.replyTo), [queued.msgId]);
+});
+
+test("a delivered reciprocal reply is retained as replied in history, inbox recovery and MCP output", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  const [original] = await send(sender.client, "receiver", "question", { thread: "work" });
+  assert.equal(original.status, "delivered");
+  const before = await human.sync();
+  const [reply] = await send(receiver.client, "sender", "answer", { replyTo: original.msgId });
+  assert.equal(reply.status, "delivered");
+  const history = await human.historyPage({ scope: "session", sessionId: sender.session.id });
+  assert.deepEqual(history.messages.map((message) => [message.id, message.status]), [
+    [original.msgId, "replied"], [reply.msgId, "delivered"],
+  ]);
+  for (const participant of [sender.client, receiver.client]) {
+    const recovered = (await participant.request("inbox", { msgId: original.msgId })).messages as StoredMessage[];
+    assert.deepEqual(recovered.map((message) => [message.id, message.status]), [[original.msgId, "replied"]]);
+    const rendered = await callTool(participant, "asenq_inbox", { id: original.msgId });
+    assert.ok(rendered.includes(original.msgId!));
+    assert.match(rendered, /\breplied\b/);
+  }
+  const replay = await human.replay(before.watermark);
+  assert.ok(replay.events.some(({ event }) =>
+    event.type === "message" && event.msg.id === original.msgId && event.status === "replied"));
+});
+
+test("sync failedCount increments on direct expiry and decrements when retained messages are pruned", async () => {
+  env = await startEnv({ historyDays: 7, ...{ queueTtlMs: 1000 } });
+  const human = env.human();
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  assert.equal((await human.request("sync")).failedCount, 0);
+  const gone = await env.watch(isSession("gone", "receiver"));
+  receiver.client.close();
+  await gone.event;
+  const [queued] = await send(human, "receiver", "short-lived queue");
+  const before = await human.sync();
+  env.clock.advance(999);
+  env.daemon.sweep();
+  assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+  assert.equal((await human.request("sync")).failedCount, 0);
+  env.clock.advance(1);
+  env.daemon.sweep();
+  assert.equal((await logOf(human, queued.msgId!)).status, "expired");
+  assert.equal((await human.request("sync")).failedCount, 1);
+  const expired = (await human.replay(before.watermark)).events.find(({ event }) =>
+    event.type === "message" && event.msg.id === queued.msgId && event.status === "expired")?.event;
+  assert.ok(expired && "failedCount" in expired);
+  assert.equal(expired.failedCount, 1);
+  env.clock.advance(8 * 86_400_000);
+  env.daemon.prune();
+  assert.equal((await human.request("sync")).failedCount, 0);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: receiver.session.id })).messages, []);
 });
