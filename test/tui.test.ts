@@ -246,6 +246,39 @@ test("stale held actions refresh without consuming the next message or a newly o
   assertWithin(ui);
 });
 
+test("archived conversation keeps held controls while release queues until the same identity revives", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "archived-held-sender", "orch");
+  const target = await env.adapter("omp", "archived-held-target", "worker");
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
+  const [drop] = (await sender.client.request("send", { to: "worker", text: "archived-drop-preview" })).results as SendResult[];
+  const [release] = (await sender.client.request("send", { to: "worker", text: "archived-release-preview" })).results as SendResult[];
+  await target.client.request("unregister");
+  const ui = await startConsole(120, 32);
+  await ui.press("CTRL_K");
+  await ui.type("worker");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("archived · read only")), "archived conversation opened");
+  assert.ok(ui.rows().some((row) => row.includes("⏸ held 2") && row.includes("archived-drop-preview")));
+  assert.equal(ui.frame().cursor, undefined, "archived conversation has no editable composer");
+  assert.ok(!ui.rows().some((row) => row.includes("Write to worker")));
+  await ui.press("x");
+  assert.equal((await logOf(human, drop.msgId!)).status, "dropped");
+  await ui.until(() => ui.rows().some((row) => row.includes("⏸ held") && row.includes("archived-release-preview")), "next archived held preview");
+  await ui.press("r");
+  assert.equal((await logOf(human, release.msgId!)).status, "queued");
+  assert.equal(target.deliveries.length, 0, "release cannot deliver to the removed transport");
+  assert.ok(!ui.rows().some((row) => row.includes("⏸ held")));
+  assert.match(ui.rows()[0], /0 held/);
+  const revived = await env.adapter("omp", "archived-held-target", "ignored-name");
+  assert.equal(revived.session.id, target.session.id);
+  await ui.until(() => revived.deliveries.length === 1, "queued release delivered on revival");
+  assert.equal((await revived.nextDelivery()).msg.id, release.msgId);
+  assert.equal((await logOf(human, release.msgId!)).status, "delivered");
+  assertWithin(ui);
+});
+
 test("header hydrates held messages and follows hold, release, drop, removal and revival", async () => {
   env = await startEnv();
   const human = env.human();

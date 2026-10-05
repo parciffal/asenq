@@ -1056,8 +1056,10 @@ export class ConsoleApp {
     if (titled) rows.push(this.title(width, narrow, y0, x0));
     if (this.panel) return this.panelPane(rows, width, height, y0, x0);
     const target = this.composeTarget();
+    const scope = this.scope();
     const available = height - rows.length;
-    const held = target?.kind === "session" ? this.heldForSession(target.id) : undefined;
+    // Held controls follow the viewed identity, including read-only archived conversations.
+    const held = scope?.scope === "session" ? this.heldForSession(scope.sessionId) : undefined;
     // Reserve one transcript row and the editor's input before held chrome. A full bar
     // needs three rows; short panes use one, and the smallest panes hide it entirely.
     const heldRows = held ? heldBar(held.message, held.count, width, available >= 8 ? 3 : available >= 3 ? 1 : 0) : [];
@@ -1068,7 +1070,6 @@ export class ConsoleApp {
     if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, Math.max(1, composerRoom - heldRows.length)), x0);
     const transcriptHeight = height - rows.length - heldRows.length - (composer?.rows.length ?? 0);
     const transcriptY = y0 + rows.length;
-    const scope = this.scope();
     let body: TerminalLine[];
     if (!scope) {
       const text = this.connection === "offline" && !this.sessions.length
