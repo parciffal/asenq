@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import type { AsenqClient } from "../src/shared/client.js";
+import { AsenqClient } from "../src/shared/client.js";
 import type { StoredMessage } from "../src/shared/protocol.js";
-import { ConsoleApp } from "../src/tui/app.js";
+import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
   changedTerminalRows, normalizeTerminalLine, terminalTextWidth, translateKeyboardInput, truncateTerminalText, wrapTerminalText,
   type TerminalAdapterOptions, type TerminalFrame, type TerminalLine, type TerminalSize,
 } from "../src/tui/terminal.js";
-import { startEnv, type TestEnv } from "./helpers.js";
+import { logOf, startEnv, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 let open: Console | undefined;
@@ -38,11 +38,12 @@ const lineText = (line: TerminalLine | undefined): string =>
   line === undefined ? "" : typeof line === "string" ? line : line.map((span) => span.text).join("");
 
 /** Runs the real ui against the test daemon with a recording screen instead of a TTY. */
-async function startConsole(columns: number, rows: number): Promise<Console> {
+async function startConsole(columns: number, rows: number, client?: ConsoleDeps["client"]): Promise<Console> {
   let handlers: TerminalAdapterOptions = {};
   let frame: TerminalFrame = { lines: [] };
   const size = { columns, rows };
   const app = new ConsoleApp({
+    ...(client ? { client } : {}),
     screen: (options) => {
       handlers = options;
       return { size, start() {}, render(next) { frame = next; }, cleanup() {} };
@@ -115,7 +116,144 @@ test("file-only direct messages show the summary and path in transcript rows", a
   assertWithin(ui);
 });
 
-test("header hydrates held messages and follows hold, release, drop, removal and revival", async () => {
+test("held shortcuts retain search, palette and form typing and cannot act from hidden surfaces", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-typing-sender", "alpha");
+  const target = await env.adapter("omp", "held-typing-target", "rx-target");
+  await human.request("set_inbound", { name: "rx-target", mode: "hold" });
+  const reply = await sender.client.request("send", { to: "rx-target", text: "await human decision" });
+  const msgId = (reply.results as { msgId: string }[])[0].msgId;
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("rx");
+  assert.ok(ui.rows().some((row) => row.includes("/ rx")), "r and x enter the session filter");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("⏸") && row.includes("held")), "target bar is visible before opening overlays");
+
+  await ui.press("?");
+  await ui.type("rx");
+  assert.ok(ui.rows().some((row) => row.startsWith("? rx")), "r and x enter the palette filter");
+  await ui.press("ESCAPE");
+  await ui.press("CTRL_E");
+  await ui.type("rx");
+  await ui.press("CTRL_D");
+  assert.equal((await target.nextDelivery()).msg.text, "rx", "form typing reaches the target as a human message");
+  assert.equal((await logOf(human, msgId)).status, "held");
+
+  await ui.press("a");
+  await ui.type("rx");
+  assert.equal((await logOf(human, msgId)).status, "held", "activity cannot act on the previous bar");
+  ui.size.columns = 60;
+  await ui.press("s");
+  await ui.type("rx");
+  assert.equal((await logOf(human, msgId)).status, "held", "narrow picker cannot act on a hidden bar");
+  assert.ok(!ui.rows().some((row) => row.includes("⏸") && row.includes("held")), "picker has no actionable bar");
+  assertWithin(ui);
+});
+
+test("held actions stay bound to the target identity across rename and name reuse", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-rename-sender", "alpha");
+  const target = await env.adapter("omp", "held-rename-target", "beta");
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  const first = await sender.client.request("send", { to: "beta", text: "first identity-held message" });
+  const second = await sender.client.request("send", { to: "beta", text: "second identity-held message" });
+  const firstId = (first.results as { msgId: string }[])[0].msgId;
+  const secondId = (second.results as { msgId: string }[])[0].msgId;
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("beta");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  await human.request("rename", { from: "beta", name: "renamed" });
+  await ui.until(() => ui.rows().some((row) => row.includes("to renamed")), "bound target rename");
+  await ui.press("r");
+  assert.equal((await target.nextDelivery()).msg.id, firstId);
+  assert.equal((await logOf(human, secondId)).status, "held");
+  const replacement = await env.adapter("omp", "held-rename-replacement", "beta");
+  assert.notEqual(replacement.session.id, target.session.id);
+  await ui.until(() => ui.rows()[0].includes("3 live"), "name reused by another identity");
+  await ui.press("ESCAPE");
+  const listWidth = paneWidths(120)!.list;
+  const replacementRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("beta") && !row.includes("renamed"));
+  assert.ok(replacementRow >= 0);
+  await ui.click(3, replacementRow);
+  assert.ok(!ui.rows().some((row) => row.includes("⏸") && row.includes("held")), "new beta does not inherit renamed target's held messages");
+  await ui.type("rx");
+  assert.equal((await logOf(human, secondId)).status, "held");
+  const renamedRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("renamed"));
+  assert.ok(renamedRow >= 0);
+  await ui.click(3, renamedRow);
+  await ui.press("x");
+  assert.equal((await logOf(human, secondId)).status, "dropped");
+  assert.equal(replacement.deliveries.length, 0);
+  assertWithin(ui);
+});
+
+test("stale held actions refresh without consuming the next message or a newly opened target", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-stale-sender", "alpha");
+  const beta = await env.adapter("omp", "held-stale-beta", "beta");
+  await env.adapter("omp", "held-stale-gamma", "gamma");
+  for (const name of ["beta", "gamma"]) await human.request("set_inbound", { name, mode: "hold" });
+  const gamma = await sender.client.request("send", { to: "gamma", text: "gamma must remain held" });
+  const first = await sender.client.request("send", { to: "beta", text: "externally released oldest" });
+  const second = await sender.client.request("send", { to: "beta", text: "next beta must remain held" });
+  const gammaId = (gamma.results as { msgId: string }[])[0].msgId;
+  const firstId = (first.results as { msgId: string }[])[0].msgId;
+  const secondId = (second.results as { msgId: string }[])[0].msgId;
+  const started = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  let delayRelease = true;
+  const ui = await startConsole(120, 32, (options) => new class extends AsenqClient {
+    override async request(op: string, params: Record<string, unknown> = {}) {
+      if (op === "release" && delayRelease) {
+        delayRelease = false;
+        started.resolve();
+        await proceed.promise;
+      }
+      return super.request(op, params);
+    }
+  }(options));
+  await ui.press("/");
+  await ui.type("beta");
+  await ui.press("ENTER");
+  await ui.press("ESCAPE");
+  const listWidth = paneWidths(120)!.list;
+  const gammaRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("gamma"));
+  assert.ok(gammaRow >= 0);
+  const pendingRelease = ui.press("r");
+  try {
+    await started.promise;
+    await human.request("release", { msgId: firstId });
+    assert.equal((await beta.nextDelivery()).msg.id, firstId);
+    const switchTarget = ui.click(3, gammaRow);
+    assert.ok(ui.rows().some((row) => row.includes("⏸") && row.includes("held") && row.includes("gamma")), "the overlapping shortcuts see gamma's actionable bar");
+    const overlappingRelease = ui.press("r");
+    const overlappingDrop = ui.press("x");
+    const compose = ui.press("c");
+    const typeR = ui.press("r");
+    const typeX = ui.press("x");
+    proceed.resolve();
+    await Promise.all([pendingRelease, switchTarget, overlappingRelease, overlappingDrop, compose, typeR, typeX]);
+    assert.equal((await logOf(human, secondId)).status, "held", "a stale captured ID never falls through to the next beta message");
+    assert.equal((await logOf(human, gammaId)).status, "held", "overlapping keys do not act on the newly opened target");
+    assert.ok(ui.rows().some((row) => row.includes("not held")), "stale release retains the existing error notice");
+    assert.ok(ui.rows().some((row) => row.includes("to gamma")), "action completion keeps the new target");
+    assert.ok(ui.rows().some((row) => row.includes("› rx")), "action completion keeps the new target's draft");
+    assert.match(ui.rows()[0], /2 held/);
+    assertWithin(ui);
+  } finally {
+    proceed.resolve();
+    await pendingRelease;
+  }
+});
+
+test("header hydrates held messages and follows hold, release, drop and target removal", async () => {
   env = await startEnv();
   const human = env.human();
   const alpha = await env.adapter("omp", "held-alpha", "alpha");
