@@ -118,7 +118,7 @@ type Target =
   | { kind: "list" }
   | { kind: "transcript" };
 type Hit = { row: number; start: number; end: number; target: Target };
-type Entry = { key?: string; rows(width: number, selected: boolean, focused: boolean): TerminalLine[] };
+type Entry = { key?: string; rows(width: number, selected: boolean): TerminalLine[] };
 type Shown = { key: string; layout: TranscriptLayout; top: number; height: number };
 type ComposeTarget = { kind: "session"; id: string; name: string } | { kind: "channel"; name: string };
 type Pane = { rows: TerminalLine[]; cursor?: TerminalCursor };
@@ -549,13 +549,16 @@ export class ConsoleApp {
     return [{ text: long ? `${state.unread} unread${reminder} · ` : `+${state.unread}${reminder} · `, style: theme.unread }];
   }
 
-  private marker(selected: boolean): TerminalSpan {
-    return { text: selected ? "› " : "  ", style: theme.accentBold };
+  private marker(selected: boolean, list = false): TerminalSpan {
+    return {
+      text: selected ? (list ? "▌ " : "› ") : "  ",
+      style: theme.accentBold,
+    };
   }
 
   private entries(tab: Tab): Entry[] {
-    const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.accent }]] });
-    const pick = (selected: boolean, focused: boolean) => selected && focused ? theme.selected : undefined;
+    const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.dim }]] });
+    const pick = (selected: boolean) => selected ? theme.selected : undefined;
     if (tab === "sessions") {
       const q = this.query.toLowerCase();
       const orders = this.sessionOrders;
@@ -564,40 +567,46 @@ export class ConsoleApp {
         .sort((a, b) => (orders[b.id] ?? 0) - (orders[a.id] ?? 0) || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
       const row = (s: SessionIdentity): Entry => ({
         key: `s:${s.id}`,
-        rows: (width, selected, focused) => {
+        rows: (width, selected) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
-          const right = [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)];
-          const left = [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])];
+          const archived = s.state === "removed";
+          const failedPing = s.state === "live" && this.sessionPings[s.id] === "not_responding";
+          const left: TerminalLine = [
+            this.marker(selected, true),
+            { text: archived ? "  " : s.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || s.state === "gone" ? theme.warn : theme.ok },
+            { text: s.name, style: selected ? theme.brand : archived ? theme.dim : unread ? theme.bold : {} },
+            ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : []),
+          ];
+          const right: TerminalSpan[] = [{ text: harnessShortName(s.harness).padEnd(3), style: theme.dim }];
           const role = s.role === "orchestrator" ? "orch" : s.role === "worker" ? "wrk" : "";
-          const statusWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-          const roleFits = width - statusWidth - role.length - 2 >= 2 + Math.min(2, terminalTextWidth(s.name));
-          if (role && roleFits) right.unshift({ text: `${role} ` });
-          const labelWidth = left.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-          // Harness metadata yields before names, roles and unread/state indicators.
-          const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - labelWidth - 2);
-          const harness = ellipsize(harnessShortName(s.harness), harnessWidth);
-          if (harness) right.unshift({ text: `${harness} `, style: theme.dim });
-          return [justify(
-            left,
-            right,
-            width, pick(selected, focused),
-          )];
+          if (role) right.push({ text: " " }, { text: role, style: { ...theme.selected, ...(archived ? theme.dim : theme.bold) } });
+          if (s.inbound !== "accept") right.push({ text: " " }, { text: s.inbound === "hold" ? "⏸" : "refuse", style: s.inbound === "hold" ? theme.warn : theme.bad });
+          const badge = this.unreadSpans(`s:${s.id}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") }));
+          if (badge.length) right.push({ text: " " }, ...badge);
+          const detailWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+          const fill = pick(selected);
+          // Keep complete metadata and a readable name even at the narrow split boundary.
+          const rows = width < 4 + Math.min(3, terminalTextWidth(s.name)) + 1 + detailWidth
+            ? [padSpans(left, width, fill), justify([], right, width, fill)]
+            : [justify(left, right, width, fill)];
+          if (failedPing) rows.push(justify([], [this.stateLabel(s)], width, fill));
+          return rows;
         },
       });
       const live = matching.filter((s) => s.state === "live");
       const gone = matching.filter((s) => s.state === "gone");
       const archived = matching.filter((s) => s.state === "removed");
       const result: Entry[] = [];
-      if (live.length) result.push(heading(`Live ${live.length}`), ...live.map(row));
-      if (gone.length) result.push(heading(`Reconnecting ${gone.length}`), ...gone.map(row));
+      if (live.length) result.push(heading("LIVE"), ...live.map(row));
+      if (gone.length) result.push(heading("RECONNECTING"), ...gone.map(row));
       if (archived.length) {
         const open = this.archiveOpen || q !== "";
         result.push({
           key: "archive",
-          rows: (width, selected, focused) => [justify(
-            [this.marker(selected), { text: `${open ? "▾" : "▸"} Archive`, style: theme.accent }],
-            [{ text: `${archived.length}`, style: theme.dim }], width, pick(selected, focused),
+          rows: (width, selected) => [justify(
+            [this.marker(selected, true), { text: `${open ? "▾" : "▸"} archive ${archived.length}`, style: theme.dim }],
+            [], width, pick(selected),
           )],
         });
         if (open) result.push(...archived.map(row));
@@ -609,16 +618,16 @@ export class ConsoleApp {
         const key = summary.sessionId ? `i:${summary.sessionId}` : `i:n:${summary.name}`;
         return {
           key,
-          rows: (width, selected, focused) => {
+          rows: (width, selected) => {
             const unreadKey = summary.sessionId ? `s:${summary.sessionId}` : "";
             const preview = sanitizeTerminalText(renderMessageBody(summary.latest));
             return [
               justify(
-                [this.marker(selected), { text: summary.name, style: theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
+                [this.marker(selected, true), { text: summary.name, style: selected ? theme.brand : theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
                 [...this.unreadSpans(unreadKey), { text: formatTime(summary.latest.createdAt, Date.now(), true), style: theme.dim }],
-                width, pick(selected, focused),
+                width, pick(selected),
               ),
-              padSpans([{ text: "  " }, { text: ellipsize(preview, Math.max(0, width - 2)), style: theme.dim }], width, pick(selected, focused)),
+              padSpans([{ text: "  " }, { text: ellipsize(preview, Math.max(0, width - 2)), style: theme.dim }], width, pick(selected)),
             ];
           },
         };
@@ -628,10 +637,10 @@ export class ConsoleApp {
       return this.channels.flatMap((channel): Entry[] => [
         {
           key: `c:${channel.name}`,
-          rows: (width, selected, focused) => [justify(
-            [this.marker(selected), { text: `#${channel.name}`, style: theme.accentBold }],
+          rows: (width, selected) => [justify(
+            [this.marker(selected, true), { text: `#${channel.name}`, style: selected ? theme.brand : theme.accentBold }],
             this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
-            width, pick(selected, focused),
+            width, pick(selected),
           )],
         },
         ...(channel.memberIds ?? []).flatMap((id): Entry[] => {
@@ -639,16 +648,28 @@ export class ConsoleApp {
           if (!member) return [];
           return [{
             key: `m:${channel.name}:${id}`,
-            rows: (width, selected, focused) => {
+            rows: (width, selected) => {
+              const archived = member.state === "removed";
+              const failedPing = member.state === "live" && this.sessionPings[member.id] === "not_responding";
               const role = member.role === "orchestrator" ? "orch" : member.role === "worker" ? "wrk" : "unset";
-              const detail = [{ text: `${role} `, style: theme.dim }, this.stateLabel(member)];
-              const label = [this.marker(selected), { text: "  " }, { text: member.name, style: theme.agent }];
+              const detail: TerminalSpan[] = [
+                { text: harnessShortName(member.harness).padEnd(3), style: theme.dim },
+                { text: " " },
+                { text: role, style: role === "unset" ? theme.dim : { ...theme.selected, ...(archived ? theme.dim : theme.bold) } },
+              ];
+              if (member.inbound !== "accept") detail.push({ text: " " }, { text: member.inbound === "hold" ? "⏸" : "refuse", style: member.inbound === "hold" ? theme.warn : theme.bad });
+              const label: TerminalLine = [
+                this.marker(selected, true), { text: "  " },
+                { text: archived ? "  " : member.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || member.state === "gone" ? theme.warn : theme.ok },
+                { text: member.name, style: selected ? theme.brand : archived ? theme.dim : theme.agent },
+              ];
               const detailWidth = detail.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-              const fill = pick(selected, focused);
-              if (width < 4 + Math.min(2, terminalTextWidth(member.name)) + 1 + detailWidth) {
-                return [padSpans(label, width, fill), padSpans([{ text: "    " }, ...detail], width, fill)];
-              }
-              return [justify(label, detail, width, fill)];
+              const fill = pick(selected);
+              const rows = width < 6 + Math.min(3, terminalTextWidth(member.name)) + 1 + detailWidth
+                ? [padSpans(label, width, fill), justify([], detail, width, fill)]
+                : [justify(label, detail, width, fill)];
+              if (failedPing) rows.push(justify([], [this.stateLabel(member)], width, fill));
+              return rows;
             },
           }];
         }),
@@ -659,8 +680,8 @@ export class ConsoleApp {
       .filter((item) => this.activityFilter === "all" || isImportantEvent(item))
       .map((item) => ({
         key: `e:${item.position}`,
-        rows: (width, selected, focused) => [padSpans(
-          [this.marker(selected), ...activitySpans(item, names)], width, pick(selected, focused),
+        rows: (width, selected) => [padSpans(
+          [this.marker(selected, true), ...activitySpans(item, names)], width, pick(selected),
         )],
       }));
   }
@@ -1079,12 +1100,11 @@ export class ConsoleApp {
 
   private listPane(width: number, height: number, y0: number, x0: number): Pane {
     const tab = this.tab;
-    const focused = this.focus === "list";
     const header: TerminalLine[] = [];
     let cursor: TerminalCursor | undefined;
     if (tab === "sessions" && (this.searching || this.query)) {
       header.push(justify([{ text: "/ ", style: theme.accentBold }, { text: this.query }], this.searching ? [] : [{ text: "Esc clear", style: theme.dim }], width));
-      if (this.searching) cursor = { row: y0, column: x0 + Math.min(width - 1, 2 + terminalTextWidth(this.query)) };
+      if (this.searching && width > 0) cursor = { row: y0, column: x0 + Math.min(width - 1, 2 + terminalTextWidth(this.query)) };
     } else if (tab === "activity") {
       header.push(justify(
         [{ text: "Activity ", style: theme.accentBold }, { text: this.activityFilter === "important" ? "messages, sessions, channels and retention" : "all events", style: theme.dim }],
@@ -1093,7 +1113,15 @@ export class ConsoleApp {
     } else if (tab === "inbox") {
       header.push(justify([{ text: this.inboxFeed ? "Senders · feed shown" : "Senders", style: theme.accentBold }], [{ text: "v feed", style: theme.dim }], width));
     }
-    const available = Math.max(0, height - header.length);
+    // Decorations must leave at least one content row in a tiny viewport.
+    if (header.length >= height) {
+      header.length = Math.max(0, height - 1);
+      cursor = undefined;
+    }
+    const footer: TerminalLine[] = tab === "sessions" && !this.searching && !this.query && width >= 17 && height - header.length >= 5
+      ? [[{ text: "/ filter sessions", style: theme.dim }], [{ text: "─".repeat(width), style: theme.border }]]
+      : [];
+    const available = Math.max(0, height - header.length - footer.length);
     const selected = tab === "activity" ? this.selectedActivity() : this.selection[tab];
     const rows: TerminalLine[] = [];
     const keys: (string | undefined)[] = [];
@@ -1102,7 +1130,7 @@ export class ConsoleApp {
     for (const entry of this.entries(tab)) {
       const isSelected = entry.key !== undefined && entry.key === selected;
       if (isSelected) selStart = rows.length;
-      for (const row of entry.rows(width, isSelected, focused)) {
+      for (const row of entry.rows(width, isSelected)) {
         rows.push(row);
         keys.push(entry.key);
       }
@@ -1118,7 +1146,13 @@ export class ConsoleApp {
     if (tab === "activity" && this.followActivity) top = rows.length - available;
     if (selStart >= 0 && selStart < top) top = selStart;
     if (selEnd >= 0 && selEnd >= top + available) top = selEnd - available + 1;
+    if (selStart >= 0 && selEnd - selStart + 1 > available) top = selStart;
     top = Math.max(0, Math.min(top, rows.length - available));
+    if (available > 0 && !keys.slice(top, top + available).some((key) => key !== undefined)) {
+      const next = keys.findIndex((key, index) => index >= top && key !== undefined);
+      const previous = keys.findLastIndex((key) => key !== undefined);
+      if (next >= 0 || previous >= 0) top = next >= 0 ? next : previous;
+    }
     this.listTop[tab] = top;
     const visible = rows.slice(top, top + available);
     header.forEach((_, index) => this.hits.push({ row: y0 + index, start: x0, end: x0 + width, target: { kind: "list" } }));
@@ -1126,7 +1160,11 @@ export class ConsoleApp {
       const key = keys[top + index];
       this.hits.push({ row: y0 + header.length + index, start: x0, end: x0 + width, target: key ? { kind: "entry", key } : { kind: "list" } });
     });
-    return { rows: [...header, ...visible], ...(cursor ? { cursor } : {}) };
+    if (footer.length) {
+      while (visible.length < available) visible.push([]);
+      footer.forEach((_, index) => this.hits.push({ row: y0 + header.length + available + index, start: x0, end: x0 + width, target: { kind: "list" } }));
+    }
+    return { rows: [...header, ...visible, ...footer], ...(cursor ? { cursor } : {}) };
   }
 
   private title(width: number, narrow: boolean, y0: number, x0: number): TerminalLine {
@@ -1176,6 +1214,8 @@ export class ConsoleApp {
     if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, Math.max(1, composerRoom - heldRows.length)), x0);
     const transcriptHeight = height - rows.length - heldRows.length - (composer?.rows.length ?? 0);
     const transcriptY = y0 + rows.length;
+    let visibleHeight = transcriptHeight;
+    let latestHint = false;
     let body: TerminalLine[];
     if (!scope) {
       const text = this.connection === "offline" && !this.sessions.length
@@ -1185,26 +1225,27 @@ export class ConsoleApp {
     } else {
       const key = keyOf(scope);
       const stream = this.streams.get(key);
+      latestHint = stream?.viewport.follow === false && transcriptHeight >= 2;
+      if (latestHint) visibleHeight--;
       const readScope = scope.scope === "inbox" ? undefined : scope;
       const state = readScope && this.readStates.get(key);
       const firstUnread = readScope && state?.unread
         ? stream?.messages.find((m) => this.eligible(readScope, m) && (m.order > state.position || m.order === state.reminder))
         : undefined;
-      const leading: TerminalLine[] = [[{
-        text: ellipsize(stream?.loading ? "Loading…" : stream?.hasMore ? "↑ older messages · scroll up or PgUp" : "Beginning of retained history", width),
-        style: theme.dim,
-      }]];
+      const historyText = ellipsize(stream?.loading ? "Loading…" : stream?.hasMore ? "↑ older messages · scroll up or PgUp" : "· beginning of retained history ·", width);
+      const historyIndent = !stream?.loading && !stream?.hasMore ? Math.max(0, Math.floor((width - terminalTextWidth(historyText)) / 2)) : 0;
+      const leading: TerminalLine[] = [[{ text: " ".repeat(historyIndent) + historyText, style: theme.dim }]];
       const layout = layoutTranscript(stream?.messages ?? [], {
         width,
         ...(stream?.selectedId && this.focus === "transcript" ? { selectedId: stream.selectedId } : {}),
         expanded: (id) => stream?.expanded.has(id) ?? false,
-        ...(firstUnread ? { firstUnreadId: firstUnread.id } : {}),
+        ...(firstUnread ? { firstUnreadId: firstUnread.id, unreadCount: state?.unread } : {}),
         leading,
         empty: stream?.loaded ? "No retained messages" : "",
       });
-      const top = viewportTop(layout, stream?.viewport ?? { follow: true }, transcriptHeight);
-      this.shown = { key, layout, top, height: transcriptHeight };
-      body = layout.rows.slice(top, top + transcriptHeight);
+      const top = viewportTop(layout, stream?.viewport ?? { follow: true }, visibleHeight);
+      this.shown = { key, layout, top, height: visibleHeight };
+      body = layout.rows.slice(top, top + visibleHeight);
       const rowIds: (string | undefined)[] = new Array(layout.rows.length);
       for (const [id, range] of layout.ranges) for (let row = range.start; row <= range.end; row++) rowIds[row] = id;
       body.forEach((_, index) => {
@@ -1212,10 +1253,14 @@ export class ConsoleApp {
         this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: id ? { kind: "message", id } : { kind: "transcript" } });
       });
     }
-    body = body.slice(0, transcriptHeight);
-    for (let index = body.length; index < transcriptHeight; index++) {
+    body = body.slice(0, visibleHeight);
+    for (let index = body.length; index < visibleHeight; index++) {
       body.push("");
       this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: { kind: "transcript" } });
+    }
+    if (latestHint) {
+      body.push(justify([], [{ text: "End ↓ latest", style: theme.dim }], width));
+      this.hits.push({ row: transcriptY + visibleHeight, start: x0, end: x0 + width, target: { kind: "transcript" } });
     }
     rows.push(...body);
     if (held && heldRows.length) {

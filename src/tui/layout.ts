@@ -134,6 +134,8 @@ export type TranscriptOptions = {
   selectedId?: string;
   expanded?: (id: string) => boolean;
   firstUnreadId?: string;
+  /** Authoritative human unread count at firstUnreadId; defaults to 1, never counts agent traffic. */
+  unreadCount?: number;
   /** Rows before the first message, such as the older-history hint. */
   leading?: TerminalLine[];
   empty?: string;
@@ -144,21 +146,58 @@ export function senderLabel(message: StoredMessage): string {
   return message.from === "human" ? "you" : message.from;
 }
 
-function headerSpans(message: StoredMessage, now: number): TerminalSpan[] {
-  const human = message.from === "human";
-  const spans: TerminalSpan[] = [
-    { text: human ? "› " : "● ", style: human ? theme.human : theme.agent },
-    { text: senderLabel(message), style: human ? theme.human : theme.agent },
+function headerSpans(message: StoredMessage, now: number, width: number, fill?: TerminalStyle): TerminalSpan[] {
+  const sender = senderLabel(message);
+  const target = message.channel ? `#${message.channel}` : message.to === "human" ? "you" : message.to;
+  const senderWidth = terminalTextWidth(sender);
+  const targetWidth = terminalTextWidth(target);
+  const minimumIdentity = Math.min(width, Math.min(6, senderWidth) + 3 + Math.min(6, targetWidth));
+  const status: TerminalSpan = {
+    text: `${message.status === "delivered" || message.status === "posted" ? "✓ " : ""}${message.status}`,
+    style: statusStyle(message.status),
+  };
+  const time: TerminalSpan = { text: `  ${formatTime(message.createdAt, now)}`, style: theme.dim };
+  const tags: TerminalSpan[] = [];
+  if (message.kind && message.kind !== "chat") {
+    const kind = ` ${message.kind}${message.kind === "control" && message.action ? ` ${message.action}` : ""} `;
+    if (terminalTextWidth(kind) + 2 + minimumIdentity <= width) {
+      tags.push({ text: "  " }, { text: kind, style: { ...theme.warn, inverse: true } });
+    }
+  }
+  if (message.done && spansWidth(tags) + 7 + minimumIdentity <= width) {
+    tags.push({ text: " · done", style: theme.dim });
+  }
+  if (!message.channel && message.sourceChannel) {
+    const source = ` via #${message.sourceChannel}`;
+    if (spansWidth(tags) + terminalTextWidth(source) + minimumIdentity <= width) {
+      tags.push({ text: source, style: theme.dim });
+    }
+  }
+  const tagWidth = spansWidth(tags);
+  let right = [status, time];
+  // Keep both labels and message meaning readable; time yields first, then delivery state.
+  if (spansWidth(right) + 1 + minimumIdentity + tagWidth > width) right = [status];
+  if (spansWidth(right) + 1 + minimumIdentity + tagWidth > width) right = [];
+  const leftWidth = width - spansWidth(right) - (right.length ? 1 : 0);
+  const identityWidth = leftWidth - tagWidth;
+  let senderBudget = senderWidth;
+  let targetBudget = targetWidth;
+  if (senderWidth + 3 + targetWidth > identityWidth) {
+    const namesWidth = Math.max(0, identityWidth - 3);
+    senderBudget = Math.min(senderWidth, Math.ceil(namesWidth / 2));
+    targetBudget = Math.min(targetWidth, namesWidth - senderBudget);
+    senderBudget = Math.min(senderWidth, namesWidth - targetBudget);
+  }
+  const identity: TerminalSpan[] = identityWidth >= 5 ? [
+    { text: ellipsize(sender, senderBudget), style: message.from === "human" ? theme.human : theme.agent },
+    { text: " → ", style: theme.dim },
+    { text: ellipsize(target, targetBudget), style: theme.dim },
+  ] : [
+    { text: sender, style: message.from === "human" ? theme.human : theme.agent },
+    { text: " → ", style: theme.dim },
+    { text: target, style: theme.dim },
   ];
-  if (!message.channel && message.sourceChannel) spans.push({ text: ` via #${message.sourceChannel}`, style: theme.dim });
-  if (message.channel) spans.push({ text: ` in #${message.channel}`, style: theme.dim });
-  else if (message.to !== "human" && !human) spans.push({ text: ` → ${message.to}`, style: theme.agent });
-  else if (human) spans.push({ text: ` → ${message.to === "human" ? "you" : message.to}`, style: theme.dim });
-  spans.push({ text: "  " }, { text: message.status, style: statusStyle(message.status) });
-  if (message.kind && message.kind !== "chat") spans.push({ text: ` · ${message.kind}${message.kind === "control" && message.action ? ` ${message.action}` : ""}`, style: theme.dim });
-  if (message.done) spans.push({ text: " · done", style: theme.dim });
-  spans.push({ text: `  ${formatTime(message.createdAt, now)}`, style: theme.dim });
-  return spans;
+  return justify([...identity, ...tags], right, width, fill);
 }
 
 function detailLines(message: StoredMessage): string[] {
@@ -174,38 +213,49 @@ function detailLines(message: StoredMessage): string[] {
 }
 
 /**
- * Lay out each message as a distinct block: header, wrapped body and optional details.
- * Bodies are wrapped, never clipped; ranges let callers map rows back to messages.
+ * Lay out each message as a distinct block: fitted header, full wrapped body and optional details.
+ * Only direct nonhuman exchanges are dim and omit the spacer between adjacent such blocks.
+ * The divider uses the caller's human unread count, not the number of subsequent messages.
+ * Ranges exclude dividers/spacers; bodyEnd precedes details so read-on-view still requires the full body.
  */
 export function layoutTranscript(messages: readonly StoredMessage[], options: TranscriptOptions): TranscriptLayout {
   const width = Math.max(1, options.width);
-  const bodyWidth = Math.max(1, width - 2);
+  const indent = " ".repeat(Math.min(2, width - 1));
+  const bodyWidth = width - indent.length;
   const now = options.now ?? Date.now();
   const rows: TerminalLine[] = [...(options.leading ?? [])];
   if (rows.length && messages.length) rows.push("");
   const ranges = new Map<string, MessageRange>();
   const order: string[] = [];
   if (!messages.length && options.empty) rows.push([{ text: ellipsize(options.empty, width), style: theme.dim }]);
+  let previousCompact = false;
   for (const message of messages) {
-    if (order.length) rows.push("");
+    const compact = !message.channel && message.from !== "human" && message.to !== "human";
+    if (order.length && !(previousCompact && compact)) rows.push("");
     if (message.id === options.firstUnreadId) {
-      rows.push(clipSpans([{ text: "── new ", style: theme.unread }, { text: "─".repeat(Math.max(0, width - 7)), style: theme.accent }], width));
+      const label = `${options.unreadCount ?? 1} new `;
+      rows.push(clipSpans([{ text: label, style: theme.unread }, { text: "┄".repeat(Math.max(0, width - terminalTextWidth(label))), style: theme.accent }], width));
     }
     const start = rows.length;
     const selected = message.id === options.selectedId;
-    const header = justify(headerSpans(message, now), [], width, selected ? theme.selected : undefined);
-    rows.push(header);
-    for (const line of wrappedBody(message, bodyWidth)) rows.push(`  ${line}`);
+    const fill = compact ? { ...theme.dim, ...(selected ? theme.selected : {}) } : selected ? theme.selected : undefined;
+    rows.push(headerSpans(message, now, width, fill));
+    for (const line of wrappedBody(message, bodyWidth)) {
+      const text = `${indent}${line}`;
+      rows.push(compact ? [{ text, style: theme.dim }] : text);
+    }
     const bodyEnd = rows.length - 1;
     if (options.expanded?.(message.id)) {
+      const prefix = truncateTerminalText("  ┊ ", Math.max(0, width - 1));
       for (const detail of detailLines(message)) {
-        for (const line of wrapTerminalText(detail, Math.max(1, width - 4))) {
-          rows.push([{ text: "  ┊ ", style: theme.accent }, { text: line, style: theme.dim }]);
+        for (const line of wrapTerminalText(detail, width - terminalTextWidth(prefix))) {
+          rows.push([{ text: prefix, style: compact ? { ...theme.accent, dim: true } : theme.accent }, { text: line, style: theme.dim }]);
         }
       }
     }
     ranges.set(message.id, { start, bodyEnd, end: rows.length - 1 });
     order.push(message.id);
+    previousCompact = compact;
   }
   return { rows, ranges, order };
 }

@@ -529,7 +529,7 @@ test("wide console lists live sessions by recent activity, collapses the archive
   let rows = ui.rows();
   const index = (text: string): number => rows.findIndex((row) => truncateTerminalText(row, listWidth).includes(text));
   assert.ok(index("beta") < index("alpha"), "most recent activity first");
-  assert.ok(index("alpha") < index("Archive"), "live before archive");
+  assert.ok(index("alpha") < index("archive"), "live before archive");
   assert.equal(index("retired"), -1, "archive starts collapsed");
 
   await ui.press("DOWN");
@@ -632,61 +632,6 @@ test("new arrivals keep a scrolled reader in place, and the composer sends once 
   assert.ok(!ui.rows().some((row) => row.includes("› hello") || row.includes("› there")), "draft cleared after send");
 });
 
-test("session list shows short harness labels without losing state or unread badges", async () => {
-  env = await startEnv();
-  const cc = await env.adapter("claude", "cc-key", "reviewer");
-  await env.adapter("opencode", "oc-key", "planner");
-  await env.adapter("omp", "omp-key", "writer");
-  await cc.client.request("send", { to: "human", text: "review is ready" });
-  const ui = await startConsole(120, 20);
-  const listWidth = paneWidths(120)!.list;
-  await ui.until(() => ui.rows().some((row) => row.includes("writer")), "all sessions");
-  const list = ui.rows().map((row) => truncateTerminalText(row, listWidth));
-  assert.match(list.find((row) => row.includes("reviewer"))!, /\bcc\b.*\+1.*live/);
-  assert.match(list.find((row) => row.includes("planner"))!, /\boc\b.*live/);
-  assert.match(list.find((row) => row.includes("writer"))!, /\bomp\b.*live/);
-  assertWithin(ui);
-});
-
-test("session roles yield to archived names, unread counts and state at 80 columns", async () => {
-  env = await startEnv();
-  const human = env.human();
-  const alpha = await env.adapter("omp", "role-alpha", "alpha");
-  const bravo = await env.adapter("claude", "role-bravo", "bravo");
-  await env.adapter("opencode", "role-charlie", "charlie");
-  await human.request("set_role", { name: "alpha", role: "orchestrator" });
-  await human.request("set_role", { name: "bravo", role: "worker" });
-  for (const session of [alpha, bravo]) {
-    await session.client.request("send", { to: "human", text: "unread role conversation" });
-  }
-  const ui = await startConsole(80, 20);
-  const listWidth = paneWidths(80)!.list;
-  const list = (): string[] => ui.rows().map((row) => truncateTerminalText(row, listWidth));
-  const alphaRow = list().find((row) => row.includes("al"))!;
-  const bravoRow = list().find((row) => row.includes("br"))!;
-  assert.match(alphaRow, /\borch\b.*\+1.*live/);
-  assert.match(bravoRow, /\bwrk\b.*\+1.*live/);
-  const unsetRow = list().find((row) => row.includes("charlie"))!;
-  assert.match(unsetRow, /live/);
-  assert.doesNotMatch(unsetRow, /\b(?:orch|wrk|unset)\b/);
-  assertWithin(ui);
-
-  await alpha.client.request("unregister");
-  await bravo.client.request("unregister");
-  await ui.until(() => list().some((row) => row.includes("Archive")), "archived sessions");
-  await ui.press("END");
-  await ui.press("ENTER");
-  await ui.until(() => list().filter((row) => row.includes("archived")).length === 2, "expanded archive");
-  for (const prefix of ["al", "br"]) {
-    const rows = list();
-    const index = rows.findIndex((row) => row.includes(prefix) && row.includes("archived"));
-    assert.ok(index >= 0, `${prefix} retains a distinct visible name prefix`);
-    assert.match(rows[index], /\+1.*archived/);
-    assert.doesNotMatch(rows[index], /\b(?:orch|wrk)\b/, "role yields to archived identity and unread state");
-  }
-  assertWithin(ui);
-});
-
 test("human role form updates the selected session through protocol events and can unset it", async () => {
   env = await startEnv();
   const human = env.human();
@@ -697,7 +642,7 @@ test("human role form updates the selected session through protocol events and c
   await ui.type("alpha");
   await ui.press("ENTER");
   const listWidth = paneWidths(120)!.list;
-  const sessionRow = (): string => ui.rows().map((row) => truncateTerminalText(row, listWidth)).find((row) => row.includes("alpha") && row.includes("live")) ?? "";
+  const sessionRow = (): string => ui.rows().map((row) => truncateTerminalText(row, listWidth)).find((row) => row.includes("alpha") && row.includes("●")) ?? "";
 
   for (const [value, tag] of [["orchestrator", "orch"], ["worker", "wrk"], ["unset", ""]]) {
     await ui.press("?");
@@ -734,9 +679,9 @@ test("channel rosters show shared identities and follow name, role and lifecycle
     const width = paneWidths(ui.size.columns)?.list ?? ui.size.columns;
     return ui.rows().map((row) => truncateTerminalText(row, width));
   };
-  assert.equal(listRows().filter((row) => row.includes("alpha") && row.includes("orch") && row.includes("live")).length, 2);
-  assert.ok(listRows().some((row) => row.includes("bravo") && row.includes("wrk") && row.includes("live")));
-  assert.ok(listRows().some((row) => row.includes("charlie") && row.includes("unset") && row.includes("live")));
+  assert.equal(listRows().filter((row) => row.includes("alpha") && row.includes("orch") && row.includes("●")).length, 2);
+  assert.ok(listRows().some((row) => row.includes("bravo") && row.includes("wrk") && row.includes("●")));
+  assert.ok(listRows().some((row) => row.includes("charlie") && row.includes("unset") && row.includes("●")));
   for (const columns of [79, 80, 120]) {
     await ui.resize(columns, 22);
     assert.ok(listRows().some((row) => row.includes("#one")));
@@ -749,10 +694,10 @@ test("channel rosters show shared identities and follow name, role and lifecycle
   const gone = await env.watch((e) => e.type === "session" && e.action === "gone" && e.session.id === alpha.session.id);
   alpha.client.close();
   await gone.event;
-  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("gone")).length === 2, "both rosters show gone");
+  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("◌")).length === 2, "both rosters show reconnecting");
   env.clock.advance(GRACE_MS);
   env.daemon.sweep();
-  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("archived")).length === 2, "both rosters show archived");
+  await ui.until(() => ui.rows().filter((row, index) => truncateTerminalText(row, paneWidths(120)!.list).includes("renamed") && normalizeTerminalLine(ui.frame().lines[index], ui.size.columns).some((span) => span.text.includes("renamed") && span.style?.dim)).length === 2, "both rosters show archived identities");
   assert.deepEqual((await human.request("channel_read", { channel: "one" })).messages, []);
   assertWithin(ui);
 });
@@ -784,13 +729,13 @@ test("channel palette edits and member hit targets keep delivery in channel scop
   await ui.press("TAB");
   await ui.type("alpha");
   await ui.press("CTRL_D");
-  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("unset") && row.includes("live")), "palette add renders roster event");
+  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("unset") && row.includes("●")), "palette add renders roster event");
 
   for (const columns of [79, 80, 120]) {
     await ui.resize(columns, 22);
     await ui.press("#");
     const width = paneWidths(columns)?.list ?? columns;
-    const row = ui.rows().findIndex((row) => truncateTerminalText(row, width).includes("alpha"));
+    const row = ui.rows().findIndex((row) => truncateTerminalText(row, width).includes("alp") && truncateTerminalText(row, width).includes("●"));
     assert.ok(row >= 1);
     await ui.click(columns >= 80 ? 1 : 0, row);
     await ui.press("ENTER");
@@ -815,7 +760,7 @@ test("channel palette edits and member hit targets keep delivery in channel scop
   const replacement = await env.adapter("omp", "palette-new-alpha", "alpha");
   await human.request("channel_add", { channel: "empty", name: "alpha" });
   await ui.press("CTRL_D");
-  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("live")) && !ui.rows().some((row) => row.includes("retired")), "remove event leaves the new identity visible");
+  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("●")) && !ui.rows().some((row) => row.includes("retired")), "remove event leaves the new identity visible");
   const members = (await human.request("channel_members", { channel: "empty" })).members as SessionIdentity[];
   assert.deepEqual(members.map((member) => member.id), [replacement.session.id], "removal follows selected identity through rename, archive and name reuse");
   assertWithin(ui);
@@ -1137,7 +1082,7 @@ test("unread archived sessions remain distinguishable at the 80-column boundary"
   const ui = await startConsole(80, 18);
   await ui.press("ENTER");
   const listWidth = paneWidths(80)!.list;
-  const archived = ui.rows().map((row) => truncateTerminalText(row, listWidth)).filter((row) => row.includes("archived"));
+  const archived = ui.rows().map((row) => truncateTerminalText(row, listWidth)).filter((row) => row.includes("alpha") || row.includes("bravo"));
   assert.equal(archived.length, 2);
   assert.ok(archived.some((row) => row.includes("al")), "alpha retains a visible name prefix");
   assert.ok(archived.some((row) => row.includes("br")), "bravo retains a distinct visible name prefix");
@@ -1202,8 +1147,8 @@ test("console shows control actions beside their kind without changing ordinary 
   const ui = await startConsole(120, 30);
   await ui.until(() => ui.rows().some((row) => row.includes("Please pause here")), "control message");
 
-  const control = ui.rows().find((row) => row.includes(" · control"));
-  const ordinary = ui.rows().find((row) => row.includes(" · status"));
+  const control = ui.rows().find((row) => row.includes("control pause"));
+  const ordinary = ui.rows().find((row) => /\bstatus\b/.test(row) && row.includes("→"));
   assert.ok(control?.includes("pause"), "the visible control tag carries its action");
   assert.ok(ordinary, "ordinary status tag remains visible");
   assert.ok(!ordinary.includes("pause") && !ordinary.includes("control"), "ordinary metadata is unchanged");
@@ -1536,7 +1481,7 @@ test("held bar scopes to the open target and releases then drops its oldest show
   await ui.type("worker");
   await ui.press("ENTER");
   await ui.press("ENTER");
-  const bar = () => ui.rows().find((row) => row.includes("⏸") && row.includes("held"));
+  const bar = () => ui.rows().find((row) => row.includes("⏸ held"));
   assert.ok(bar(), "held messages for the open target expose the bar");
   assert.ok(bar()!.includes("orch → worker") && bar()!.includes("oldest-review-preview"), "the oldest message is shown with its sender and target");
   assert.match(bar()!, /held.*2/, "multiple held messages show a count");
@@ -1633,7 +1578,7 @@ test("Ctrl+X closes only a selected session row after one-key confirmation and l
   await ui.press("ESCAPE");
   await ui.press("END");
   await ui.press("ENTER");
-  assert.ok(ui.rows().some((row) => row.includes("renamed") && row.includes("archived")), "closed conversation is reachable in the archive");
+  assert.ok(ui.rows().some((row) => truncateTerminalText(row, paneWidths(120)!.list).includes("renamed")), "closed conversation is reachable in the archive");
   assertWithin(ui);
 });
 
@@ -1747,7 +1692,10 @@ test("Ping sessions refreshes rows and external pongs and disconnection update a
   env = await startEnv({ pingTimeoutMs });
   const human = env.human();
   const hung = await env.adapter("omp", "ping-status-key", "worker", { autoPong: false });
+  await human.request("set_role", { name: "worker", role: "worker" });
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
   const ui = await startConsole(120, 24);
+  const list = (): string[] => ui.rows().map((row) => truncateTerminalText(row, paneWidths(ui.size.columns)!.list));
   await ui.press("?");
   await ui.type("Ping sessions");
   const action = ui.press("ENTER");
@@ -1755,7 +1703,14 @@ test("Ping sessions refreshes rows and external pongs and disconnection update a
   env.clock.advance(pingTimeoutMs);
   env.daemon.sweep();
   await action;
-  assert.ok(ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "failed ping renders on the live session row");
+  await ui.resize(80, 24);
+  const failedRow = list().findIndex((row) => row.includes("not_responding"));
+  assert.ok(failedRow >= 0 && list().some((row) => row.includes("worker") && row.includes("●")), "failed ping stays visible with the live identity at 80 columns");
+  assert.ok(list().some((row) => row.includes("omp") && row.includes("wrk") && row.includes("⏸")), "ping metadata never displaces harness, role or inbound policy");
+  await ui.click(5, failedRow);
+  await ui.press("CTRL_X");
+  assert.ok(ui.rows().some((row) => row.includes(hung.session.id)), "ping detail row targets its stable identity");
+  await ui.press("n");
   assert.equal((await human.sync()).sessions.find((session) => session.id === hung.session.id)!.state, "live", "ping failure does not disconnect or close the session");
   assert.ok(!ui.rows().some((row) => row.includes("y confirm")), "Ping sessions never opens a destructive confirmation");
 
@@ -1763,21 +1718,21 @@ test("Ping sessions refreshes rows and external pongs and disconnection update a
   const probe = await hung.nextPing();
   await hung.client.request("pong", { pingId: probe.pingId });
   await external;
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "external response replaces cached failed status");
+  await ui.until(() => list().some((row) => row.includes("worker") && row.includes("●")) && !list().some((row) => row.includes("not_responding")), "external response replaces cached failed status");
 
   const failedAgain = human.request("ping", { sessionId: hung.session.id });
   await hung.nextPing();
   env.clock.advance(pingTimeoutMs);
   env.daemon.sweep();
   await failedAgain;
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "external failed ping updates the connected console");
+  await ui.until(() => list().some((row) => row.includes("not_responding")), "external failed ping updates the connected console");
   const gone = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === hung.session.id);
   hung.client.close();
   await gone.event;
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("gone") && !row.includes("not_responding")), "disconnection clears cached ping");
+  await ui.until(() => list().some((row) => row.includes("worker") && row.includes("◌")) && !list().some((row) => row.includes("not_responding")), "disconnection clears cached ping");
   const revived = await env.adapter("omp", "ping-status-key", "worker");
   assert.equal(revived.session.id, hung.session.id);
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "revival does not inherit a failed ping");
+  await ui.until(() => list().some((row) => row.includes("worker") && row.includes("●")) && !list().some((row) => row.includes("not_responding")), "revival does not inherit a failed ping");
   assertWithin(ui);
 });
 
@@ -1852,7 +1807,7 @@ test("purge all archives cancels safely and never enlarges the confirmed archive
   }, "confirmed archives purged");
   assert.ok(snapshot.sessions.some((s) => s.id === later.session.id && s.state === "removed"), "archive created after preview is not deleted");
   await ui.press("ENTER");
-  assert.ok(ui.rows().some((row) => row.includes("later") && row.includes("archived")), "unconfirmed archive remains visible");
+  assert.ok(ui.rows().some((row) => truncateTerminalText(row, paneWidths(120)!.list).includes("later")), "unconfirmed archive remains visible");
   assert.ok(!ui.rows().some((row) => /\b(alpha|beta)\b/.test(row)), "confirmed archive rows disappear");
   assertWithin(ui);
 });
@@ -1899,17 +1854,17 @@ test("Home and End reach list boundaries after a selected archive is hidden", as
   await ui.type("alpha");
   await ui.press("ENTER");
   await alpha.client.request("unregister");
-  await ui.until(() => list().some((row) => row.includes("alpha") && row.includes("archived")), "selected identity archived");
+  await ui.until(() => list().some((row) => row.includes("alpha") && !row.includes("●") && !row.includes("◌") && !row.includes("/ alpha")), "selected identity archived");
   await ui.press("ESCAPE");
   await ui.press("END");
   await ui.press("ENTER");
-  assert.ok(list().some((row) => row.includes("alpha") && row.includes("archived")), "End reaches the collapsed Archive heading");
+  assert.ok(list().some((row) => row.includes("alpha") && !row.includes("/ alpha")), "End reaches the collapsed archive heading");
 
   await ui.press("DOWN");
   await ui.press("?");
   await ui.type("Toggle archive");
   await ui.press("ENTER");
-  assert.ok(!list().some((row) => row.includes("alpha") && row.includes("archived")), "selected archive is hidden again");
+  assert.ok(!list().some((row) => row.includes("alpha")), "selected archive is hidden again");
   await ui.press("HOME");
   await ui.press("ENTER");
   await ui.until(() => ui.rows().some((row) => row.includes("Live boundary conversation")), "Home opens the first live session");
@@ -2152,5 +2107,136 @@ test("channel mention picker uses the pinned opening boundary for typing and pas
   }
   const posts = (await human.request("channel_read", { channel: "work", limit: 100 })).messages as StoredMessage[];
   assert.deepEqual(posts.map((post) => post.text), expected);
+  assertWithin(ui);
+});
+
+test("design A session sections expose state, harness, roles, policy and focused identity", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "restyle-alpha", "alpha");
+  const beta = await env.adapter("opencode", "restyle-beta", "beta");
+  const retired = await env.adapter("claude", "restyle-retired", "retired");
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await human.request("set_role", { name: "beta", role: "worker" });
+  await retired.client.request("send", { to: "human", text: "retained archive" });
+  await retired.client.request("unregister");
+  await alpha.client.request("send", { to: "human", text: "unread live message" });
+  await human.request("set_inbound", { name: "alpha", mode: "hold" });
+  const gone = await env.watch((event) => event.type === "session" && event.action === "gone" && event.name === "beta");
+  beta.client.close();
+  await gone.event;
+  const ui = await startConsole(120, 32);
+  const listWidth = paneWidths(120)!.list;
+  const list = ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  assert.ok(list.some((row) => row.includes("LIVE")));
+  assert.ok(list.some((row) => row.includes("RECONNECTING")));
+  assert.ok(list.some((row) => /▸ archive\s+1/.test(row)));
+  const alphaRow = list.findIndex((row) => row.includes("alpha"));
+  assert.ok(list[alphaRow].includes("▌") && list[alphaRow].includes("●") && list[alphaRow].includes("⏸"));
+  assert.match(list[alphaRow], /omp.*orch/);
+  assert.ok(list.some((row) => row.includes("◌") && row.includes("beta") && row.includes("oc") && row.includes("wrk")));
+  const alphaSpans = normalizeTerminalLine(ui.frame().lines[alphaRow], ui.size.columns);
+  assert.ok(alphaSpans.some((span) => span.text.includes("alpha") && span.style?.foreground === "brightCyan" && span.style.bold));
+  assert.ok(alphaSpans.some((span) => span.text.includes("orch") && span.style?.inverse));
+  assert.ok(list.some((row) => row.includes("/ filter sessions")));
+  assert.equal(await unread(human, alpha.session.id), 1, "styling a selected list row never marks it read");
+  await ui.press("ENTER");
+  await ui.press("c");
+  const composerList = ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  const composerAlpha = composerList.findIndex((row) => row.includes("alpha"));
+  assert.ok(composerList[composerAlpha].includes("▌"), "selected identity stays marked while writing");
+  assert.ok(normalizeTerminalLine(ui.frame().lines[composerAlpha], ui.size.columns).some((span) => span.text.includes("alpha") && span.style?.foreground === "brightCyan"));
+  await ui.press("ESCAPE");
+  await ui.press("u");
+  await ui.resize(80, 20);
+  const narrowList = ui.rows().map((row) => truncateTerminalText(row, paneWidths(80)!.list));
+  assert.ok(narrowList.some((row) => row.includes("alpha")));
+  assert.ok(narrowList.some((row) => row.includes("omp") && row.includes("orch") && row.includes("+1")));
+  assertWithin(ui);
+  await ui.press("CTRL_K");
+  await ui.type("retired");
+  await ui.press("ENTER");
+  const archivedList = ui.rows().map((row) => truncateTerminalText(row, paneWidths(80)!.list));
+  const archivedRow = archivedList.find((row) => row.includes("retired"))!;
+  assert.ok(archivedRow.includes("cc") && !archivedRow.includes("●") && !archivedRow.includes("◌"), "archived row retains harness without a live-state dot");
+  assertWithin(ui);
+});
+
+test("design A transcript separates status and kind, counts unread and compacts only agent exchanges", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "restyle-chat-alpha", "alpha");
+  const peer = await env.adapter("omp", "restyle-chat-beta", "beta");
+  await human.sendToSession(alpha.session.id, "human-out-full");
+  await alpha.client.request("send", { to: "human", text: "human-in-first" });
+  await alpha.client.request("send", { to: "human", text: "human-in-full" });
+  await alpha.client.request("send", { to: "beta", text: "compact-first", kind: "task" });
+  await peer.client.request("send", { to: "alpha", text: "compact-second", kind: "result" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  const rows = ui.rows();
+  assert.ok(rows.some((row) => /you → alpha\s{2,}✓ delivered/.test(row)));
+  assert.ok(rows.some((row) => row.includes("alpha → you")));
+  const divider = rows.findIndex((row) => row.includes("2 new") && row.includes("┄"));
+  assert.ok(divider >= 0);
+  const firstBody = rows.findIndex((row) => row.includes("compact-first"));
+  const secondHeader = rows.findIndex((row) => row.includes("beta → alpha"));
+  assert.equal(secondHeader, firstBody + 1, "adjacent agent exchanges have no blank spacer");
+  for (const text of ["compact-first", "compact-second"]) {
+    const row = rows.findIndex((value) => value.includes(text));
+    assert.ok(normalizeTerminalLine(ui.frame().lines[row], ui.size.columns).some((span) => span.text.includes(text) && span.style?.dim));
+  }
+  for (const text of ["human-out-full", "human-in-full"]) {
+    const row = rows.findIndex((value) => value.includes(text));
+    assert.ok(normalizeTerminalLine(ui.frame().lines[row], ui.size.columns).some((span) => span.text.includes(text) && !span.style?.dim));
+  }
+  const taskHeader = rows.findIndex((row) => row.includes("alpha → beta"));
+  assert.ok(normalizeTerminalLine(ui.frame().lines[taskHeader], ui.size.columns).some((span) => span.text.includes("task") && span.style?.inverse && span.style.foreground === "yellow"));
+  assert.equal(await unread(human, alpha.session.id), 2, "visible list preview and new-divider preserve unread");
+  await ui.press("ENTER");
+  assert.equal(await unread(human, alpha.session.id), 0);
+  await ui.press("u");
+  assert.equal(await unread(human, alpha.session.id), 1, "explicit unread reminder survives the restyle");
+  assertWithin(ui);
+});
+
+test("compact agent bodies remain fully reachable and latest hint never reads the hidden human tail", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "restyle-long-alpha", "alpha");
+  const beta = await env.adapter("omp", "restyle-long-beta", "beta");
+  const agentText = [...Array.from({ length: 18 }, (_, index) => `agent paragraph ${index} retains its complete wrapped words`), "last-agent-body-row"].join("\n");
+  await beta.client.request("send", { to: "alpha", text: agentText, kind: "result" });
+  await alpha.client.request("send", { to: "human", text: `${"human paragraph keeps scrolling\n".repeat(22)}last-human-body-row` });
+  const ui = await startConsole(80, 10);
+  await ui.press("CTRL_K");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("last-human-body-row")), "human tail initially visible");
+  await ui.press("u");
+  await ui.press("HOME");
+  assert.ok(ui.rows().some((row) => row.includes("End ↓ latest")));
+  assert.ok(!ui.rows().some((row) => row.includes("last-human-body-row")));
+  const seen = new Set<string>();
+  const inset = paneWidths(80)!.list + 2;
+  for (let step = 0; step < 100; step++) {
+    const rows = ui.rows();
+    for (const row of rows) {
+      const text = row.slice(inset, -1).trim();
+      if (text.startsWith("agent paragraph") || text.includes("last-agent-body-row")) seen.add(text);
+    }
+    assert.equal(await unread(human, alpha.session.id), 1, "agent rows and navigation hint never clear the hidden human reminder");
+    if (rows.some((row) => row.includes("last-agent-body-row"))) break;
+    await ui.press("PAGE_DOWN");
+  }
+  for (const row of wrapTerminalText(agentText, paneWidths(80)!.conversation - 4)) {
+    assert.ok(seen.has(row.trim()), `agent body row remains reachable: ${row}`);
+  }
+  await ui.press("END");
+  assert.ok(ui.rows().some((row) => row.includes("last-human-body-row")));
+  assert.ok(!ui.rows().some((row) => row.includes("End ↓ latest")));
+  assert.equal(await unread(human, alpha.session.id), 0, "only reaching the actual human tail clears its reminder");
   assertWithin(ui);
 });
