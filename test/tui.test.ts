@@ -22,7 +22,9 @@ type Console = {
   app: ConsoleApp;
   size: TerminalSize;
   rows(): string[];
+  frame(): TerminalFrame;
   press(name: string): Promise<void>;
+  click(column: number, row?: number): Promise<void>;
   close(): void;
   type(text: string): Promise<void>;
   until(predicate: () => boolean | Promise<boolean>, what: string): Promise<void>;
@@ -47,9 +49,14 @@ async function startConsole(columns: number, rows: number): Promise<Console> {
     app,
     size,
     rows: () => frame.lines.map(lineText),
+    frame: () => frame,
     async press(name) {
       const text = [...name].length === 1 ? name : undefined;
       handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: name.startsWith("CTRL_"), alt: false, shift: name.startsWith("SHIFT_") });
+      await app.idle();
+    },
+    async click(column, row = 0) {
+      handlers.onMouse?.({ name: "MOUSE_LEFT_BUTTON_PRESSED", column, row, action: "press", button: "left", ctrl: false, alt: false, shift: false });
       await app.idle();
     },
     close: () => handlers.onInterrupt?.(),
@@ -82,6 +89,79 @@ function assertWithin(ui: Console): void {
 }
 
 const size = { columns: 10, rows: 4 };
+
+test("header hydrates held messages and follows hold, release, drop and target removal", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "held-alpha", "alpha");
+  const beta = await env.adapter("omp", "held-beta", "beta");
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  const hold = async (text: string): Promise<string> => {
+    const reply = await alpha.client.request("send", { to: "beta", text });
+    return (reply.results as { msgId: string }[])[0].msgId;
+  };
+  const release = await hold("release this");
+  const drop = await hold("drop this");
+  const ui = await startConsole(120, 32);
+  assert.match(ui.rows()[0], /2 live · 0 reconnecting · 2 held · 0 unread/);
+
+  await hold("keep until removal");
+  await ui.until(() => ui.rows()[0].includes("3 held"), "new held message");
+  await human.request("release", { msgId: release });
+  await ui.until(() => ui.rows()[0].includes("2 held"), "released message leaves held count");
+  await human.request("drop", { msgId: drop });
+  await ui.until(() => ui.rows()[0].includes("1 held"), "dropped message leaves held count");
+  await beta.client.request("unregister");
+  await ui.until(() => /1 live · 0 reconnecting · 0 held/.test(ui.rows()[0]), "removed target expires remaining held messages");
+  assertWithin(ui);
+});
+
+test("header counts human session and channel unread markers and gone sessions separately", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "counter-alpha", "alpha");
+  const beta = await env.adapter("omp", "counter-beta", "beta");
+  await alpha.client.request("send", { to: "human", text: "private unread" });
+  await beta.client.request("channel_send", { channel: "updates", text: "channel unread" });
+  const ui = await startConsole(120, 32);
+  assert.match(ui.rows()[0], /2 live · 0 reconnecting · 0 held · 2 unread/);
+  const state = await human.readState({ scope: "session", sessionId: alpha.session.id });
+  const page = await human.historyPage({ scope: "session", sessionId: alpha.session.id });
+  await human.markRead(state.scope, page.messages.at(-1)!.order, state.version);
+  await ui.until(() => ui.rows()[0].includes("1 unread"), "shared read marker updates total");
+  const gone = await env.watch((e) => e.type === "session" && e.action === "gone" && e.name === "beta");
+  beta.client.close();
+  await gone.event;
+  await ui.until(() => ui.rows()[0].includes("1 live · 1 reconnecting"), "gone session counter");
+  const returned = await env.adapter("omp", "counter-beta", "beta");
+  assert.equal(returned.session.id, beta.session.id);
+  await ui.until(() => ui.rows()[0].includes("2 live · 0 reconnecting"), "reconnected identity counter");
+});
+
+test("compact tabs remain mouse reachable without stealing the connection hit area", async () => {
+  env = await startEnv();
+  const ui = await startConsole(20, 12);
+  for (const [key, initial, expected] of [
+    ["i", "I", "Senders"], ["#", "C", "No channels yet"], ["s", "S", "No sessions yet"],
+  ]) {
+    await ui.press(key);
+    await ui.press("s");
+    const header = ui.rows()[0];
+    const column = header.indexOf(initial);
+    assert.ok(column >= 0 && column < header.indexOf("●"), `${initial} precedes connection`);
+    await ui.click(column);
+    assert.ok(ui.rows()[1].includes(expected), `${initial} opens its tab`);
+    const before = ui.rows().slice(1);
+    await ui.click(ui.rows()[0].indexOf("●"));
+    assert.deepEqual(ui.rows().slice(1), before, "connection is not a clipped tab target");
+    assertWithin(ui);
+  }
+  await ui.press("a");
+  const before = ui.rows().slice(1);
+  await ui.press("s");
+  await ui.click(ui.rows()[0].indexOf("A"));
+  assert.deepEqual(ui.rows().slice(1), before, "Activity mouse target selects the same view as its key");
+});
 
 test("wrapping keeps every visible character within the cell width", () => {
   const cases: [string, number][] = [
@@ -209,7 +289,6 @@ test("narrow console reaches every wrapped row and marks an open conversation re
   assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow picker is not boxed");
   assert.equal(await unread(human, alpha.session.id), 1, "the picker alone does not mark anything read");
   await ui.press("ENTER");
-  assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow conversation is not boxed");
   await ui.until(async () => await unread(human, alpha.session.id) === 0, "opening shows the newest row and reads it");
 
   await ui.press("HOME");
@@ -267,7 +346,7 @@ test("new arrivals keep a scrolled reader in place, and the composer sends once 
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(alpha.deliveries.length, pending + 1, "sent exactly once");
   assert.equal(alpha.deliveries.at(-1)!.msg.text, "hello\nthere");
-  assert.ok(!ui.rows().some((row) => row.startsWith("› hello") || row.includes("› there")), "draft cleared after send");
+  assert.ok(!ui.rows().some((row) => row.includes("› hello") || row.includes("› there")), "draft cleared after send");
 });
 
 test("session list shows short harness labels without losing state or unread badges", async () => {
@@ -328,7 +407,7 @@ test("rounded panes resize at the wide boundary without overflowing or moving mo
         assert.ok(rendered.length <= height, `${columns}×${height}: frame exceeds the terminal height`);
         for (const row of rendered) assert.ok(terminalTextWidth(row) <= columns, `${columns}×${height}: ${row}`);
         if (columns < 80) {
-          assert.ok(rendered.every((row) => !row.includes("╭") && !row.includes("╰")), "narrow picker stays unboxed");
+          assert.ok(rendered.every((row) => !row.includes("╭") || row.startsWith("╭─ to ")), "only the composer may be boxed in narrow mode");
           continue;
         }
         const top = height >= 4 ? 1 : 0;
@@ -380,16 +459,43 @@ test("rounded panes resize at the wide boundary without overflowing or moving mo
     assert.equal(await unread(human, alpha.session.id), 1, "the conversation border is not a transcript hit");
     await click(listWidth + 2, messageRow);
     assert.equal(await unread(human, alpha.session.id), 0, "the inset transcript hit reads the visible newest row");
-    const composerRow = rows().findIndex((row) => row.slice(listWidth + 2).startsWith("› "));
+    const composerRow = rows().findIndex((row) => row.slice(listWidth + 2).startsWith("│› "));
     assert.ok(composerRow > messageRow);
+    const promptColumn = rows()[composerRow]!.indexOf("› ", listWidth + 2);
     await click(listWidth + 2, composerRow);
+    const beforeTyping = frame;
     await press("x");
-    assert.deepEqual(frame.cursor, { row: composerRow, column: listWidth + 5 }, "composer cursor includes border and prompt insets");
+    assert.deepEqual(frame.cursor, { row: composerRow, column: promptColumn + terminalTextWidth("› x") }, "composer cursor follows the typed text inside both borders");
+    assert.deepEqual(changedTerminalRows(beforeTyping, frame, size), [composerRow], "typing without a wrap redraws only the input row");
     await resize(80, 8);
     assert.ok(frame.cursor && frame.cursor.column > paneWidths(80)!.list + 1 && frame.cursor.column < 79);
     assert.ok(frame.cursor.row >= 2 && frame.cursor.row < 6, "resized composer cursor stays above the bottom border");
     await press("ENTER");
     assert.equal((await alpha.nextDelivery()).msg.text, "x", "mouse-focused composer sends to the selected identity after resize");
+
+    await press("ESCAPE");
+    await resize(79, 18);
+    const narrowPromptRow = rows().findIndex((row) => row.startsWith("│› "));
+    assert.ok(narrowPromptRow >= 0, "the narrow conversation exposes the boxed composer");
+    assert.ok(rows().filter((row) => row.includes("╭")).every((row) => row.startsWith("╭─ to ")), "the narrow picker has no outer box");
+    await click(1, narrowPromptRow);
+    const draft = "0123456789abcdefghijklmnopqrstuvwxyz";
+    for (const character of draft) await press(character);
+    await press("ALT_ENTER");
+    await press("z");
+    await press("CTRL_J");
+    await press("y");
+    for (const [columns, height] of [[20, 8], [5, 6], [79, 5], [79, 3], [79, 1], [80, 5], [100, 18]] as const) {
+      await resize(columns, height);
+      assert.ok(rows().length <= height);
+      for (const row of rows()) assert.ok(terminalTextWidth(row) <= columns);
+      assert.ok(frame.cursor, `${columns}×${height}: focused editor has an input cell`);
+      assert.ok(frame.cursor.row >= 0 && frame.cursor.row < height);
+      assert.ok(frame.cursor.column >= 0 && frame.cursor.column < columns);
+      assert.ok(!"╭╮╰╯│─".includes(rows()[frame.cursor.row]![frame.cursor.column]!), "wrapped cursor never lands on a border");
+    }
+    await press("ENTER");
+    assert.equal((await alpha.nextDelivery()).msg.text, `${draft}\nz\ny`, "hard-wrapping and short-pane fallbacks preserve the full multiline draft");
 
     await press("ESCAPE");
     await press("a");
@@ -455,5 +561,54 @@ test("unread archived sessions remain distinguishable at the 80-column boundary"
   assert.ok(archived.some((row) => row.includes("al")), "alpha retains a visible name prefix");
   assert.ok(archived.some((row) => row.includes("br")), "bravo retains a distinct visible name prefix");
   for (const row of archived) assert.ok(row.includes("+1"), "unread count remains visible");
+  assertWithin(ui);
+});
+
+test("chrome header shows all counters and highlights the active tab as a pill", async () => {
+  env = await startEnv();
+  await env.adapter("omp", "chrome-header", "reviewer");
+  const ui = await startConsole(120, 32);
+  assert.match(ui.rows()[0], /1 live · 0 reconnecting · 0 held · 0 unread/);
+  assert.match(ui.rows()[0], /● connected$/);
+  const spans = ui.frame().lines[0] as readonly { text: string; style?: { inverse?: boolean } }[];
+  assert.ok(spans.some((span) => span.text.includes("Sessions") && span.style?.inverse), "active Sessions tab is an inverse pill");
+  await ui.press("i");
+  const inbox = ui.frame().lines[0] as typeof spans;
+  assert.ok(inbox.some((span) => span.text.includes("Inbox") && span.style?.inverse), "the active pill follows keyboard tab changes");
+  assertWithin(ui);
+});
+
+test("chrome footer renders context keys as inverse chips with dim labels", async () => {
+  env = await startEnv();
+  await env.adapter("omp", "chrome-footer", "reviewer");
+  const ui = await startConsole(120, 32);
+  const footer = ui.frame().lines.at(-1) as readonly { text: string; style?: { inverse?: boolean; dim?: boolean } }[];
+  assert.ok(footer.some((span) => /Enter|⏎/.test(span.text) && span.style?.inverse), "Enter is an inverse key chip");
+  assert.ok(footer.some((span) => span.text.includes("open") && span.style?.dim && !span.style.inverse), "open is a dim label rather than part of the key chip");
+  await ui.press("c");
+  const composerFooter = ui.frame().lines.at(-1) as typeof footer;
+  assert.ok(composerFooter.some((span) => /Shift\+Enter|⇧⏎/.test(span.text) && span.style?.inverse), "composer newline key stays discoverable");
+  assertWithin(ui);
+});
+
+test("chrome composer is a focused rounded box with target and editing hints", async () => {
+  env = await startEnv();
+  const reviewer = await env.adapter("omp", "chrome-composer", "reviewer");
+  const ui = await startConsole(120, 32);
+  await ui.press("c");
+  const listWidth = paneWidths(120)!.list;
+  const conversation = ui.rows().map((row) => row.slice(listWidth + 2, -1));
+  const titleRow = conversation.findIndex((row) => row.startsWith("╭─ to reviewer "));
+  assert.ok(titleRow > 1, "composer target is inset into a separate top border");
+  assert.ok(conversation[titleRow + 1].startsWith("│› "), "prompt sits inside the composer");
+  assert.ok(conversation[titleRow + 2].startsWith("╰"), "composer has its own rounded bottom border");
+  assert.ok(conversation.some((row) => row.includes("⏎ send") && row.includes("⇧⏎ newline") && row.includes("^E editor")), "editing hints are visible in the composer");
+  const title = ui.frame().lines[titleRow] as readonly { text: string; style?: { foreground?: string } }[];
+  assert.ok(title.some((span) => span.text.includes("╭") && span.style?.foreground === "cyan"), "focused composer border is cyan");
+  await ui.type("hello");
+  await ui.press("SHIFT_ENTER");
+  await ui.type("there");
+  await ui.press("ENTER");
+  assert.equal((await reviewer.nextDelivery()).msg.text, "hello\nthere");
   assertWithin(ui);
 });
