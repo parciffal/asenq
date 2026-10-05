@@ -90,7 +90,7 @@ function assertWithin(ui: Console): void {
 
 const size = { columns: 10, rows: 4 };
 
-test("header hydrates held messages and follows hold, release, drop and target removal", async () => {
+test("header hydrates held messages and follows hold, release, drop, removal and revival", async () => {
   env = await startEnv();
   const human = env.human();
   const alpha = await env.adapter("omp", "held-alpha", "alpha");
@@ -105,14 +105,20 @@ test("header hydrates held messages and follows hold, release, drop and target r
   const ui = await startConsole(120, 32);
   assert.match(ui.rows()[0], /2 live · 0 reconnecting · 2 held · 0 unread/);
 
-  await hold("keep until removal");
+  const pending = await hold("keep until removal");
   await ui.until(() => ui.rows()[0].includes("3 held"), "new held message");
   await human.request("release", { msgId: release });
   await ui.until(() => ui.rows()[0].includes("2 held"), "released message leaves held count");
   await human.request("drop", { msgId: drop });
   await ui.until(() => ui.rows()[0].includes("1 held"), "dropped message leaves held count");
   await beta.client.request("unregister");
-  await ui.until(() => /1 live · 0 reconnecting · 0 held/.test(ui.rows()[0]), "removed target expires remaining held messages");
+  await ui.until(() => /1 live · 0 reconnecting · 1 held/.test(ui.rows()[0]), "removed target keeps held messages");
+  const revived = await env.adapter("omp", "held-beta", "ignored");
+  assert.deepEqual(revived.session, beta.session);
+  await ui.until(() => /2 live · 0 reconnecting · 1 held/.test(ui.rows()[0]), "revived target keeps held messages");
+  await human.request("release", { msgId: pending });
+  assert.equal((await revived.nextDelivery()).msg.id, pending);
+  await ui.until(() => /2 live · 0 reconnecting · 0 held/.test(ui.rows()[0]), "release after revival clears held count");
   assertWithin(ui);
 });
 

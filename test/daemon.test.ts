@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, test } from "node:test";
 import { claudeFrame, parseEnvelopeReply, replyAddr } from "../src/daemon/claude.js";
 import { Daemon } from "../src/daemon/daemon.js";
@@ -100,13 +101,14 @@ test("client rejects an old daemon before requesting new history operations", as
   }
 });
 
-test("registration: slug names, collision suffix, takeover of a gone session keeps its queue", async () => {
+test("registration: different harness ids in the same cwd stay distinct, even when the requested name is gone", async () => {
   env = await startEnv();
   const human = env.human();
   const k1 = await env.adapter("opencode", "k1", "Worker API");
   assert.equal(k1.session.name, "worker-api");
   const k2 = await env.adapter("opencode", "k2", "Worker API");
   assert.equal(k2.session.name, "worker-api-2");
+  assert.notEqual(k2.session.id, k1.session.id);
 
   const gone = await env.watch(isSession("gone", "worker-api"));
   k1.client.close();
@@ -114,14 +116,20 @@ test("registration: slug names, collision suffix, takeover of a gone session kee
   const [queued] = await send(human, "worker-api", "while you were away");
   assert.equal(queued.status, "queued");
 
-  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
   const k3 = await env.adapter("opencode", "k3", "Worker API");
-  assert.deepEqual(k3.session, k1.session);
-  assert.equal((await k3.nextDelivery()).msg.id, queued.msgId);
-  await delivered.event;
+  assert.equal(k3.session.name, "worker-api-3");
+  assert.notEqual(k3.session.id, k1.session.id);
+  assert.equal(await sessionState(human, "worker-api"), "gone");
+  assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+  assert.deepEqual(k3.deliveries, []);
 
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const resumed = await env.adapter("opencode", "k1", "ignored-request");
+  assert.deepEqual(resumed.session, k1.session);
+  assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
+  await delivered.event;
   const other = await env.adapter("opencode", "k4", "Worker API", { cwd: "/elsewhere" });
-  assert.equal(other.session.name, "worker-api-3");
+  assert.equal(other.session.name, "worker-api-4");
 });
 
 test("fallback names come from the key when the requested name is reserved or empty", async () => {
@@ -287,7 +295,7 @@ test("policy: hold, refuse, duplicate drop and rate limit", async () => {
   assert.deepEqual([over.status, over.reason], ["rejected", "rate_limited"]);
 });
 
-test("grace expiry: a message to a vanished session expires and the sender is told", async () => {
+test("grace expiry removes the transport but preserves the queue without a delivery-failure notice", async () => {
   env = await startEnv();
   const human = env.human();
   const a = await env.adapter("omp", "a", "alpha");
@@ -301,13 +309,1080 @@ test("grace expiry: a message to a vanished session expires and the sender is to
   env.clock.advance(GRACE_MS - 1);
   env.daemon.sweep();
   assert.equal((await logOf(human, r.msgId!)).status, "queued");
+  assert.equal(await sessionState(human, "beta"), "gone");
   env.clock.advance(1);
   env.daemon.sweep();
-  assert.equal((await logOf(human, r.msgId!)).status, "expired");
-  const notice = await a.nextDelivery();
-  assert.equal(notice.msg.from, "asenq");
-  assert.match(notice.text, new RegExp(`Message ${r.msgId} to beta was not delivered`));
+  assert.equal((await logOf(human, r.msgId!)).status, "queued");
   assert.equal(await sessionState(human, "beta"), undefined);
+  assert.equal((await human.sync()).sessions.find((session) => session.id === b.session.id)?.state, "removed");
+  assert.deepEqual(a.deliveries, []);
+
+  const delivered = await env.watch(isStatus(r.msgId, "delivered"));
+  const resumed = await env.adapter("omp", "b", "different-request");
+  assert.deepEqual(resumed.session, b.session);
+  assert.equal((await resumed.nextDelivery()).msg.id, r.msgId);
+  await delivered.event;
+  assert.equal((await logOf(human, r.msgId!)).status, "delivered");
+  assert.deepEqual(a.deliveries, []);
+});
+
+test("Claude live resume recognizes the session id before a changed process key and keeps its renamed queue", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const first = (await human.request("claude_hook", {
+    event: "start", key: "process1", socket: null, sessionId: "A", name: "claude-original", cwd: "/work",
+  })).session as { id: string; name: string };
+  const attached = env.human();
+  await attached.request("claude_attach", { sessionId: "A" });
+  await attached.request("rename", { name: "niche-manager" });
+  const [queued] = await send(human, "niche-manager", "saved for the resumed conversation");
+  assert.equal(queued.status, "queued");
+
+  const resumed = (await human.request("claude_hook", {
+    event: "start", key: "process2", socket: null, sessionId: "A", name: "different-request", cwd: "/work",
+  })).session as { id: string; name: string };
+  assert.deepEqual(resumed, { id: first.id, name: "niche-manager" });
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts as string[];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /saved for the resumed conversation/);
+  assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: first.id })).messages.map(
+    (message) => [message.id, message.toSessionId, message.status],
+  ), [[queued.msgId, first.id, "delivered"]]);
+  assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts, []);
+});
+
+const originalClaudeTranscript = fileURLToPath(new URL("../../test/fixtures/claude-lineage-original.jsonl", import.meta.url));
+const resumedClaudeTranscript = fileURLToPath(new URL("../../test/fixtures/claude-lineage-resumed.jsonl", import.meta.url));
+const originalClaudeId = "8dab0f9b-86f5-4bdb-a8d7-d3771dd75179";
+const resumedClaudeId = "5caef88d-869b-41cd-990c-83f2032f0856";
+
+test("Claude real resume lineage keeps the renamed identity and queued delivery across new session and process ids", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const first = (await human.request("claude_hook", {
+    event: "start", key: "original-process", socket: null, sessionId: originalClaudeId,
+    transcriptPath: originalClaudeTranscript, source: "startup", name: "claude-original",
+  })).session as { id: string; name: string };
+  await human.request("rename", { from: first.name, name: "niche-manager" });
+  const [queued] = await send(human, "niche-manager", "saved across real Claude resume");
+  assert.equal(queued.status, "queued");
+  await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+
+  const resumed = (await human.request("claude_hook", {
+    event: "start", key: "resumed-process", socket: null, sessionId: resumedClaudeId,
+    transcriptPath: resumedClaudeTranscript, source: "resume", name: "claude-resumed",
+  })).session as { id: string; name: string };
+  assert.deepEqual(resumed, { id: first.id, name: "niche-manager" });
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: resumedClaudeId })).texts as string[];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /saved across real Claude resume/);
+  assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: first.id })).messages.map(
+    (message) => [message.id, message.toSessionId, message.status],
+  ), [[queued.msgId, first.id, "delivered"]]);
+  assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: resumedClaudeId })).texts, []);
+});
+
+test("Claude overlapping live lineage is a fork and cannot later steal the original queue", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = (await human.request("claude_hook", {
+    event: "start", key: "original-process", sessionId: originalClaudeId, name: "original",
+    transcriptPath: originalClaudeTranscript, source: "startup",
+  })).session as { id: string; name: string };
+  const [originalQueue] = await send(human, original.name, "belongs only to the original");
+  const fork = (await human.request("claude_hook", {
+    event: "start", key: "fork-process", sessionId: resumedClaudeId, name: "fork",
+    transcriptPath: resumedClaudeTranscript, source: "resume",
+  })).session as { id: string; name: string };
+  assert.notEqual(fork.id, original.id);
+  const [forkQueue] = await send(human, fork.name, "belongs only to the fork");
+  await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+  const texts = (await human.request("claude_hook", {
+    event: "poll", sessionId: resumedClaudeId, transcriptPath: resumedClaudeTranscript,
+  })).texts as string[];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /belongs only to the fork/);
+  assert.equal((await logOf(human, originalQueue.msgId!)).status, "queued");
+  assert.equal((await logOf(human, forkQueue.msgId!)).status, "delivered");
+  assert.deepEqual((await env.human().request("claude_attach", { sessionId: resumedClaudeId })).session, fork);
+
+  const third = (await human.request("claude_hook", {
+    event: "start", key: "third-process", sessionId: "third", name: "third",
+    transcriptPath: originalClaudeTranscript, source: "resume",
+  })).session as { id: string; name: string };
+  assert.notEqual(third.id, original.id);
+  assert.notEqual(third.id, fork.id);
+  assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: "third" })).texts, []);
+  assert.equal((await logOf(human, originalQueue.msgId!)).status, "queued");
+});
+
+test("Claude ambiguous offline lineage creates a new identity and reports every candidate without moving their queues", async () => {
+  const logs: string[] = [];
+  env = await startEnv({ log: (line) => logs.push(line) });
+  const human = env.human();
+  const candidates: { id: string; name: string }[] = [];
+  const queues: SendResult[] = [];
+  for (const [sessionId, transcriptPath, name] of [
+    [originalClaudeId, originalClaudeTranscript, "original"],
+    [resumedClaudeId, resumedClaudeTranscript, "fork"],
+  ]) {
+    const candidate = (await human.request("claude_hook", {
+      event: "start", key: name + "-process", sessionId, transcriptPath, name, source: "resume",
+    })).session as { id: string; name: string };
+    candidates.push(candidate);
+    queues.push((await send(human, candidate.name, "queue for " + name))[0]);
+  }
+  assert.notEqual(candidates[0].id, candidates[1].id);
+  await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+  await human.request("claude_hook", { event: "end", sessionId: resumedClaudeId });
+  const ambiguousPath = join(env.home, "ambiguous.jsonl");
+  writeFileSync(ambiguousPath, readFileSync(resumedClaudeTranscript, "utf8"));
+  const registered = await env.watch(isSession("registered", "ambiguous"));
+  const fresh = (await human.request("claude_hook", {
+    event: "start", key: "ambiguous-process", sessionId: "ambiguous", name: "ambiguous",
+    transcriptPath: ambiguousPath, source: "resume",
+  })).session as { id: string; name: string };
+  assert.ok(candidates.every((candidate) => candidate.id !== fresh.id));
+  const event = await registered.event;
+  assert.equal(event.type, "session");
+  if (event.type !== "session") assert.fail("expected session event");
+  for (const candidate of candidates) {
+    assert.ok(event.reason?.includes(candidate.id), "registration reason includes candidate " + candidate.id);
+  }
+  assert.ok(logs.some((line) => candidates.every((candidate) => line.includes(candidate.id))));
+  writeFileSync(ambiguousPath, '{"type":"file-history-snapshot","messageId":"c3107927-0b2d-4dca-b85c-78e3b06af72d"}\n');
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "poll", sessionId: "ambiguous", transcriptPath: ambiguousPath,
+  })).texts, []);
+  assert.deepEqual((await env.human().request("claude_attach", { sessionId: "ambiguous" })).session, fresh);
+  for (const queued of queues) assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+});
+
+for (const timing of ["start", "later hook"] as const) {
+  test(`Claude partial resume head at ${timing} cannot select a fork before the complete head is ambiguous`, async () => {
+    const logs: string[] = [];
+    env = await startEnv({ log: (line) => logs.push(line) });
+    const human = env.human();
+    const original = (await human.request("claude_hook", {
+      event: "start", key: "original", sessionId: "original", name: "original",
+      transcriptPath: originalClaudeTranscript, source: "startup",
+    })).session as { id: string; name: string };
+    const fork = (await human.request("claude_hook", {
+      event: "start", key: "fork", sessionId: "fork", name: "fork",
+      transcriptPath: resumedClaudeTranscript, source: "resume",
+    })).session as { id: string; name: string };
+    const queues = [
+      (await send(human, original.name, "original's waiting message"))[0],
+      (await send(human, fork.name, "fork's waiting message"))[0],
+    ];
+    await human.request("claude_hook", { event: "end", sessionId: "original" });
+    await human.request("claude_hook", { event: "end", sessionId: "fork" });
+    const fullHead = readFileSync(resumedClaudeTranscript, "utf8");
+    const partialHead = fullHead.split("\n").slice(0, 6).join("\n") + "\n";
+    const path = join(env.home, "growing.jsonl");
+    if (timing === "start") writeFileSync(path, partialHead);
+    const provisional = (await human.request("claude_hook", {
+      event: "start", key: "provisional", sessionId: "provisional", name: "provisional",
+      transcriptPath: path, source: "resume",
+    })).session as { id: string; name: string };
+    assert.notEqual(provisional.id, original.id);
+    assert.notEqual(provisional.id, fork.id);
+    writeFileSync(path, partialHead);
+    assert.deepEqual((await human.request("claude_hook", {
+      event: "poll", sessionId: "provisional", transcriptPath: path,
+    })).texts, []);
+    writeFileSync(path, fullHead);
+    assert.deepEqual((await human.request("claude_hook", {
+      event: "poll", sessionId: "provisional", transcriptPath: path,
+    })).texts, []);
+    assert.deepEqual((await env.human().request("claude_attach", { sessionId: "provisional" })).session, provisional);
+    for (const queued of queues) assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+    assert.ok(logs.some((line) => line.includes(original.id) && line.includes(fork.id)));
+    assert.ok((await human.replay(0)).events.some(({ event }) => event.type === "session"
+      && event.action === "registered" && event.reason?.includes(original.id) && event.reason.includes(fork.id)));
+  });
+}
+
+test("Claude three-line original resume stays provisional until eight complete head lines arrive", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const originalPath = join(env.home, "short-original.jsonl");
+  const resumedPath = join(env.home, "short-resumed.jsonl");
+  const shortHead = '{"type":"mode"}\n{"type":"user","uuid":"short-user"}\n{"type":"assistant","uuid":"short-reply"}\n';
+  writeFileSync(originalPath, shortHead);
+  const original = (await human.request("claude_hook", {
+    event: "start", key: "short-original", sessionId: "short-original", name: "niche-manager",
+    transcriptPath: originalPath, source: "startup",
+  })).session as { id: string; name: string };
+  const [queued] = await send(human, original.name, "waiting for a complete copied head");
+  await human.request("claude_hook", { event: "end", sessionId: "short-original" });
+  writeFileSync(resumedPath, shortHead);
+  const provisional = (await human.request("claude_hook", {
+    event: "start", key: "short-resumed", sessionId: "short-resumed", name: "temporary",
+    transcriptPath: resumedPath, source: "resume",
+  })).session as { id: string; name: string };
+  assert.notEqual(provisional.id, original.id);
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "poll", sessionId: "short-resumed", transcriptPath: resumedPath,
+  })).texts, []);
+  assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+  writeFileSync(resumedPath, shortHead + Array.from({ length: 6 }, (_, index) =>
+    JSON.stringify({ type: "attachment", uuid: `new-entry-${index}` }) + "\n").join(""));
+  assert.deepEqual((await env.human().request("claude_attach", { sessionId: "short-resumed" })).session, original);
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: "short-resumed" })).texts as string[];
+  assert.match(texts[0], /waiting for a complete copied head/);
+  assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+  assert.ok(!(await human.sync()).sessions.some((session) => session.id === provisional.id));
+});
+
+for (const timing of ["start", "later hook"] as const) {
+  test(`Claude complete unmatched resume head at ${timing} stays its own identity after a later fork ends`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const path = timing === "start" ? originalClaudeTranscript : join(env.home, "initially-missing.jsonl");
+    const original = (await human.request("claude_hook", {
+      event: "start", key: "root-process", sessionId: "root", name: "root",
+      transcriptPath: path, source: "resume",
+    })).session as { id: string; name: string };
+    if (timing === "later hook") {
+      writeFileSync(path, readFileSync(originalClaudeTranscript, "utf8"));
+      await human.request("claude_hook", { event: "reconcile", sessionId: "root", transcriptPath: path });
+    }
+    const [originalQueue] = await send(human, original.name, "belongs to the root");
+    const fork = (await human.request("claude_hook", {
+      event: "start", key: "fork-process", sessionId: "fork", name: "fork",
+      transcriptPath: resumedClaudeTranscript, source: "resume",
+    })).session as { id: string; name: string };
+    assert.notEqual(fork.id, original.id);
+    const [forkQueue] = await send(human, fork.name, "belongs only to the fork");
+    await human.request("claude_hook", { event: "end", sessionId: "fork" });
+    const texts = (await human.request("claude_hook", {
+      event: "poll", sessionId: "root", transcriptPath: path,
+    })).texts as string[];
+    assert.equal(texts.length, 1);
+    assert.match(texts[0], /belongs to the root/);
+    assert.deepEqual((await env.human().request("claude_attach", { sessionId: "root" })).session, original);
+    assert.equal((await logOf(human, originalQueue.msgId!)).status, "delivered");
+    assert.equal((await logOf(human, forkQueue.msgId!)).status, "queued");
+    const snapshot = await human.sync();
+    assert.equal(snapshot.sessions.find((session) => session.id === original.id)?.name, "root");
+    assert.equal(snapshot.sessions.find((session) => session.id === fork.id)?.state, "removed");
+  });
+}
+
+test("Claude chained lineage unions old and new fingerprints durably across daemon reopen", async () => {
+  env = await startEnv();
+  let human = env.human();
+  const original = (await human.request("claude_hook", {
+    event: "start", key: "original-process", sessionId: originalClaudeId, name: "niche-manager",
+    transcriptPath: originalClaudeTranscript, source: "startup",
+  })).session as { id: string; name: string };
+  await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "start", key: "resumed-process", sessionId: resumedClaudeId,
+    transcriptPath: resumedClaudeTranscript, source: "resume",
+  })).session, original);
+  const [queued] = await send(human, original.name, "survives chained resume and reopen");
+  await human.request("claude_hook", { event: "end", sessionId: resumedClaudeId });
+  await env.restart();
+  human = env.human();
+  const chainPath = join(env.home, "chain.jsonl");
+  writeFileSync(chainPath, '{"type":"file-history-snapshot","messageId":"c3107927-0b2d-4dca-b85c-78e3b06af72d"}\n' + "{}\n".repeat(7));
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "start", key: "third-process", sessionId: "third", transcriptPath: chainPath, source: "resume",
+  })).session, original);
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: "third" })).texts as string[];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /survives chained resume and reopen/);
+  assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+  await human.request("claude_hook", { event: "end", sessionId: "third" });
+  writeFileSync(chainPath, '{"type":"attachment","uuid":"7206c438-04ba-4b22-9553-1587dad1be33"}\n' + "{}\n".repeat(7));
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "start", key: "fourth-process", sessionId: "fourth", transcriptPath: chainPath, source: "resume",
+  })).session, original);
+});
+
+for (const initialHead of ["missing", "empty", "new hook only"] as const) {
+  for (const reconciliation of ["poll", "attach"] as const) {
+    test(`Claude late ${reconciliation} after ${initialHead} SessionStart merges provisional queues, history, mappings and bindings`, async () => {
+      env = await startEnv();
+      const human = env.human();
+      const sender = await env.adapter("omp", "sender", "sender");
+      const ancestor = (await human.request("claude_hook", {
+        event: "start", key: "original-process", sessionId: originalClaudeId, name: "original",
+        transcriptPath: originalClaudeTranscript, source: "startup",
+      })).session as { id: string; name: string };
+      await human.request("rename", { from: ancestor.name, name: "niche-manager" });
+      await human.request("set_inbound", { name: "niche-manager", mode: "hold" });
+      const [held] = await send(sender.client, "niche-manager", "ancestor held decision");
+      const [oldQueue] = await send(human, "niche-manager", "ancestor queued message");
+      await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+
+      const latePath = join(env.home, "late.jsonl");
+      if (initialHead === "empty") writeFileSync(latePath, "");
+      if (initialHead === "new hook only") {
+        writeFileSync(latePath, '{"type":"attachment","uuid":"new-session-start-hook"}\n');
+      }
+      const provisional = (await human.request("claude_hook", {
+        event: "start", key: "resumed-process", sessionId: resumedClaudeId, name: "provisional",
+        transcriptPath: latePath, source: "resume",
+      })).session as { id: string; name: string };
+      assert.notEqual(provisional.id, ancestor.id);
+      const bound = env.human();
+      assert.deepEqual((await bound.request("claude_attach", { sessionId: resumedClaudeId })).session, provisional);
+      const [newQueue] = await send(human, provisional.name, "provisional queued message");
+      const [outgoing] = await send(bound, "human", "provisional history for human");
+      assert.deepEqual([held.status, oldQueue.status, newQueue.status, outgoing.status], ["held", "queued", "queued", "posted"]);
+      await human.request("set_inbound", { name: provisional.name, mode: "refuse" });
+      writeFileSync(latePath, readFileSync(resumedClaudeTranscript, "utf8"));
+      const removed = await env.watch(isSession("removed", provisional.name));
+
+      let texts: string[];
+      if (reconciliation === "attach") {
+        assert.deepEqual((await env.human().request("claude_attach", { sessionId: resumedClaudeId })).session, {
+          id: ancestor.id, name: "niche-manager",
+        });
+        texts = (await human.request("claude_hook", { event: "poll", sessionId: resumedClaudeId })).texts as string[];
+      } else {
+        texts = (await human.request("claude_hook", {
+          event: "poll", sessionId: resumedClaudeId, transcriptPath: latePath,
+        })).texts as string[];
+      }
+      assert.equal(texts.length, 2);
+      assert.match(texts[0], /ancestor queued message/);
+      assert.match(texts[1], /provisional queued message/);
+      const removedEvent = await removed.event;
+      assert.equal(removedEvent.type, "session");
+      if (removedEvent.type !== "session") assert.fail("expected removal event");
+      assert.equal(removedEvent.reason, "merged into niche-manager");
+      const snapshot = await human.sync();
+      assert.equal(snapshot.sessions.some((session) => session.id === provisional.id), false);
+      const revived = snapshot.sessions.find((session) => session.id === ancestor.id)!;
+      assert.deepEqual([revived.name, revived.inbound, revived.state, revived.previousNames], [
+        "niche-manager", "hold", "live", ["original", "provisional"],
+      ]);
+      for (const sessionId of [originalClaudeId, resumedClaudeId]) {
+        assert.deepEqual((await env.human().request("claude_attach", { sessionId })).session, {
+          id: ancestor.id, name: "niche-manager",
+        });
+      }
+      assert.equal(((await bound.request("list")).sessions as { name: string; you: boolean }[]).find((session) => session.you)?.name, "niche-manager");
+      assert.deepEqual((await human.historyPage({ scope: "session", sessionId: ancestor.id })).messages.map(
+        (message) => [message.id, message.fromSessionId, message.toSessionId, message.status],
+      ), [
+        [held.msgId, sender.session.id, ancestor.id, "held"],
+        [oldQueue.msgId, undefined, ancestor.id, "delivered"],
+        [newQueue.msgId, undefined, ancestor.id, "delivered"],
+        [outgoing.msgId, ancestor.id, undefined, "posted"],
+      ]);
+      assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: resumedClaudeId })).texts, []);
+      assert.equal((await human.request("release", { msgId: held.msgId })).status, "queued");
+      const released = (await human.request("claude_hook", { event: "poll", sessionId: resumedClaudeId })).texts as string[];
+      assert.equal(released.length, 1);
+      assert.match(released[0], /ancestor held decision/);
+    });
+  }
+}
+
+for (const initialHead of ["missing", "empty", "new hook only"] as const) {
+  test(`Claude socket late reconciliation after ${initialHead} transfers ancestor delivery without polling twice`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const ancestor = (await human.request("claude_hook", {
+      event: "start", key: "original-process", sessionId: originalClaudeId, name: "niche-manager",
+      transcriptPath: originalClaudeTranscript, source: "startup",
+    })).session as { id: string; name: string };
+    const [oldQueue] = await send(human, ancestor.name, "ancestor socket delivery");
+    await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+    const latePath = join(env.home, "late-socket.jsonl");
+    if (initialHead === "empty") writeFileSync(latePath, "");
+    if (initialHead === "new hook only") writeFileSync(latePath, '{"type":"attachment","uuid":"new-hook"}\n');
+    const sock = join(env.home, "claude.sock");
+    const fake = await fakeClaude(sock);
+    try {
+      const provisional = (await human.request("claude_hook", {
+        event: "start", key: sock, socket: sock, sessionId: resumedClaudeId, name: "provisional",
+        transcriptPath: latePath, source: "resume",
+      })).session as { id: string; name: string };
+      assert.notEqual(provisional.id, ancestor.id);
+      const [alreadyDelivered] = await send(human, provisional.name, "delivered before lineage");
+      assert.equal(alreadyDelivered.status, "delivered");
+      assert.match(await fake.nextLine(), /delivered before lineage/);
+      writeFileSync(latePath, readFileSync(resumedClaudeTranscript, "utf8"));
+      const delivered = await env.watch(isStatus(oldQueue.msgId, "delivered"));
+      await human.request("claude_hook", {
+        event: "reconcile", sessionId: resumedClaudeId, transcriptPath: latePath,
+      });
+      assert.match(await fake.nextLine(), /ancestor socket delivery/);
+      await delivered.event;
+      assert.equal((await logOf(human, oldQueue.msgId!)).status, "delivered");
+      assert.deepEqual((await human.request("claude_hook", {
+        event: "poll", sessionId: resumedClaudeId, transcriptPath: latePath,
+      })).texts, []);
+      await env.daemon.retry();
+      assert.equal(fake.lines.length, 2);
+      assert.deepEqual((await env.human().request("claude_attach", { sessionId: resumedClaudeId })).session, ancestor);
+      assert.deepEqual((await human.historyPage({ scope: "session", sessionId: ancestor.id })).messages.map(
+        (message) => [message.id, message.toSessionId, message.status],
+      ), [[oldQueue.msgId, ancestor.id, "delivered"], [alreadyDelivered.msgId, ancestor.id, "delivered"]]);
+    } finally {
+      await fake.stop();
+    }
+  });
+}
+
+for (const largerMarker of ["ancestor", "provisional"] as const) {
+  for (const reminders of ["ancestor", "provisional", "both"] as const) {
+    test(`Claude late merge keeps MAX ${largerMarker} human read position and ${reminders} reminders`, async () => {
+      const logs: string[] = [];
+      env = await startEnv({ log: (line) => logs.push(line) });
+      const human = env.human();
+      const ancestor = (await human.request("claude_hook", {
+        event: "start", key: "original-process", sessionId: originalClaudeId, name: "niche-manager",
+        transcriptPath: originalClaudeTranscript, source: "startup",
+      })).session as { id: string; name: string };
+      const oldBound = env.human();
+      await oldBound.request("claude_attach", { sessionId: originalClaudeId });
+      const [oldMessage] = await send(oldBound, "human", "ancestor history");
+      const ancestorScope = { scope: "session" as const, sessionId: ancestor.id };
+      const oldOrder = (await human.historyPage(ancestorScope)).messages.find((message) => message.id === oldMessage.msgId)!.order;
+      const oldRead = await human.readState(ancestorScope);
+      assert.equal((await human.markRead(ancestorScope, oldOrder, oldRead.version)).applied, true);
+      if (reminders !== "provisional") await human.markUnread(ancestorScope);
+      await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+
+      const latePath = join(env.home, "late-read.jsonl");
+      const provisional = (await human.request("claude_hook", {
+        event: "start", key: "resumed-process", sessionId: resumedClaudeId, name: "provisional",
+        transcriptPath: latePath, source: "resume",
+      })).session as { id: string; name: string };
+      const newBound = env.human();
+      await newBound.request("claude_attach", { sessionId: resumedClaudeId });
+      const [newMessage] = await send(newBound, "human", "provisional history");
+      const provisionalScope = { scope: "session" as const, sessionId: provisional.id };
+      const newOrder = (await human.historyPage(provisionalScope)).messages.find((message) => message.id === newMessage.msgId)!.order;
+      assert.ok(newOrder > oldOrder);
+      if (largerMarker === "provisional") {
+        const read = await human.readState(provisionalScope);
+        assert.equal((await human.markRead(provisionalScope, newOrder, read.version)).applied, true);
+      }
+      if (reminders !== "ancestor") await human.markUnread(provisionalScope);
+      const beforeMerge = await human.readState(ancestorScope);
+      writeFileSync(latePath, readFileSync(resumedClaudeTranscript, "utf8"));
+      assert.deepEqual((await newBound.request("claude_attach", { sessionId: resumedClaudeId })).session, ancestor);
+      const merged = await human.readState(ancestorScope);
+      const expectedPosition = largerMarker === "ancestor" ? oldOrder : newOrder;
+      const expectedReminder = reminders === "provisional" ? newOrder : oldOrder;
+      const expectedUnread = largerMarker === "ancestor" && reminders !== "provisional" ? 2 : 1;
+      assert.deepEqual([merged.position, merged.reminder, merged.unread], [
+        expectedPosition, expectedReminder, expectedUnread,
+      ]);
+      assert.deepEqual((await human.historyPage(ancestorScope)).messages.map((message) => [
+        message.id, message.fromSessionId,
+      ]), [[oldMessage.msgId, ancestor.id], [newMessage.msgId, ancestor.id]]);
+      const stale = await human.markRead(ancestorScope, newOrder, beforeMerge.version);
+      assert.equal(stale.applied, false);
+      assert.equal(stale.state.reminder, expectedReminder);
+      if (reminders === "both") {
+        assert.ok(logs.some((line) => line.includes("reminder") && line.includes(String(newOrder)) && line.includes(provisional.id)));
+      }
+      const cleared = await human.markRead(ancestorScope, newOrder, merged.version);
+      assert.deepEqual([cleared.applied, cleared.state.position, cleared.state.reminder, cleared.state.unread], [
+        true, newOrder, null, 0,
+      ]);
+      assert.equal((await human.readState()).some((state) => state.scope.scope === "session" && state.scope.sessionId === provisional.id), false);
+    });
+  }
+}
+
+const ignoredClaudeHeads: [string, string | undefined][] = [
+  ["missing transcript", undefined],
+  ["empty transcript", ""],
+  ["malformed JSON", "{not-json}\n"],
+  ["atis-latch identifiers", '{"type":"atis-latch","uuid":"7206c438-04ba-4b22-9553-1587dad1be33","messageId":"932e7924-5c15-4a0a-b8e1-6188de1037d0","atis":"shared-latch"}\n'],
+  ["nested uuid", '{"type":"attachment","attachment":{"uuid":"7206c438-04ba-4b22-9553-1587dad1be33"}}\n'],
+  ["non-snapshot messageId", '{"type":"mode","messageId":"932e7924-5c15-4a0a-b8e1-6188de1037d0"}\n'],
+  ["ninth-line overlap", '{"type":"mode"}\n'.repeat(8) + '{"type":"file-history-snapshot","messageId":"932e7924-5c15-4a0a-b8e1-6188de1037d0"}\n'],
+];
+for (const [headDescription, head] of ignoredClaudeHeads) {
+  test(`Claude ${headDescription} never claims an unrelated offline identity or its queue`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const ancestor = (await human.request("claude_hook", {
+      event: "start", key: "original-process", sessionId: originalClaudeId, name: "niche-manager",
+      transcriptPath: originalClaudeTranscript, source: "startup",
+    })).session as { id: string; name: string };
+    const [queued] = await send(human, ancestor.name, "must not route to unrelated identity");
+    await human.request("claude_hook", { event: "end", sessionId: originalClaudeId });
+    const path = join(env.home, "unrelated.jsonl");
+    if (head !== undefined) writeFileSync(path, head);
+    const unrelated = (await human.request("claude_hook", {
+      event: "start", key: "unrelated-process", sessionId: "unrelated", name: "unrelated",
+      transcriptPath: path, source: "resume",
+    })).session as { id: string; name: string };
+    assert.notEqual(unrelated.id, ancestor.id);
+    assert.deepEqual((await human.request("claude_hook", {
+      event: "poll", sessionId: "unrelated", transcriptPath: path,
+    })).texts, []);
+    assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+    assert.deepEqual((await env.human().request("claude_attach", { sessionId: "unrelated" })).session, unrelated);
+  });
+}
+
+
+for (const binding of ["recorded session id", "active process key"] as const) {
+  test(`Claude ${binding} wins over changed lineage during compaction or clear`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const original = (await human.request("claude_hook", {
+      event: "start", key: "original-process", sessionId: originalClaudeId, name: "niche-manager",
+      transcriptPath: originalClaudeTranscript, source: "startup",
+    })).session as { id: string; name: string };
+    const fork = (await human.request("claude_hook", {
+      event: "start", key: "fork-process", sessionId: resumedClaudeId, name: "fork",
+      transcriptPath: resumedClaudeTranscript, source: "resume",
+    })).session as { id: string; name: string };
+    assert.notEqual(fork.id, original.id);
+    const [queued] = await send(human, original.name, "original queue through compaction");
+    const changedId = binding === "recorded session id" ? originalClaudeId : "compacted";
+    const changedKey = binding === "recorded session id" ? "new-process" : "original-process";
+    const changedPath = join(env.home, "compacted.jsonl");
+    writeFileSync(changedPath, '{"type":"file-history-snapshot","messageId":"c3107927-0b2d-4dca-b85c-78e3b06af72d"}\n');
+    assert.deepEqual((await human.request("claude_hook", {
+      event: "start", key: changedKey, sessionId: changedId, name: "ignored",
+      transcriptPath: changedPath, source: "compact",
+    })).session, original);
+    const texts = (await human.request("claude_hook", { event: "poll", sessionId: changedId })).texts as string[];
+    assert.equal(texts.length, 1);
+    assert.match(texts[0], /original queue through compaction/);
+    assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+    assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: resumedClaudeId })).texts, []);
+  });
+}
+
+for (const lifecycle of ["gone", "grace removal", "end", "idle removal"] as const) {
+  test(`Claude ${lifecycle} resume keeps identity, rename, queued and held messages across changed process keys`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const sender = await env.adapter("omp", "sender", "sender");
+    const first = (await human.request("claude_hook", {
+      event: "start", key: "process1", socket: lifecycle === "gone" || lifecycle === "grace removal"
+        ? join(env.home, "missing-claude.sock") : null,
+      sessionId: "A", name: "original", cwd: "/work",
+    })).session as { id: string; name: string };
+    const attached = env.human();
+    await attached.request("claude_attach", { sessionId: "A" });
+    await attached.request("rename", { name: "niche-manager" });
+    await human.request("set_inbound", { name: "niche-manager", mode: "hold" });
+    const [held] = await send(sender.client, "niche-manager", "awaiting the human decision");
+    assert.equal(held.status, "held");
+
+    if (lifecycle === "gone" || lifecycle === "grace removal") {
+      await env.daemon.probeClaude();
+      assert.equal(await sessionState(human, "niche-manager"), "gone");
+    }
+    const [queued] = await send(human, "niche-manager", "resume this conversation");
+    assert.equal(queued.status, "queued");
+    if (lifecycle === "grace removal") {
+      env.clock.advance(GRACE_MS);
+      env.daemon.sweep();
+    } else if (lifecycle === "end") {
+      await human.request("claude_hook", { event: "end", sessionId: "A" });
+    } else if (lifecycle === "idle removal") {
+      env.clock.advance(12 * 3_600_000 + 1);
+      await env.daemon.probeClaude();
+    }
+    const before = (await human.sync()).sessions.find((session) => session.id === first.id)!;
+    assert.equal(before.state, lifecycle === "gone" ? "gone" : "removed");
+    assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+    assert.equal((await logOf(human, held.msgId!)).status, "held");
+
+    const resumed = (await human.request("claude_hook", {
+      event: "start", key: "process2", socket: null, sessionId: "A", name: "ignored-request", cwd: "/work",
+    })).session as { id: string; name: string };
+    assert.deepEqual(resumed, { id: first.id, name: "niche-manager" });
+    const current = (await human.sync()).sessions.find((session) => session.id === first.id)!;
+    assert.deepEqual([current.state, current.inbound, current.previousNames], ["live", "hold", ["original"]]);
+    const texts = (await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts as string[];
+    assert.equal(texts.length, 1);
+    assert.match(texts[0], /resume this conversation/);
+    assert.equal((await logOf(human, held.msgId!)).status, "held");
+    assert.equal((await human.request("release", { msgId: held.msgId })).status, "queued");
+    const released = (await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts as string[];
+    assert.equal(released.length, 1);
+    assert.match(released[0], /awaiting the human decision/);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: first.id })).messages.map(
+      (message) => [message.id, message.toSessionId, message.status],
+    ), [[held.msgId, first.id, "delivered"], [queued.msgId, first.id, "delivered"]]);
+    assert.deepEqual(sender.deliveries, []);
+  });
+}
+
+for (const harness of ["omp", "opencode"] as const) {
+  for (const removal of ["grace", "unregister"] as const) {
+    test(`${harness} revival after ${removal} preserves the renamed identity, queued and held delivery`, async () => {
+      env = await startEnv();
+      const human = env.human();
+      const sender = await env.adapter("omp", "sender", "sender");
+      const original = await env.adapter(harness, "retained-key", "original", { autoAck: removal !== "unregister" });
+      await original.client.request("rename", { name: "niche-manager" });
+      await human.request("set_inbound", { name: "niche-manager", mode: "hold" });
+      const [held] = await send(sender.client, "niche-manager", "held through removal");
+      assert.equal(held.status, "held");
+
+      let queued: SendResult;
+      if (removal === "unregister") {
+        const sending = send(human, "niche-manager", "queued through removal");
+        await original.nextDelivery();
+        await original.client.request("unregister");
+        original.client.close();
+        [queued] = await sending;
+      } else {
+        const gone = await env.watch(isSession("gone", "niche-manager"));
+        original.client.close();
+        await gone.event;
+        [queued] = await send(human, "niche-manager", "queued through removal");
+        env.clock.advance(GRACE_MS);
+        env.daemon.sweep();
+      }
+      assert.equal(queued.status, "queued");
+      assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+      assert.equal((await logOf(human, held.msgId!)).status, "held");
+      assert.equal((await human.sync()).sessions.find((session) => session.id === original.session.id)?.state, "removed");
+
+      const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+      const resumed = await env.adapter(harness, "retained-key", "ignored-request", { cwd: "/changed" });
+      assert.deepEqual(resumed.session, { id: original.session.id, name: "niche-manager" });
+      assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
+      await delivered.event;
+      const current = (await human.sync()).sessions.find((session) => session.id === original.session.id)!;
+      assert.deepEqual([current.state, current.inbound, current.cwd, current.previousNames], ["live", "hold", "/changed", ["original"]]);
+      assert.equal((await logOf(human, held.msgId!)).status, "held");
+      assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+      assert.equal((await resumed.nextDelivery()).msg.id, held.msgId);
+      assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+        (message) => [message.id, message.toSessionId, message.status],
+      ), [[held.msgId, original.session.id, "delivered"], [queued.msgId, original.session.id, "delivered"]]);
+      assert.deepEqual(sender.deliveries, []);
+    });
+  }
+}
+
+test("Claude sessions with different ids and process keys in the same cwd do not take over a gone name", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const first = (await human.request("claude_hook", {
+    event: "start", key: "process1", socket: join(env.home, "missing.sock"), sessionId: "A", name: "same-name", cwd: "/work",
+  })).session as { id: string; name: string };
+  await env.daemon.probeClaude();
+  const [queued] = await send(human, "same-name", "only for A");
+  assert.equal(queued.status, "queued");
+  const second = (await human.request("claude_hook", {
+    event: "start", key: "process2", socket: null, sessionId: "B", name: "same-name", cwd: "/work",
+  })).session as { id: string; name: string };
+  assert.notEqual(second.id, first.id);
+  assert.equal(second.name, "same-name-2");
+  assert.equal(await sessionState(human, "same-name"), "gone");
+  assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: "B" })).texts, []);
+  assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+  const resumed = (await human.request("claude_hook", {
+    event: "start", key: "process3", socket: null, sessionId: "A", name: "not-the-stored-name", cwd: "/work",
+  })).session as { id: string; name: string };
+  assert.deepEqual(resumed, first);
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts as string[];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /only for A/);
+  assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+});
+
+for (const previousTransport of ["removed", "rotated"] as const) {
+  test(`Claude reused ${previousTransport} process key does not transfer another harness session's queue`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const original = (await human.request("claude_hook", {
+      event: "start", key: "process1", sessionId: "A", name: "alpha", cwd: "/work",
+    })).session as { id: string; name: string };
+    const [queued] = await send(human, "alpha", "only for A");
+    if (previousTransport === "removed") {
+      await human.request("claude_hook", { event: "end", sessionId: "A" });
+    } else {
+      const resumed = (await human.request("claude_hook", {
+        event: "start", key: "process2", sessionId: "A", cwd: "/work",
+      })).session as { id: string; name: string };
+      assert.deepEqual(resumed, original);
+    }
+    const unrelated = (await human.request("claude_hook", {
+      event: "start", key: "process1", sessionId: "B", name: "beta", cwd: "/work",
+    })).session as { id: string; name: string };
+    assert.notEqual(unrelated.id, original.id);
+    assert.equal(unrelated.name, "beta");
+    assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: "B" })).texts, []);
+    assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+    const revived = (await human.request("claude_hook", {
+      event: "start", key: "process3", sessionId: "A", cwd: "/work",
+    })).session as { id: string; name: string };
+    assert.deepEqual(revived, original);
+    const texts = (await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts as string[];
+    assert.match(texts[0], /only for A/);
+    assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+  });
+}
+
+test("Claude restart reopens the database and preserves removed identity, rename, queue and accumulated session ids", async () => {
+  env = await startEnv();
+  let human = env.human();
+  const first = (await human.request("claude_hook", {
+    event: "start", key: "process1", socket: null, sessionId: "A", name: "original",
+  })).session as { id: string; name: string };
+  const compacted = (await human.request("claude_hook", {
+    event: "start", key: "process1", socket: null, sessionId: "B", name: "ignored-compaction-name",
+  })).session as { id: string; name: string };
+  assert.deepEqual(compacted, first);
+  const attached = env.human();
+  await attached.request("claude_attach", { sessionId: "A" });
+  await attached.request("rename", { name: "niche-manager" });
+  const [queued] = await send(human, "niche-manager", "survives a database reopen");
+  assert.equal(queued.status, "queued");
+  await human.request("claude_hook", { event: "end", sessionId: "B" });
+  assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+
+  await env.restart();
+  human = env.human();
+  assert.equal((await human.sync()).sessions.find((session) => session.id === first.id)?.state, "removed");
+  const resumed = (await human.request("claude_hook", {
+    event: "start", key: "process2", socket: null, sessionId: "A", name: "ignored-resume-name",
+  })).session as { id: string; name: string };
+  assert.deepEqual(resumed, { id: first.id, name: "niche-manager" });
+  const oldId = env.human();
+  assert.deepEqual((await oldId.request("claude_attach", { sessionId: "B" })).session, resumed);
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: "B" })).texts as string[];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /survives a database reopen/);
+  assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+
+  await env.restart();
+  human = env.human();
+  const [second] = await send(human, "niche-manager", "survives another restart");
+  assert.equal(second.status, "queued");
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "start", key: "process3", socket: null, sessionId: "B", name: "another-request",
+  })).session, resumed);
+  assert.deepEqual((await env.human().request("claude_attach", { sessionId: "A" })).session, resumed);
+  const afterRestart = (await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts as string[];
+  assert.equal(afterRestart.length, 1);
+  assert.match(afterRestart[0], /survives another restart/);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: first.id })).messages.map(
+    (message) => [message.id, message.status],
+  ), [[queued.msgId, "delivered"], [second.msgId, "delivered"]]);
+  assert.deepEqual((await human.sync()).sessions.find((session) => session.id === first.id)?.previousNames, ["original"]);
+});
+
+for (const harness of ["omp", "opencode"] as const) {
+  test(`${harness} restart reopens the database and revives the removed renamed identity with its queue`, async () => {
+    env = await startEnv();
+    let human = env.human();
+    const original = await env.adapter(harness, "persisted-key", "original");
+    await original.client.request("rename", { name: "niche-manager" });
+    const gone = await env.watch(isSession("gone", "niche-manager"));
+    original.client.close();
+    await gone.event;
+    const [queued] = await send(human, "niche-manager", "saved across restart");
+    assert.equal(queued.status, "queued");
+    env.clock.advance(GRACE_MS);
+    env.daemon.sweep();
+    await env.restart();
+    human = env.human();
+    assert.equal((await logOf(human, queued.msgId!)).status, "queued");
+    assert.equal((await human.sync()).sessions.find((session) => session.id === original.session.id)?.state, "removed");
+
+    const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+    const resumed = await env.adapter(harness, "persisted-key", "ignored-request");
+    assert.deepEqual(resumed.session, { id: original.session.id, name: "niche-manager" });
+    assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
+    await delivered.event;
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+      (message) => [message.id, message.toSessionId, message.status],
+    ), [[queued.msgId, original.session.id, "delivered"]]);
+    assert.deepEqual((await human.sync()).sessions.find((session) => session.id === original.session.id)?.previousNames, ["original"]);
+  });
+}
+
+for (const harness of ["claude", "omp"] as const) {
+  for (const retention of ["inside", "outside"] as const) {
+    test(`${harness} no-traffic identity ${retention} retention uses removal time rather than creation time`, async () => {
+      env = await startEnv({ historyDays: 7 });
+      const human = env.human();
+      const original = harness === "claude"
+        ? (await human.request("claude_hook", {
+          event: "start", key: "process1", socket: null, sessionId: "A", name: "niche-manager",
+        })).session as { id: string; name: string }
+        : (await env.adapter("omp", "retained-key", "niche-manager")).session;
+      env.clock.advance(8 * 86_400_000);
+      if (harness === "claude") {
+        await human.request("claude_hook", { event: "end", sessionId: "A" });
+      } else {
+        const connection = await env.adapter("omp", "retained-key", "ignored-request");
+        await connection.client.request("unregister");
+      }
+      const removedAt = env.clock.now();
+      env.daemon.prune();
+      const removed = (await human.sync()).sessions.find((session) => session.id === original.id)!;
+      assert.deepEqual([removed.state, removed.removedAt], ["removed", removedAt]);
+      env.clock.advance(7 * 86_400_000 + (retention === "inside" ? -1 : 1));
+      env.daemon.prune();
+      const retained = (await human.sync()).sessions.find((session) => session.id === original.id);
+      assert.equal(retained?.state, retention === "inside" ? "removed" : undefined);
+
+      const resumed = harness === "claude"
+        ? (await human.request("claude_hook", {
+          event: "start", key: "process2", socket: null, sessionId: "A", name: "fresh-request",
+        })).session as { id: string; name: string }
+        : (await env.adapter("omp", "retained-key", "fresh-request")).session;
+      if (retention === "inside") {
+        assert.deepEqual(resumed, original);
+      } else {
+        assert.notEqual(resumed.id, original.id);
+        assert.equal(resumed.name, "fresh-request");
+      }
+      assert.deepEqual((await human.historyPage({ scope: "session", sessionId: resumed.id })).messages, []);
+    });
+  }
+}
+
+test("pending queued and held messages retain a removed identity beyond its no-traffic retention window", async () => {
+  env = await startEnv({ historyDays: 7 });
+  let human = env.human();
+  const sender = await env.adapter("omp", "sender", "sender");
+  const original = await env.adapter("omp", "retained-key", "niche-manager");
+  await human.request("set_inbound", { name: "niche-manager", mode: "hold" });
+  const [held] = await send(sender.client, "niche-manager", "held beyond retention");
+  const gone = await env.watch(isSession("gone", "niche-manager"));
+  original.client.close();
+  await gone.event;
+  const [queued] = await send(human, "niche-manager", "queued beyond retention");
+  assert.deepEqual([held.status, queued.status], ["held", "queued"]);
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  env.clock.advance(8 * 86_400_000);
+  env.daemon.prune();
+  assert.equal((await human.sync()).sessions.find((session) => session.id === original.session.id)?.state, "removed");
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.session.id })).messages.map(
+    (message) => [message.id, message.status],
+  ), [[held.msgId, "held"], [queued.msgId, "queued"]]);
+
+  await env.restart();
+  human = env.human();
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const resumed = await env.adapter("omp", "retained-key", "ignored-request");
+  assert.deepEqual(resumed.session, original.session);
+  assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
+  await delivered.event;
+  assert.equal((await logOf(human, held.msgId!)).status, "held");
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+  assert.equal((await resumed.nextDelivery()).msg.id, held.msgId);
+});
+
+for (const harness of ["claude", "omp"] as const) {
+  for (const holderState of ["live", "gone"] as const) {
+    test(`${harness} revival around a ${holderState} name holder keeps its queue and emits the deterministic fallback rename`, async () => {
+      env = await startEnv();
+      const human = env.human();
+      const original = harness === "claude"
+        ? (await human.request("claude_hook", {
+          event: "start", key: "process1", socket: null, sessionId: "A", name: "original", cwd: "/work",
+        })).session as { id: string; name: string }
+        : (await env.adapter("omp", "retained-key", "original")).session;
+      await human.request("rename", { from: "original", name: "niche-manager" });
+      let queued: SendResult;
+      if (harness === "claude") {
+        [queued] = await send(human, "niche-manager", "belongs to the original identity");
+        await human.request("claude_hook", { event: "end", sessionId: "A" });
+      } else {
+        const connection = await env.adapter("omp", "retained-key", "ignored-request");
+        const gone = await env.watch(isSession("gone", "niche-manager"));
+        connection.client.close();
+        await gone.event;
+        [queued] = await send(human, "niche-manager", "belongs to the original identity");
+        env.clock.advance(GRACE_MS);
+        env.daemon.sweep();
+      }
+      assert.equal(queued.status, "queued");
+      const holderAdapter = harness === "omp" ? await env.adapter("omp", "other-key", "niche-manager") : undefined;
+      const holder = harness === "claude"
+        ? (await human.request("claude_hook", {
+          event: "start", key: "holder-process", socket: holderState === "gone" ? join(env.home, "missing-holder.sock") : null,
+          sessionId: "B", name: "niche-manager", cwd: "/work",
+        })).session as { id: string; name: string }
+        : holderAdapter!.session;
+      if (harness === "claude") {
+        await human.request("claude_hook", {
+          event: "start", key: "suffix-process", socket: null, sessionId: "C", name: "niche-manager", cwd: "/work",
+        });
+      } else {
+        await env.adapter("omp", "suffix-key", "niche-manager");
+      }
+      if (holderState === "gone") {
+        if (harness === "claude") {
+          await env.daemon.probeClaude();
+          assert.equal(await sessionState(human, "niche-manager"), "gone");
+        } else {
+          const gone = await env.watch(isSession("gone", "niche-manager"));
+          holderAdapter!.client.close();
+          await gone.event;
+        }
+      }
+      const renamed = await env.watch(isSession("renamed", "niche-manager-3"));
+      const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+      if (harness === "claude") {
+        assert.deepEqual((await human.request("claude_hook", {
+          event: "start", key: "process2", socket: null, sessionId: "A", name: "ignored-request", cwd: "/work",
+        })).session, { id: original.id, name: "niche-manager-3" });
+        const texts = (await human.request("claude_hook", { event: "poll", sessionId: "A" })).texts as string[];
+        assert.equal(texts.length, 1);
+        assert.match(texts[0], /belongs to the original identity/);
+      } else {
+        const resumed = await env.adapter("omp", "retained-key", "ignored-request");
+        assert.deepEqual(resumed.session, { id: original.id, name: "niche-manager-3" });
+        assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
+      }
+      await delivered.event;
+      const event = await renamed.event;
+      assert.ok(event.type === "session");
+      assert.deepEqual([event.action, event.oldName, event.name, event.session.id], [
+        "renamed", "niche-manager", "niche-manager-3", original.id,
+      ]);
+      const snapshot = await human.sync();
+      const revived = snapshot.sessions.find((session) => session.id === original.id)!;
+      assert.deepEqual([revived.name, revived.previousNames, revived.state], [
+        "niche-manager-3", ["original", "niche-manager"], "live",
+      ]);
+      assert.equal(snapshot.sessions.find((session) => session.id === holder.id)?.state, holderState);
+      if (harness === "claude") {
+        assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: "B" })).texts, []);
+      } else {
+        assert.deepEqual(holderAdapter!.deliveries, []);
+      }
+      assert.deepEqual((await human.historyPage({ scope: "session", sessionId: original.id })).messages.map(
+        (message) => [message.id, message.toSessionId, message.status],
+      ), [[queued.msgId, original.id, "delivered"]]);
+      assert.deepEqual((await human.historyPage({ scope: "session", sessionId: holder.id })).messages, []);
+    });
+  }
+}
+
+test("legacy registration backfill survives repeated database reopen and removal for Claude, omp and OpenCode", async () => {
+  env = await startEnv({}, (db) => {
+    db.exec(`
+      CREATE TABLE sessions(
+        id TEXT PRIMARY KEY, harness TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL UNIQUE,
+        cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
+        gone_at INTEGER, claude_socket TEXT, claude_session_ids TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL, UNIQUE(harness,key));
+      CREATE TABLE messages(
+        id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
+        channel TEXT, text TEXT NOT NULL, kind TEXT, thread TEXT, reply_to TEXT,
+        done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE TABLE session_identities(
+        id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
+        cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
+        created_at INTEGER NOT NULL, removed_at INTEGER);
+      CREATE TABLE protocol_meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      INSERT INTO protocol_meta(key,value) VALUES('identity_backfill',1);
+    `);
+    for (const [harness, key, name] of [
+      ["claude", "legacy-process", "niche-manager"],
+      ["omp", "legacy-omp-key", "omp-manager"],
+      ["opencode", "legacy-opencode-key", "opencode-manager"],
+    ]) {
+      const id = `s_legacy_${harness}`;
+      db.run(
+        `INSERT INTO sessions(id,harness,key,name,cwd,state,gone_at,claude_session_ids,created_at)
+         VALUES(?,?,?,?,'/legacy','gone',1700000000000,?,1700000000000)`,
+        id, harness, key, name, harness === "claude" ? '["legacy-A","legacy-B"]' : "[]",
+      );
+      db.run(
+        `INSERT INTO session_identities(id,harness,name,previous_names,cwd,state,created_at)
+         VALUES(?,?,?,?,'/legacy','gone',1700000000000)`,
+        id, harness, name, JSON.stringify([`old-${harness}-name`]),
+      );
+      db.run(
+        `INSERT INTO messages(id,from_name,to_name,to_session,text,status,created_at,updated_at)
+         VALUES(?,'human',?,?,?,'queued',1700000000000,1700000000000)`,
+        `m_legacy_${harness}`, name, id, `legacy queue for ${harness}`,
+      );
+    }
+  });
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  await env.restart();
+  await env.restart();
+  const human = env.human();
+  const removed = await human.sync();
+  assert.deepEqual(removed.sessions.map((session) => [session.id, session.state]).sort(), [
+    ["s_legacy_claude", "removed"],
+    ["s_legacy_omp", "removed"],
+    ["s_legacy_opencode", "removed"],
+  ]);
+
+  const claude = (await human.request("claude_hook", {
+    event: "start", key: "new-process", socket: null, sessionId: "legacy-A", name: "ignored-request",
+  })).session as { id: string; name: string };
+  assert.deepEqual(claude, { id: "s_legacy_claude", name: "niche-manager" });
+  assert.deepEqual((await env.human().request("claude_attach", { sessionId: "legacy-B" })).session, claude);
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: "legacy-B" })).texts as string[];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0], /legacy queue for claude/);
+  for (const harness of ["omp", "opencode"] as const) {
+    const delivered = await env.watch(isStatus(`m_legacy_${harness}`, "delivered"));
+    const resumed = await env.adapter(harness, `legacy-${harness}-key`, "ignored-request");
+    assert.deepEqual(resumed.session, { id: `s_legacy_${harness}`, name: `${harness}-manager` });
+    assert.equal((await resumed.nextDelivery()).msg.id, `m_legacy_${harness}`);
+    await delivered.event;
+  }
+  const revived = await human.sync();
+  for (const harness of ["claude", "omp", "opencode"] as const) {
+    const identity = revived.sessions.find((session) => session.id === `s_legacy_${harness}`)!;
+    assert.deepEqual([identity.state, identity.previousNames], ["live", [`old-${harness}-name`]]);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: identity.id })).messages.map(
+      (message) => [message.id, message.toSessionId, message.status],
+    ), [[`m_legacy_${harness}`, identity.id, "delivered"]]);
+  }
+});
+
+test("harness-scoped adapter keys revive distinct identities when omp and OpenCode share a key and cwd", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const omp = await env.adapter("omp", "shared-id", "shared-name");
+  const opencode = await env.adapter("opencode", "shared-id", "shared-name");
+  assert.notEqual(omp.session.id, opencode.session.id);
+  assert.equal(opencode.session.name, "shared-name-2");
+  const ompGone = await env.watch(isSession("gone", omp.session.name));
+  const opencodeGone = await env.watch(isSession("gone", opencode.session.name));
+  omp.client.close();
+  opencode.client.close();
+  await ompGone.event;
+  await opencodeGone.event;
+  const [ompMessage] = await send(human, omp.session.name, "only for omp");
+  const [opencodeMessage] = await send(human, opencode.session.name, "only for OpenCode");
+  assert.deepEqual([ompMessage.status, opencodeMessage.status], ["queued", "queued"]);
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  await env.restart();
+  const ompDelivered = await env.watch(isStatus(ompMessage.msgId, "delivered"));
+  const opencodeDelivered = await env.watch(isStatus(opencodeMessage.msgId, "delivered"));
+  const resumedOmp = await env.adapter("omp", "shared-id", "different-request");
+  const resumedOpenCode = await env.adapter("opencode", "shared-id", "different-request");
+  assert.deepEqual(resumedOmp.session, omp.session);
+  assert.deepEqual(resumedOpenCode.session, opencode.session);
+  assert.equal((await resumedOmp.nextDelivery()).msg.id, ompMessage.msgId);
+  assert.equal((await resumedOpenCode.nextDelivery()).msg.id, opencodeMessage.msgId);
+  await ompDelivered.event;
+  await opencodeDelivered.event;
+  assert.deepEqual(resumedOmp.deliveries.map((delivery) => delivery.msg.id), [ompMessage.msgId]);
+  assert.deepEqual(resumedOpenCode.deliveries.map((delivery) => delivery.msg.id), [opencodeMessage.msgId]);
 });
 
 test("claude socket: plain frame without auth, probe marks dead sessions gone, session ids accumulate", async () => {

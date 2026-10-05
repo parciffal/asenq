@@ -5,7 +5,7 @@ import { Daemon, type DaemonOpts } from "../src/daemon/daemon.js";
 import { AsenqClient, type Reply } from "../src/shared/client.js";
 import { socketPath } from "../src/shared/paths.js";
 import type { Harness, Push, TailEvent, WireMsg } from "../src/shared/protocol.js";
-import { openDb } from "../src/shared/sqlite.js";
+import { openDb, type Db } from "../src/shared/sqlite.js";
 
 export type Delivery = Extract<Push, { push: "deliver" }>;
 
@@ -24,27 +24,31 @@ export type TestEnv = {
   adapter(harness: Harness, key: string, name?: string, opts?: { cwd?: string; autoAck?: boolean }): Promise<Adapter>;
   /** Subscribes to tail events now; `event` resolves with the first one matching `pred`. */
   watch(pred: (e: TailEvent) => boolean): Promise<{ event: Promise<TailEvent> }>;
+  /** Closes clients and reopens the same database with a fresh daemon; the manual clock is retained. */
+  restart(): Promise<void>;
   close(): Promise<void>;
 };
 
 export type LoggedMsg = WireMsg & { status: string; reason?: string };
 
 /** Starts a daemon in-process on a temp ASENQ_HOME with a manual clock and no background timers. */
-export async function startEnv(opts: Partial<DaemonOpts> = {}): Promise<TestEnv> {
+export async function startEnv(opts: Partial<DaemonOpts> = {}, seed?: (db: Db) => void): Promise<TestEnv> {
   const home = mkdtempSync(join(tmpdir(), "asenq-"));
   process.env.ASENQ_HOME = home;
-  const db = await openDb(join(home, "asenq.db"));
+  let db = await openDb(join(home, "asenq.db"));
+  seed?.(db);
   let t = 1_700_000_000_000;
   const clock = { now: () => t, advance: (ms: number) => void (t += ms) };
-  const daemon = new Daemon({
-    socket: socketPath(), db, replyDir: join(home, "r"), now: clock.now, timers: false, log: () => {}, ...opts,
+  const createDaemon = () => new Daemon({
+    socket: socketPath(), replyDir: join(home, "r"), now: clock.now, timers: false, log: () => {}, ...opts, db,
   });
+  let daemon = createDaemon();
   await daemon.listen();
   const clients: AsenqClient[] = [];
   const track = (c: AsenqClient): AsenqClient => (clients.push(c), c);
 
   return {
-    home, daemon, clock,
+    home, get daemon() { return daemon; }, clock,
     human: () => track(new AsenqClient()),
     async adapter(harness, key, name, o = {}) {
       const deliveries: Delivery[] = [];
@@ -81,6 +85,15 @@ export async function startEnv(opts: Partial<DaemonOpts> = {}): Promise<TestEnv>
       }));
       await c.request("tail");
       return { event: promise };
+    },
+    async restart() {
+      for (const c of clients) c.close();
+      clients.length = 0;
+      await daemon.close();
+      db.close();
+      db = await openDb(join(home, "asenq.db"));
+      daemon = createDaemon();
+      await daemon.listen();
     },
     async close() {
       for (const c of clients) c.close();

@@ -1,4 +1,4 @@
-export const PROTOCOL = 5;
+export const PROTOCOL = 6;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -87,7 +87,7 @@ export type ReadState = {
 
 export type TailEvent =
   | { type: "session"; action: "registered" | "renamed" | "gone" | "removed" | "updated";
-      name: string; harness: Harness; cwd?: string; oldName?: string; session: SessionIdentity }
+      name: string; harness: Harness; cwd?: string; oldName?: string; reason?: string; session: SessionIdentity }
   | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string }
   | { type: "read"; state: ReadState }
   | { type: "retention" };
