@@ -98,6 +98,50 @@ test("orchestrator tools edit only their channels and shared members' roles", as
   assert.match(retained.split("\n").find((row) => row.startsWith("worker "))!, /role=unset/);
 });
 
+test("orchestrator tools create with membership and self-join existing channels while worker and unset sessions cannot", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const shared = await env.adapter("opencode", "orchestrator", "orchestrator");
+  const worker = (await shared.client.request("register", { harness: "opencode", key: "worker", name: "worker" }))
+    .session as { id: string; name: string };
+  const unset = (await shared.client.request("register", { harness: "opencode", key: "unset", name: "unset" }))
+    .session as { id: string; name: string };
+  await human.request("set_role", { name: "orchestrator", role: "orchestrator" });
+  await human.request("set_role", { name: "worker", role: "worker" });
+  assert.match(await callTool(shared.client, "asenq_channel_create", { channel: "unselected" }), /^asenq error \(bad_request\): /);
+  await callTool(shared.client, "asenq_channel_create", { channel: "new" }, shared.session.id);
+  const initial = await callTool(shared.client, "asenq_channel_members", { channel: "new" }, shared.session.id);
+  assert.ok(initial.includes(`id=${shared.session.id}`));
+  assert.ok(!initial.includes(`id=${worker.id}`));
+  assert.ok(!initial.includes(`id=${unset.id}`));
+  assert.match(initial.split("\n").find((row) => row.startsWith("orchestrator "))!, /role=orchestrator/);
+  await callTool(shared.client, "asenq_channel_add", { channel: "new", name: "worker" }, shared.session.id);
+  assert.ok((await callTool(shared.client, "asenq_channel_members", { channel: "new" }, worker.id)).includes(`id=${worker.id}`));
+
+  await human.request("channel_create", { channel: "existing" });
+  await callTool(shared.client, "asenq_channel_create", { channel: "existing" }, shared.session.id);
+  assert.match(await callTool(shared.client, "asenq_channel_members", { channel: "existing" }, shared.session.id), /no members/);
+  assert.match(await callTool(shared.client, "asenq_channel_add", { channel: "existing", name: "worker" }, shared.session.id), /^asenq error \(not_permitted\): /);
+  await callTool(shared.client, "asenq_channel_add", { channel: "existing", name: "orchestrator" }, shared.session.id);
+  await callTool(shared.client, "asenq_channel_add", { channel: "existing", name: "worker" }, shared.session.id);
+  const joined = await callTool(shared.client, "asenq_channel_members", { channel: "existing" }, shared.session.id);
+  assert.ok(joined.includes(`id=${shared.session.id}`));
+  assert.ok(joined.includes(`id=${worker.id}`));
+  await callTool(shared.client, "asenq_channel_remove", { channel: "existing", name: "worker" }, shared.session.id);
+
+  for (const session of [worker, unset]) {
+    assert.match(await callTool(shared.client, "asenq_channel_create", { channel: `denied-${session.name}` }, session.id), /^asenq error \(not_permitted\): /);
+    assert.match(await callTool(shared.client, "asenq_channel_create", { channel: "existing" }, session.id), /^asenq error \(not_permitted\): /);
+    assert.match(await callTool(shared.client, "asenq_channel_add", { channel: "existing", name: session.name }, session.id), /^asenq error \(not_permitted\): /);
+  }
+  const existing = await callTool(shared.client, "asenq_channel_members", { channel: "existing" }, shared.session.id);
+  assert.ok(existing.includes(`id=${shared.session.id}`));
+  assert.ok(!existing.includes(`id=${worker.id}`));
+  assert.ok(!existing.includes(`id=${unset.id}`));
+  const channels = (await human.sync()).channels;
+  assert.deepEqual(channels.map((channel) => channel.name).sort(), ["existing", "new"]);
+});
+
 test("channel tools distinguish empty rosters and channels without posts", async () => {
   env = await startEnv();
   const reader = await env.adapter("omp", "reader", "reader");
@@ -169,7 +213,7 @@ test("multi-bound tool edits authorize the selected session, never another orche
   await callTool(shared.client, "asenq_set_role", { name: "worker", role: "worker" }, shared.session.id);
   assert.match(await callTool(shared.client, "asenq_set_role", { name: "worker", role: "orchestrator" }, beta.id), /^asenq error \(not_permitted\): /);
   assert.match(await callTool(shared.client, "asenq_channel_remove", { channel: "red", name: "worker" }, beta.id), /^asenq error \(not_permitted\): /);
-  assert.match(await callTool(shared.client, "asenq_channel_add", { channel: "red", name: "beta" }, beta.id), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(shared.client, "asenq_channel_add", { channel: "red", name: "alpha" }, beta.id), /^asenq error \(not_permitted\): /);
   for (const [tool, args] of [
     ["asenq_channel_add", { channel: "red", name: "beta" }],
     ["asenq_channel_remove", { channel: "red", name: "worker" }],

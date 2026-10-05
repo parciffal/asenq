@@ -92,7 +92,7 @@ export const TOOLS: ToolSpec[] = [
     label: "Asenq Set Role",
     description:
       "Set a session's role or unset it. Only the human or an orchestrator sharing a channel with the target may edit its role. " +
-      "The human must first create a channel and add its orchestrator. Workers and sessions with an unset role cannot edit roles. " +
+      "The human assigns initial orchestrator roles; an orchestrator can create a new channel with itself as first member or join an existing channel. Workers and sessions with an unset role cannot edit roles. " +
       "Roles are informational for message delivery; asenq is a messenger, not a coordinator.",
     params: {
       name: { type: "string", description: `Target session name. ${NAMES_HINT}` },
@@ -100,11 +100,20 @@ export const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "asenq_channel_create",
+    label: "Asenq Channel Create",
+    description:
+      "Create an asenq channel. The human or an orchestrator may create it; a new channel created by an orchestrator atomically includes that orchestrator as its first member. " +
+      "Creating an existing channel is idempotent and does not join it; an orchestrator can use asenq_channel_add with its own name to join. Workers and sessions with an unset role cannot create channels. " +
+      "Roles are informational for message delivery; asenq is a messenger, not a coordinator.",
+    params: { channel: { type: "string", description: "Channel name: lowercase letters, digits, - and _" } },
+  },
+  {
     name: "asenq_channel_add",
     label: "Asenq Channel Add",
     description:
-      "Add a live session to an existing channel's roster. Only the human or an orchestrator who is a member of that channel may edit it. " +
-      "The human must first create the channel and add its orchestrator; posting to an unknown channel creates an empty roster, without joining it. " +
+      "Add a live session to an existing channel's roster. The human may add anyone; an orchestrator may add itself to any existing channel, or add other sessions only to channels it belongs to. " +
+      "Workers and sessions with an unset role cannot edit rosters. An orchestrator joins a new channel by creating it; posting to an unknown channel creates an empty roster, without joining it. " +
       "Roles are informational for message delivery; roster editing permissions do not make asenq a coordinator.",
     params: {
       channel: { type: "string", description: "Existing channel name" },
@@ -116,7 +125,7 @@ export const TOOLS: ToolSpec[] = [
     label: "Asenq Channel Remove",
     description:
       "Remove a member from an existing channel's roster by its current or former name. Only the human or an orchestrator who is a member of that channel may edit it. " +
-      "The human must first create the channel and add its orchestrator. Current member names take precedence over former names; ambiguous names are refused. " +
+      "An orchestrator can create a new channel with itself as first member or join an existing channel. Current member names take precedence over former names; ambiguous names are refused. " +
       "Use asenq_channel_members to inspect candidate identities; only the human can remove by identity id. " +
       "Roles are informational for message delivery; asenq is not a coordinator.",
     params: {
@@ -129,7 +138,7 @@ export const TOOLS: ToolSpec[] = [
     label: "Asenq Channel Members",
     description:
       "Read an existing channel's members with their full name, role or unset, raw state and identity id. Reads are unrestricted. " +
-      "Only the human or an orchestrator belonging to the channel may edit its roster; the human creates the channel and adds its first orchestrator. " +
+      "The human may edit any roster; an orchestrator can create a new channel with itself as first member or join an existing channel, then edit channels it belongs to. Workers and sessions with an unset role cannot edit rosters. " +
       "Roles are informational for message delivery; asenq does not coordinate work.",
     params: { channel: { type: "string", description: "Existing channel name" } },
   },
@@ -265,6 +274,10 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
       case "asenq_set_role": {
         await client.request("set_role", { ...who, name: args.name, role: args.role === "unset" ? null : args.role });
         return `${String(args.name)} role ${String(args.role)}`;
+      }
+      case "asenq_channel_create": {
+        const r = await client.request("channel_create", { ...who, channel: args.channel });
+        return `channel #${(r.channel as ChannelSummary).name} ready`;
       }
       case "asenq_channel_add": {
         const r = await client.request("channel_add", { ...who, channel: args.channel, name: args.name });
