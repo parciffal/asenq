@@ -655,7 +655,7 @@ export class Store {
       ? this.db.get<{ one: number }>("SELECT 1 AS one FROM messages WHERE id=? AND channel IS NULL", message.replyTo)
       : this.db.get<{ one: number }>(
         `SELECT 1 AS one FROM messages WHERE id=? AND channel IS NULL
-         AND (from_session=? OR (to_session=? AND status IN ('delivered','queued')))`,
+         AND (from_session=? OR (to_session=? AND status IN ('delivered','replied','queued')))`,
         message.replyTo, sessionId, sessionId,
       );
     const { replyToMissing: _previous, ...retained } = message;

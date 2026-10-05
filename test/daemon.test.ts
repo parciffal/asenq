@@ -4250,6 +4250,29 @@ test("queued messages expire at exactly the default 24-hour boundary with one li
   assert.deepEqual(sender.deliveries.map((delivery) => delivery.msg.replyTo), [queued.msgId]);
 });
 
+test("agents can resolve reply references to retained originals after replying", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "reference-sender", "sender");
+  const receiver = await env.adapter("omp", "reference-receiver", "receiver");
+  const [original] = await send(sender.client, "receiver", "question");
+  await receiver.nextDelivery();
+  await send(receiver.client, "sender", "answer", { replyTo: original.msgId });
+  assert.equal((await logOf(human, original.msgId!)).status, "replied");
+  const [followup] = await send(sender.client, "receiver", "follow-up to answered question", {
+    replyTo: original.msgId,
+  });
+  const delivery = await receiver.nextDelivery();
+  assert.equal(delivery.msg.replyTo, original.msgId);
+  assert.equal(delivery.msg.replyToMissing, undefined);
+  const recovered = (await receiver.client.request("inbox", { msgId: followup.msgId })).messages as StoredMessage[];
+  assert.deepEqual(recovered.map((message) => [message.replyTo, message.replyToMissing]),
+    [[original.msgId, undefined]]);
+  const rendered = await callTool(receiver.client, "asenq_inbox", { id: followup.msgId });
+  assert.ok(rendered.includes(followup.msgId!));
+  assert.doesNotMatch(rendered, /purged message/);
+});
+
 test("a delivered reciprocal reply is retained as replied in history, inbox recovery and MCP output", async () => {
   env = await startEnv();
   const human = env.human();
