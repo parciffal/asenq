@@ -1473,7 +1473,7 @@ export class Daemon {
     this.store.db.run("UPDATE messages SET attempts=?, reason=?, updated_at=? WHERE id=?", attempts, reason, this.now(), row.id);
     if (attempts >= MAX_ATTEMPTS) {
       this.setStatus(row.id, "failed", reason);
-      return "failed";
+      return this.store.msg(row.id)?.status ?? "failed";
     }
     return "queued";
   }
