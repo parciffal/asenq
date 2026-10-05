@@ -9,6 +9,7 @@ export function renderMessageBody(msg: Pick<WireMsg, "id" | "text" | "file">): s
 
 export function renderInbound(msg: WireMsg, role?: Role): string {
   let meta = "";
+  if (msg.sourceChannel) meta += ` · channel=#${msg.sourceChannel}`;
   if (msg.kind) meta += ` · kind=${msg.kind}`;
   if (msg.kind === "control") meta += ` · action=${msg.action}`;
   if (msg.thread) meta += ` · thread=${msg.thread}`;

@@ -6,7 +6,7 @@ import { formatSendResults } from "../shared/tools.js";
 
 type LoggedMsg = {
   id: string; from: string; to: string; text: string; createdAt: number;
-  kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; done?: boolean; status: string; reason?: string;
+  kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; done?: boolean; status: string; reason?: string; sourceChannel?: string;
 };
 
 const out = (s: string): void => void process.stdout.write(s + "\n");
@@ -18,7 +18,7 @@ const oneLine = (s: string, n: number): string => {
 
 function msgLine(m: Omit<LoggedMsg, "status"> & { status?: string; reason?: string }): string {
   const status = m.status ? ` (${m.status}${m.reason ? `: ${m.reason}` : ""})` : "";
-  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""}${m.replyToMissing && m.replyTo ? ` reply-to=${m.replyTo} (purged message)` : ""} ${oneLine(m.text, 120)}${status}`;
+  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.sourceChannel ? ` via #${m.sourceChannel}` : ""}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""}${m.replyToMissing && m.replyTo ? ` reply-to=${m.replyTo} (purged message)` : ""} ${oneLine(m.text, 120)}${status}`;
 }
 
 function need(args: string[], n: number, usage: string): void {
@@ -136,7 +136,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       const msgs = r.messages as LoggedMsg[];
       if (values.id) {
         const m = msgs[0];
-        out(`${m.id} ${m.from} → ${m.to} ${new Date(m.createdAt).toISOString()} ${m.status}${m.reason ? ` (${m.reason})` : ""}`);
+        out(`${m.id} ${m.from} → ${m.to}${m.sourceChannel ? ` via #${m.sourceChannel}` : ""} ${new Date(m.createdAt).toISOString()} ${m.status}${m.reason ? ` (${m.reason})` : ""}`);
         const meta = [m.kind && `kind=${m.kind}`, m.action && `action=${m.action}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}`, m.done && "done"].filter(Boolean);
         if (meta.length) out(meta.join(" · "));
         out("");
@@ -151,7 +151,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       const msgs = (r.messages as LoggedMsg[]).reverse();
       if (msgs.length === 0) out("no messages");
       for (const m of msgs) {
-        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}` : ""}${m.done ? " · done" : ""}`);
+        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}` : ""}${m.done ? " · done" : ""}`);
         out(m.text);
         out("");
       }
@@ -283,6 +283,8 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       if (sub === "send" && ch && rest.length) {
         const r = await client.request("channel_send", { channel: ch, text: rest.join(" ") });
         out(`#${ch} ${String(r.msgId)} posted`);
+        const results = r.results as SendResult[];
+        out(results.length ? formatSendResults(results) : "no mention targets; no direct messages pushed");
         return 0;
       }
       throw new Error("usage: asenq channel create <ch> | add <ch> <name> | remove <ch> <name> | remove <ch> --session-id <id> | members <ch> | read <ch> [--limit n] | send <ch> <text…>");

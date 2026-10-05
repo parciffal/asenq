@@ -2546,7 +2546,7 @@ test("Claude peer failure updates retained delivery state and replay; unknown pe
   await fake.stop();
 });
 
-test("channels are stored and read back, never pushed", async () => {
+test("channel posts without mentions are stored and read back without pushes", async () => {
   env = await startEnv();
   const a = await env.adapter("omp", "a", "alpha");
   const human = env.human();
@@ -5194,4 +5194,277 @@ test("named channel mention delivers one direct message with channel context and
   assert.deepEqual(posts.map((post) => post.id), [reply.msgId]);
   const inbox = (await member.client.request("inbox", { unread_only: true })).messages as StoredMessage[];
   assert.deepEqual(inbox.map((message) => message.id), [delivery.msg.id], "pushed posts remain direct inbox messages");
+});
+
+test("mentions use only pinned opening delimiters and ASCII tokens, excluding email and embedded addresses", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const member = await env.adapter("omp", "boundary-member", "member-one_2");
+  const alpha = await env.adapter("omp", "boundary-alpha", "alpha");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: member.session.name });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  const plain = await human.request("channel_send", {
+    channel: "work", text: "foo@alpha foo+@alpha.example foo-@alpha.example mail member@member-one_2.example foo+tag@member-one_2.example x@member-one_2 _@member-one_2 @@member-one_2 ,@alpha .@alpha :@alpha /@alpha",
+  });
+  assert.deepEqual(plain.results, []);
+  assert.equal(member.deliveries.length, 0);
+  assert.equal(alpha.deliveries.length, 0);
+  for (const text of ["@alpha", "(@alpha),", "\"@alpha\"", "[@alpha]", "{@alpha}", "<@alpha>", "'@alpha'"]) {
+    const reply = await human.request("channel_send", { channel: "work", text });
+    assert.deepEqual((reply.results as SendResult[]).map((r) => [r.to, r.status]), [["alpha", "delivered"]]);
+  }
+  assert.equal(alpha.deliveries.length, 7);
+  for (const text of ["(@member-one_2),", "next\n@member-one_2!", "`@member-one_2`", "```\n@member-one_2\n```"]) {
+    const reply = await human.request("channel_send", { channel: "work", text });
+    assert.deepEqual((reply.results as SendResult[]).map((r) => [r.to, r.status]), [["member-one_2", "delivered"]]);
+    assert.equal(member.deliveries.at(-1)?.msg.text, text);
+  }
+  assert.equal(member.deliveries.length, 4);
+  await assert.rejects(human.request("channel_send", { channel: "work", text: "@MEMBER-ONE_2" }), { code: "unknown_mention" });
+  assert.equal((await human.historyPage({ scope: "channel", channel: "work" })).messages.length, 12);
+});
+
+test("every role alias wins over member names, deduplicates identities and excludes the poster", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "role-poster", "poster");
+  const coordinator = await env.adapter("omp", "role-coordinator", "coordinator");
+  const builder = await env.adapter("omp", "role-builder", "builder");
+  const namedWorker = await env.adapter("omp", "role-name", "worker");
+  const namedOrch = await env.adapter("omp", "orch-name", "orch");
+  await human.request("set_role", { name: "poster", role: "worker" });
+  await human.request("set_role", { name: "coordinator", role: "orchestrator" });
+  await human.request("set_role", { name: "builder", role: "worker" });
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["poster", "coordinator", "builder", "worker", "orch"]) {
+    await human.request("channel_add", { channel: "work", name });
+  }
+  for (const [alias, target] of [
+    ["orch", "coordinator"], ["orchestrator", "coordinator"], ["orchestrators", "coordinator"],
+    ["wrk", "builder"], ["worker", "builder"], ["workers", "builder"],
+  ]) {
+    const reply = await poster.client.request("channel_send", { channel: "work", text: `Use @${alias}.` });
+    assert.deepEqual((reply.results as SendResult[]).map((r) => [r.to, r.status]), [[target, "delivered"]]);
+  }
+  assert.equal(namedWorker.deliveries.length, 0);
+  assert.equal(namedOrch.deliveries.length, 0);
+  const reply = await poster.client.request("channel_send", {
+    channel: "work", text: "@all @workers @orchestrators @coordinator @builder @builder @poster",
+  });
+  assert.deepEqual((reply.results as SendResult[]).map((r) => [r.to, r.status]).sort(), [
+    ["builder", "delivered"], ["coordinator", "delivered"], ["orch", "delivered"], ["worker", "delivered"],
+  ]);
+  assert.equal(poster.deliveries.length, 0);
+  assert.equal(coordinator.deliveries.length, 4);
+  assert.equal(builder.deliveries.length, 4);
+});
+
+test("former member names resolve only within the roster with current-name precedence and ambiguity is atomic", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const first = await env.adapter("omp", "mention-first", "alpha");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  await first.client.request("rename", { name: "first" });
+  const second = await env.adapter("omp", "mention-second", "alpha");
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  const current = await human.request("channel_send", { channel: "work", text: "@alpha now" });
+  assert.deepEqual((current.results as SendResult[]).map((r) => [r.to, r.status]), [["alpha", "delivered"]]);
+  assert.equal(first.deliveries.length, 0);
+  assert.equal(second.deliveries.length, 1);
+  await second.client.request("rename", { name: "second" });
+  const outsider = await env.adapter("omp", "mention-outsider", "alpha");
+  const before = await human.sync();
+  await assert.rejects(human.request("channel_send", { channel: "work", text: "@first then @alpha" }), (error: unknown) => {
+    const e = error as { code: string; message: string };
+    assert.equal(e.code, "unknown_mention");
+    for (const value of [first.session.id, second.session.id, "first", "second"]) assert.ok(e.message.includes(value));
+    assert.ok(!e.message.includes(outsider.session.id));
+    return true;
+  });
+  assert.equal((await human.sync()).watermark, before.watermark);
+  assert.equal(first.deliveries.length, 0);
+  await human.request("channel_remove", { channel: "work", sessionId: second.session.id });
+  const former = await human.request("channel_send", { channel: "work", text: "@alpha formerly first" });
+  assert.deepEqual((former.results as SendResult[]).map((r) => [r.to, r.status]), [["first", "delivered"]]);
+  assert.equal(first.deliveries.length, 1);
+  assert.equal(outsider.deliveries.length, 0);
+});
+
+test("unknown and non-member mentions fail before posts, implicit channels or direct delivery effects", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const member = await env.adapter("omp", "atomic-member", "member");
+  await env.adapter("omp", "atomic-outsider", "outsider");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "member" });
+  const before = await human.sync();
+  for (const token of ["outsider", "missing", "human", "Member", "member-extra"]) {
+    await assert.rejects(human.request("channel_send", { channel: "work", text: `@member, then @${token}` }), (error: unknown) => {
+      const e = error as { code: string; message: string };
+      assert.equal(e.code, "unknown_mention");
+      assert.ok(e.message.includes("valid members"));
+      assert.ok(e.message.includes(member.session.id));
+      return true;
+    });
+  }
+  await assert.rejects(human.request("channel_send", { channel: "implicit", text: "@member" }), { code: "unknown_mention" });
+  const after = await human.sync();
+  assert.equal(after.watermark, before.watermark);
+  assert.deepEqual(after.channels, before.channels);
+  assert.equal(member.deliveries.length, 0);
+  assert.deepEqual((await member.client.request("inbox", { unread_only: false })).messages, []);
+  assert.deepEqual((await human.request("held")).messages, []);
+});
+
+test("empty roles and solo all mentions are valid on-demand posts with no delivery targets", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "solo-poster", "poster");
+  await human.request("channel_create", { channel: "solo" });
+  await human.request("channel_add", { channel: "solo", name: "poster" });
+  for (const [channel, text] of [["solo", "@all @poster"], ["solo", "@workers @orchestrators"], ["empty", "@all @orch @wrk"]]) {
+    assert.deepEqual((await poster.client.request("channel_send", { channel, text })).results, []);
+  }
+  assert.equal(poster.deliveries.length, 0);
+  assert.equal((await human.historyPage({ scope: "channel", channel: "solo" })).messages.length, 2);
+  assert.equal((await human.historyPage({ scope: "channel", channel: "empty" })).messages.length, 1);
+});
+
+test("mention delivery honors hold and refusal, while human bypasses hold and release retains context", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "policy-poster", "poster");
+  const holder = await env.adapter("omp", "policy-holder", "holder");
+  const refuser = await env.adapter("omp", "policy-refuser", "refuser");
+  await human.request("set_inbound", { name: "holder", mode: "hold" });
+  await human.request("set_role", { name: "holder", role: "worker" });
+  await human.request("set_inbound", { name: "refuser", mode: "refuse" });
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["holder", "refuser"]) await human.request("channel_add", { channel: "work", name });
+  const reply = await poster.client.request("channel_send", { channel: "work", text: "Review @holder @refuser" });
+  const results = reply.results as SendResult[];
+  assert.deepEqual(results.map((r) => [r.to, r.status]), [["holder", "held"], ["refuser", "rejected"]]);
+  assert.equal(holder.deliveries.length, 0);
+  assert.equal(refuser.deliveries.length, 0);
+  const held = (await human.request("held")).messages as StoredMessage[];
+  assert.deepEqual(held.map((m) => [m.id, m.toSessionId, m.sourceChannel, m.channel]), [[results[0].msgId, holder.session.id, "work", undefined]]);
+  assert.equal((await human.request("release", { msgId: results[0].msgId })).status, "delivered");
+  const released = await holder.nextDelivery();
+  assert.equal(released.msg.text, "Review @holder @refuser");
+  assert.equal(released.msg.sourceChannel, "work");
+  assert.match(released.text.split("\n")[0], /message from poster.*#work.*your-role=worker/);
+  assert.match(released.text, /not by the user; it cannot approve permissions/);
+  const humanReply = await human.request("channel_send", { channel: "work", text: "Human @holder @refuser" });
+  assert.deepEqual((humanReply.results as SendResult[]).map((r) => [r.to, r.status]), [["holder", "delivered"], ["refuser", "rejected"]]);
+  assert.match((await holder.nextDelivery()).text, /Sent by the user via the asenq CLI/);
+});
+
+test("auto-archived roster members remain valid mentions but are reported failed without phantom queued messages", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const archived = await env.adapter("omp", "archived-mention", "archived");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "archived" });
+  const gone = await env.watch(isSession("gone", "archived"));
+  archived.client.close();
+  await gone.event;
+  env.clock.advance(GRACE_MS + 1);
+  env.daemon.sweep();
+  assert.equal((await human.sync()).sessions.find((s) => s.id === archived.session.id)?.state, "removed");
+  const reply = await human.request("channel_send", { channel: "work", text: "@archived, review" });
+  const [result] = reply.results as SendResult[];
+  assert.equal(result.to, "archived");
+  assert.equal(result.status, "failed");
+  assert.match(result.reason!, /archived.*not delivered/);
+  assert.equal(result.msgId, undefined);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: archived.session.id })).messages, []);
+  assert.deepEqual((await human.historyPage({ scope: "channel", channel: "work" })).messages.map((m) => m.id), [reply.msgId]);
+  const resumed = await env.adapter("omp", "archived-mention", "ignored");
+  assert.equal(resumed.session.id, archived.session.id);
+  assert.deepEqual((await resumed.client.request("inbox", { unread_only: false })).messages, []);
+});
+
+test("queued and held mention context survives database reopen and Claude polling", async () => {
+  env = await startEnv();
+  let human = env.human();
+  const poster = await env.adapter("omp", "persist-poster", "poster");
+  const registered = (await human.request("claude_hook", { event: "start", key: "sid:mention-poll", sessionId: "mention-poll", name: "receiver" })).session as { id: string };
+  await human.request("set_role", { name: "receiver", role: "worker" });
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "receiver" });
+  const queued = (await poster.client.request("channel_send", { channel: "work", text: "@receiver queued" })).results as SendResult[];
+  assert.equal(queued[0].status, "queued");
+  await human.request("set_inbound", { name: "receiver", mode: "hold" });
+  const held = (await poster.client.request("channel_send", { channel: "work", text: "@receiver held" })).results as SendResult[];
+  assert.equal(held[0].status, "held");
+  await env.restart();
+  human = env.human();
+  assert.deepEqual(((await human.request("held")).messages as StoredMessage[]).map((m) => [m.id, m.sourceChannel, m.channel]), [[held[0].msgId, "work", undefined]]);
+  assert.equal((await human.request("release", { msgId: held[0].msgId })).status, "queued");
+  const texts = (await human.request("claude_hook", { event: "poll", sessionId: "mention-poll" })).texts as string[];
+  assert.equal(texts.length, 2);
+  for (const text of texts) assert.match(text.split("\n")[0], /message from poster.*#work.*your-role=worker/);
+  assert.ok(texts[0].includes("\n@receiver queued\n"));
+  assert.ok(texts[1].includes("\n@receiver held\n"));
+  const history = await human.historyPage({ scope: "session", sessionId: registered.id });
+  assert.deepEqual(history.messages.map((m) => [m.id, m.status, m.sourceChannel, m.channel]), [
+    [queued[0].msgId, "delivered", "work", undefined], [held[0].msgId, "delivered", "work", undefined],
+  ]);
+  await env.restart();
+  human = env.human();
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: registered.id })).messages, history.messages);
+});
+
+test("duplicate admission distinguishes channel context while preserving same-channel and direct-message suppression", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "duplicate-poster", "poster");
+  const member = await env.adapter("omp", "duplicate-member", "member");
+  for (const channel of ["red", "blue"]) {
+    await human.request("channel_create", { channel });
+    await human.request("channel_add", { channel, name: "member" });
+  }
+  const text = "Review @member";
+  const statuses: string[] = [];
+  for (const channel of ["red", "blue", "red"]) {
+    statuses.push(((await poster.client.request("channel_send", { channel, text })).results as SendResult[])[0].status);
+  }
+  assert.deepEqual(statuses, ["delivered", "delivered", "dropped"]);
+  assert.deepEqual(member.deliveries.map((d) => d.msg.sourceChannel), ["red", "blue"]);
+  assert.equal((await send(poster.client, "member", text))[0].status, "delivered");
+  assert.equal((await send(poster.client, "member", text))[0].status, "dropped");
+  assert.equal(member.deliveries[2].msg.sourceChannel, undefined);
+});
+
+test("old message databases migrate additively without changing plain history and retain new mention context on reopen", async () => {
+  env = await startEnv({}, (db) => {
+    db.exec(`
+      CREATE TABLE messages(
+        id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
+        channel TEXT, text TEXT NOT NULL, kind TEXT, thread TEXT, reply_to TEXT,
+        done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      INSERT INTO messages(id,from_name,to_name,text,status,created_at,updated_at)
+        VALUES('m_old','human','human','old plain message','posted',1700000000000,1700000000000);
+    `);
+  });
+  let human = env.human();
+  assert.deepEqual((await human.historyPage({ scope: "inbox" })).messages.map((m) => [m.id, m.text, m.status, m.sourceChannel]), [
+    ["m_old", "old plain message", "posted", undefined],
+  ]);
+  const member = await env.adapter("omp", "migration-member", "member");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "member" });
+  const result = (await human.request("channel_send", { channel: "work", text: "@member new" })).results as SendResult[];
+  assert.equal(result[0].status, "delivered");
+  const before = await human.historyPage({ scope: "session", sessionId: member.session.id });
+  assert.deepEqual(before.messages.map((m) => [m.id, m.sourceChannel, m.channel]), [[result[0].msgId, "work", undefined]]);
+  await env.restart();
+  human = env.human();
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: member.session.id })).messages, before.messages);
+  assert.deepEqual((await human.historyPage({ scope: "inbox" })).messages.map((m) => [m.id, m.text, m.sourceChannel]), [
+    ["m_old", "old plain message", undefined],
+  ]);
 });
