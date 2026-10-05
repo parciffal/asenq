@@ -603,6 +603,14 @@ export class Store {
     ).map(toIdentity);
   }
 
+  private channelMemberIds(name: string): string[] {
+    const rows = this.db.all<{ id: string }>(
+      `SELECT i.id FROM session_identities i JOIN channel_members m ON m.session_id=i.id
+       WHERE m.channel=? ORDER BY i.created_at,i.id`, name,
+    );
+    return rows.map((row) => row.id);
+  }
+
   isChannelMember(name: string, sessionId: string): boolean {
     return this.db.get("SELECT 1 FROM channel_members WHERE channel=? AND session_id=?", name, sessionId) !== undefined;
   }
@@ -627,14 +635,14 @@ export class Store {
       `SELECT count(*) AS count,COALESCE(max(created_at),0) AS lastAt,COALESCE(max(ord),0) AS lastOrder
        FROM messages WHERE channel=?`, name,
     )!;
-    return { name, ...summary, memberIds: this.channelMembers(name).map((member) => member.id) };
+    return { name, ...summary, memberIds: this.channelMemberIds(name) };
   }
 
   channelSummaries(): ChannelSummary[] {
     return this.db.all<{ name: string; count: number; lastAt: number; lastOrder: number }>(
       `SELECT c.name,count(m.id) AS count,COALESCE(max(m.created_at),0) AS lastAt,COALESCE(max(m.ord),0) AS lastOrder
        FROM channels c LEFT JOIN messages m ON m.channel=c.name GROUP BY c.name ORDER BY lastOrder DESC,c.name`,
-    ).map((summary) => ({ ...summary, memberIds: this.channelMembers(summary.name).map((member) => member.id) }));
+    ).map((summary) => ({ ...summary, memberIds: this.channelMemberIds(summary.name) }));
   }
 
   /** Latest retained direct-message order touching each stable identity, as sender or recipient. */

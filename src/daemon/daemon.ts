@@ -292,6 +292,12 @@ export class Daemon {
     if (s.kind !== "human") throw new AsenqError("bad_request", `only the user (asenq CLI) can ${what}`);
   }
 
+  private requireHumanOrOrchestrator(actor: Sender, message: string): void {
+    if (actor.kind !== "human" && (actor.kind !== "agent" || this.store.identity(actor.session.id)?.role !== "orchestrator")) {
+      throw new AsenqError("not_permitted", message);
+    }
+  }
+
   private async handle(c: Conn, p: Req): Promise<Result> {
     switch (p.op) {
       case "hello":
@@ -328,9 +334,7 @@ export class Daemon {
       }
       case "set_role": {
         const actor = this.sender(c, p);
-        if (actor.kind !== "human" && (actor.kind !== "agent" || this.store.identity(actor.session.id)?.role !== "orchestrator")) {
-          throw new AsenqError("not_permitted", "only the human or a shared-channel orchestrator can change session roles");
-        }
+        this.requireHumanOrOrchestrator(actor, "only the human or a shared-channel orchestrator can change session roles");
         const role = p.role;
         if (role !== null && role !== "orchestrator" && role !== "worker") {
           throw new AsenqError("bad_request", "role must be orchestrator, worker or null");
@@ -399,9 +403,7 @@ export class Daemon {
       }
       case "channel_create": {
         const actor = this.sender(c, p);
-        if (actor.kind !== "human" && (actor.kind !== "agent" || this.store.identity(actor.session.id)?.role !== "orchestrator")) {
-          throw new AsenqError("not_permitted", "only the human or an orchestrator can create channels");
-        }
+        this.requireHumanOrOrchestrator(actor, "only the human or an orchestrator can create channels");
         return this.mutateChannel(this.channelName(p), "create", actor.kind === "agent" ? actor.session.id : undefined);
       }
       case "channel_add":
@@ -1367,9 +1369,7 @@ export class Daemon {
   }
 
   private opChannelMember(actor: Sender, p: Params, add: boolean): Result {
-    if (actor.kind !== "human" && (actor.kind !== "agent" || this.store.identity(actor.session.id)?.role !== "orchestrator")) {
-      throw new AsenqError("not_permitted", "only the human or a channel's orchestrator can edit membership");
-    }
+    this.requireHumanOrOrchestrator(actor, "only the human or a channel's orchestrator can edit membership");
     if (actor.kind !== "human" && p.sessionId !== undefined) {
       throw new AsenqError("not_permitted", "only the human can remove members by identity");
     }
