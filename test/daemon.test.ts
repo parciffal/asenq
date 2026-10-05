@@ -2969,6 +2969,9 @@ test("legacy identity migration and database reopen preserve channel rosters, ro
     assert.equal(listed.find((session) => session.name === "renamed")?.role, null);
     await human.request("set_role", { name: "renamed", role: "orchestrator" });
     assert.equal((await human.sync()).sessions.find((session) => session.id === sessionId)?.role, "orchestrator");
+    const workHistory = await human.historyPage({ scope: "channel", channel: "work" });
+    const workMarker = await human.readState({ scope: "channel", channel: "work" });
+    const readWork = await human.markRead({ scope: "channel", channel: "work" }, workHistory.messages[0].order, workMarker.version);
     agent = new AsenqClient();
     await agent.request("register", { harness: "omp", key: "alpha-key", name: "renamed" });
     await agent.request("unregister");
@@ -2983,6 +2986,7 @@ test("legacy identity migration and database reopen preserve channel rosters, ro
     await daemon.listen();
     human = new AsenqClient();
     assert.deepEqual((await human.request("channel_members", { channel: "work" })).members, []);
+    assert.deepEqual(await human.readState({ scope: "channel", channel: "work" }), readWork.state);
     const pruned = await human.sync();
     assert.equal(pruned.sessions.some((s) => s.id === sessionId), false);
     assert.deepEqual(pruned.channels, [
