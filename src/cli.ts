@@ -11,14 +11,20 @@ const USAGE = `usage: asenq <command>
 
   ls                                   list sessions
   send <name|*|human> <text…>          send as the user [--kind k] [--action pause|resume|cancel] [--thread t] [--reply-to id] [--done]
-  tail                                 follow messages and session events
+  tail                                 follow messages, sessions and channel events
   log [--session name] [--id msgId] [--limit n]
   inbox                                messages addressed to "human"
   rename <old> <new>
   inbound <name> accept|hold|refuse
   role <name> orchestrator|worker|unset
   held [name] | release <msgId> | drop <msgId>
-  channels | channel read <ch> [--limit n] | channel send <ch> <text…>
+  channels                             list channels, including those with no posts
+  channel create <ch>                   create an empty channel
+  channel add <ch> <name>               add a live session
+  channel remove <ch> <name>            remove a member by current or former name
+  channel remove <ch> --session-id <id> remove a member by stable identity
+  channel members <ch>                  list names, roles, states and identity IDs
+  channel read <ch> [--limit n] | channel send <ch> <text…>
   daemon run|start|stop|status
   setup [--remove]
   tui                                  interactive human messaging console

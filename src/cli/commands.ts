@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import type { ControlAction, Role, SendResult, TailEvent } from "../shared/protocol.js";
+import type { ChannelSummary, ControlAction, Role, SendResult, SessionIdentity, TailEvent } from "../shared/protocol.js";
 import { formatSendResults } from "../shared/tools.js";
 
 type LoggedMsg = {
@@ -103,11 +103,13 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           const e: TailEvent = p.event;
           if (e.type === "session") {
             out(`${hhmmss(Date.now())} session ${e.name} (${e.harness}) ${e.action}${e.oldName ? ` from ${e.oldName}` : ""}`);
+          } else if (e.type === "channel") {
+            out(`${hhmmss(Date.now())} channel #${e.channel.name} ${e.action} (${e.channel.memberIds?.length ?? 0} members)`);
           } else if (e.type === "message") {
             out(msgLine({ ...e.msg, status: e.status, reason: e.reason }));
           } else if (e.type === "retention") {
             out(`${hhmmss(Date.now())} retention pruned older history`);
-          } else {
+          } else if (e.type === "read") {
             const stream = e.state.scope.scope === "session" ? e.state.scope.sessionId : `#${e.state.scope.channel}`;
             out(`${hhmmss(Date.now())} read ${stream}: ${e.state.unread} unread`);
           }
@@ -193,13 +195,42 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
     }
     case "channels": {
       const r = await client.request("channel_list");
-      const rows = r.channels as { name: string; count: number; lastAt: number }[];
+      const rows = r.channels as ChannelSummary[];
       if (rows.length === 0) out("no channels");
-      for (const c of rows) out(`#${c.name}  ${c.count} messages  last ${new Date(c.lastAt).toLocaleString()}`);
+      for (const c of rows) out(`#${c.name}  ${c.count ? `${c.count} messages  last ${new Date(c.lastAt).toLocaleString()}` : "no posts"}  ${c.memberIds?.length ?? 0} members`);
       return 0;
     }
     case "channel": {
       const [sub, ch, ...rest] = argv;
+      if (sub === "create" && ch && rest.length === 0) {
+        await client.request("channel_create", { channel: ch });
+        out(`#${ch} created`);
+        return 0;
+      }
+      if (sub === "add" && ch && rest.length === 1) {
+        await client.request("channel_add", { channel: ch, name: rest[0] });
+        out(`${rest[0]} added to #${ch}`);
+        return 0;
+      }
+      if (sub === "remove" && ch) {
+        const { values, positionals } = parseArgs({
+          args: rest, allowPositionals: true, options: { "session-id": { type: "string" } },
+        });
+        const sessionId = values["session-id"];
+        if (sessionId ? positionals.length !== 0 : positionals.length !== 1) {
+          throw new Error("usage: asenq channel remove <ch> <name> | asenq channel remove <ch> --session-id <id>");
+        }
+        await client.request("channel_remove", { channel: ch, ...(sessionId ? { sessionId } : { name: positionals[0] }) });
+        out(`${sessionId ?? positionals[0]} removed from #${ch}`);
+        return 0;
+      }
+      if (sub === "members" && ch && rest.length === 0) {
+        const r = await client.request("channel_members", { channel: ch });
+        const members = r.members as SessionIdentity[];
+        if (members.length === 0) out(`#${ch} has no members`);
+        for (const member of members) out(`${member.name}  ${member.role ?? "unset"}  ${member.state}  ${member.id}`);
+        return 0;
+      }
       if (sub === "read" && ch) {
         const { values } = parseArgs({ args: rest, options: { limit: { type: "string" } } });
         const r = await client.request("channel_read", { channel: ch, limit: values.limit ? Number(values.limit) : undefined });
@@ -211,7 +242,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
         out(`#${ch} ${String(r.msgId)} posted`);
         return 0;
       }
-      throw new Error("usage: asenq channel read <ch> [--limit n] | asenq channel send <ch> <text…>");
+      throw new Error("usage: asenq channel create <ch> | add <ch> <name> | remove <ch> <name> | remove <ch> --session-id <id> | members <ch> | read <ch> [--limit n] | send <ch> <text…>");
     }
     default:
       throw new Error(`unknown command "${cmd}"\n${usage}`);
