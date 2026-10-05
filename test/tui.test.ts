@@ -174,12 +174,20 @@ test("wide console lists live sessions by recent activity, collapses the archive
   assert.equal(await unread(human, alpha.session.id), 1, "moving through the list does not mark a conversation read");
   rows = ui.rows();
   assertWithin(ui);
-  for (const row of rows.slice(1, -1)) {
+  const top = rows[1];
+  assert.ok(top.startsWith("╭─ Sessions "), "list title is inset into its rounded top border");
+  assert.ok(top.slice(listWidth + 1).startsWith("╭─ "), "conversation has its own rounded top border");
+  assert.ok(rows.at(-2)!.startsWith("╰"), "list panel has a rounded bottom border");
+  assert.ok(rows.at(-2)!.slice(listWidth + 1).startsWith("╰"), "conversation panel has a rounded bottom border");
+  for (const row of rows.slice(2, -2)) {
     const left = truncateTerminalText(row, listWidth);
-    assert.equal(terminalTextWidth(left), listWidth, `list pane is padded: ${row}`);
-    assert.equal(row.slice(left.length)[0], "│", `separator stays in its column: ${row}`);
+    assert.equal(terminalTextWidth(left), listWidth, `list panel is padded: ${row}`);
+    assert.equal(left[0], "│", `list left edge is intact: ${row}`);
+    assert.equal(left.at(-1), "│", `list right edge is intact: ${row}`);
+    assert.equal(row.slice(left.length, left.length + 2), " │", `panels remain separate: ${row}`);
+    assert.equal(row.at(-1), "│", `conversation right edge is intact: ${row}`);
   }
-  const conversation = rows.slice(1, -1).map((row) => row.slice(truncateTerminalText(row, listWidth).length + 1)).join("");
+  const conversation = rows.slice(2, -2).map((row) => row.slice(truncateTerminalText(row, listWidth).length + 2, -1)).join("");
   assert.ok(conversation.replace(/\s+/g, "").includes(long.replace(/\s+/g, "")), "the whole message body is visible");
 
   await ui.press("/");
@@ -198,8 +206,10 @@ test("narrow console reaches every wrapped row and marks an open conversation re
 
   const ui = await startConsole(40, 12);
   await ui.until(() => ui.rows().some((row) => row.includes("alpha")), "picker");
+  assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow picker is not boxed");
   assert.equal(await unread(human, alpha.session.id), 1, "the picker alone does not mark anything read");
   await ui.press("ENTER");
+  assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow conversation is not boxed");
   await ui.until(async () => await unread(human, alpha.session.id) === 0, "opening shows the newest row and reads it");
 
   await ui.press("HOME");
@@ -258,4 +268,20 @@ test("new arrivals keep a scrolled reader in place, and the composer sends once 
   assert.equal(alpha.deliveries.length, pending + 1, "sent exactly once");
   assert.equal(alpha.deliveries.at(-1)!.msg.text, "hello\nthere");
   assert.ok(!ui.rows().some((row) => row.startsWith("› hello") || row.includes("› there")), "draft cleared after send");
+});
+
+test("session list shows short harness labels without losing state or unread badges", async () => {
+  env = await startEnv();
+  const cc = await env.adapter("claude", "cc-key", "reviewer");
+  await env.adapter("opencode", "oc-key", "planner");
+  await env.adapter("omp", "omp-key", "writer");
+  await cc.client.request("send", { to: "human", text: "review is ready" });
+  const ui = await startConsole(120, 20);
+  const listWidth = paneWidths(120)!.list;
+  await ui.until(() => ui.rows().some((row) => row.includes("writer")), "all sessions");
+  const list = ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  assert.match(list.find((row) => row.includes("reviewer"))!, /\bcc\b.*\+1.*live/);
+  assert.match(list.find((row) => row.includes("planner"))!, /\boc\b.*live/);
+  assert.match(list.find((row) => row.includes("writer"))!, /\bomp\b.*live/);
+  assertWithin(ui);
 });
