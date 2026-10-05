@@ -642,7 +642,7 @@ test("human role form updates the selected session through protocol events and c
   await ui.type("alpha");
   await ui.press("ENTER");
   const listWidth = paneWidths(120)!.list;
-  const sessionRow = (): string => ui.rows().map((row) => truncateTerminalText(row, listWidth)).find((row) => row.includes("alpha")) ?? "";
+  const sessionRow = (): string => ui.rows().map((row) => truncateTerminalText(row, listWidth)).find((row) => row.includes("alpha") && row.includes("●")) ?? "";
 
   for (const [value, tag] of [["orchestrator", "orch"], ["worker", "wrk"], ["unset", ""]]) {
     await ui.press("?");
@@ -735,7 +735,7 @@ test("channel palette edits and member hit targets keep delivery in channel scop
     await ui.resize(columns, 22);
     await ui.press("#");
     const width = paneWidths(columns)?.list ?? columns;
-    const row = ui.rows().findIndex((row) => truncateTerminalText(row, width).includes("alpha"));
+    const row = ui.rows().findIndex((row) => truncateTerminalText(row, width).includes("alp") && truncateTerminalText(row, width).includes("●"));
     assert.ok(row >= 1);
     await ui.click(columns >= 80 ? 1 : 0, row);
     await ui.press("ENTER");
@@ -760,7 +760,7 @@ test("channel palette edits and member hit targets keep delivery in channel scop
   const replacement = await env.adapter("omp", "palette-new-alpha", "alpha");
   await human.request("channel_add", { channel: "empty", name: "alpha" });
   await ui.press("CTRL_D");
-  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("live")) && !ui.rows().some((row) => row.includes("retired")), "remove event leaves the new identity visible");
+  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("●")) && !ui.rows().some((row) => row.includes("retired")), "remove event leaves the new identity visible");
   const members = (await human.request("channel_members", { channel: "empty" })).members as SessionIdentity[];
   assert.deepEqual(members.map((member) => member.id), [replacement.session.id], "removal follows selected identity through rename, archive and name reuse");
   assertWithin(ui);
@@ -1148,7 +1148,7 @@ test("console shows control actions beside their kind without changing ordinary 
   await ui.until(() => ui.rows().some((row) => row.includes("Please pause here")), "control message");
 
   const control = ui.rows().find((row) => row.includes("control pause"));
-  const ordinary = ui.rows().find((row) => /\bstatus\b/.test(row) && row.includes("✓ delivered"));
+  const ordinary = ui.rows().find((row) => /\bstatus\b/.test(row) && row.includes("→"));
   assert.ok(control?.includes("pause"), "the visible control tag carries its action");
   assert.ok(ordinary, "ordinary status tag remains visible");
   assert.ok(!ordinary.includes("pause") && !ordinary.includes("control"), "ordinary metadata is unchanged");
