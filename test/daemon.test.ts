@@ -176,7 +176,7 @@ test("human roles validate, publish identity updates and survive rename and gone
   assert.equal(await roleOf("renamed"), null);
 });
 
-test("set_role denies every bound or attached agent before validating its request", async () => {
+test("unset bound and attached agents cannot edit roles, and sender selection cannot become human", async () => {
   env = await startEnv();
   const human = env.human();
   const omp = await env.adapter("omp", "omp-key", "omp");
@@ -189,10 +189,10 @@ test("set_role denies every bound or attached agent before validating its reques
     for (const request of [
       { name: "omp", role: "worker" }, { name: "omp", role: null },
       { name: "missing", role: "invalid" }, {},
-      { name: "omp", role: "orchestrator", as: "unbound" },
     ]) {
-      await assert.rejects(client.request("set_role", request), { code: "not_permitted" });
+      await assert.rejects(client.request("set_role", request), { code: client === opencode.client ? "bad_request" : "not_permitted" });
     }
+    await assert.rejects(client.request("set_role", { name: "omp", role: "worker", as: "unbound" }), { code: "bad_request" });
   }
   assert.ok((await human.sync()).sessions.every((session) => session.role === null));
 });
@@ -1899,6 +1899,195 @@ test("channels are stored and read back, never pushed", async () => {
   await assert.rejects(human.request("channel_send", { channel: "Bad Name", text: "x" }), /invalid channel name/);
 });
 
+test("human channel lifecycle keeps empty channels, identity rosters and on-demand posts", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const before = await human.sync();
+  const empty = { name: "work", count: 0, lastAt: 0, lastOrder: 0, memberIds: [] };
+  assert.deepEqual((await human.request("channel_create", { channel: "work" })).channel, empty);
+  assert.deepEqual((await human.request("channel_create", { channel: "work" })).channel, empty);
+  assert.deepEqual((await human.request("channel_list")).channels, [empty]);
+  const marker = await human.readState({ scope: "channel", channel: "work" });
+  assert.deepEqual([marker.position, marker.unread], [0, 0]);
+  await human.markRead({ scope: "channel", channel: "work" }, 0, marker.version);
+  for (const op of ["channel_create", "channel_add", "channel_remove", "channel_members"]) {
+    await assert.rejects(human.request(op, { channel: "Bad Name", name: "alpha" }), { code: "invalid_name" });
+  }
+  for (const op of ["channel_add", "channel_remove", "channel_members"]) {
+    await assert.rejects(human.request(op, { channel: "missing", name: "alpha" }), { code: "unknown_channel" });
+  }
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  await human.request("channel_create", { channel: "review" });
+  await human.request("channel_add", { channel: "review", name: "alpha" });
+  await alpha.client.request("rename", { name: "renamed" });
+  await human.request("set_role", { name: "renamed", role: "worker" });
+  const members = (await human.request("channel_members", { channel: "work" })).members;
+  assert.deepEqual(members, [(await human.sync()).sessions.find((s) => s.id === alpha.session.id)]);
+  const gone = await env.watch(isSession("gone", "renamed"));
+  alpha.client.close();
+  await gone.event;
+  assert.equal(((await human.request("channel_members", { channel: "review" })).members as { state: string }[])[0].state, "gone");
+  const resumed = await env.adapter("omp", "alpha-key", "renamed");
+  assert.equal(resumed.session.id, alpha.session.id);
+  await resumed.client.request("channel_send", { channel: "implicit", text: "@all still read on demand" });
+  const implicit = (await human.sync()).channels.find((c) => c.name === "implicit");
+  assert.deepEqual(implicit?.memberIds, []);
+  assert.equal(implicit?.count, 1);
+  assert.equal(resumed.deliveries.length, 0);
+  await human.request("channel_remove", { channel: "work", name: "alpha" });
+  await human.request("channel_remove", { channel: "work", sessionId: alpha.session.id });
+  assert.deepEqual((await human.request("channel_members", { channel: "work" })).members, []);
+  assert.deepEqual((await human.sync()).channels.find((c) => c.name === "review")?.memberIds, [alpha.session.id]);
+  const replay = await human.replay(before.watermark);
+  const events = replay.events.filter(({ event }) => event.type === "channel");
+  assert.deepEqual(events.map(({ event }) => event.type === "channel" && [event.action, event.channel.name, event.channel.memberIds]), [
+    ["created", "work", []], ["updated", "work", [alpha.session.id]],
+    ["created", "review", []], ["updated", "review", [alpha.session.id]],
+    ["created", "implicit", []], ["updated", "work", []],
+  ]);
+});
+
+test("orchestrators edit only their channel rosters and shared roles, losing permission on self-removal", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orch = await env.adapter("omp", "orch-key", "orch");
+  const worker = await env.adapter("omp", "worker-key", "worker");
+  const outside = await env.adapter("omp", "outside-key", "outside");
+  await human.request("set_role", { name: "orch", role: "orchestrator" });
+  await human.request("set_role", { name: "worker", role: "worker" });
+  for (const channel of ["work", "other"]) await human.request("channel_create", { channel });
+  await human.request("channel_add", { channel: "work", name: "orch" });
+  await human.request("channel_add", { channel: "other", name: "outside" });
+  await orch.client.request("channel_add", { channel: "work", name: "worker" });
+  await orch.client.request("set_role", { name: "worker", role: "orchestrator" });
+  assert.equal(((await worker.client.request("channel_members", { channel: "work" })).members as { name: string; role: string }[])
+    .find((m) => m.name === "worker")?.role, "orchestrator");
+  await orch.client.request("set_role", { name: "worker", role: "worker" });
+  for (const client of [orch.client, worker.client, outside.client]) {
+    await assert.rejects(client.request("channel_create", { channel: "forbidden" }), { code: "not_permitted" });
+  }
+  for (const op of ["channel_add", "channel_remove"]) {
+    await assert.rejects(orch.client.request(op, { channel: "other", name: "missing" }), { code: "not_permitted" });
+    await assert.rejects(worker.client.request(op, { channel: "work", name: "missing" }), { code: "not_permitted" });
+    await assert.rejects(orch.client.request(op, { channel: "work", sessionId: worker.session.id }), { code: "not_permitted" });
+  }
+  await assert.rejects(orch.client.request("set_role", { name: "outside", role: "worker" }), { code: "not_permitted" });
+  await assert.rejects(worker.client.request("set_role", { name: "missing", role: "invalid" }), { code: "not_permitted" });
+  await assert.rejects(orch.client.request("channel_add", { channel: "work", name: "missing" }), { code: "unknown_target" });
+  await orch.client.request("channel_remove", { channel: "work", name: "orch" });
+  await assert.rejects(orch.client.request("channel_add", { channel: "work", name: "outside" }), { code: "not_permitted" });
+  await assert.rejects(orch.client.request("set_role", { name: "worker", role: null }), { code: "not_permitted" });
+  await human.request("set_role", { name: "outside", role: "worker" });
+});
+
+test("membership and role authorization select the bound or attached actor before target lookup", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const multi = await env.adapter("opencode", "orch-key", "orch");
+  const registered = await multi.client.request("register", { harness: "opencode", key: "worker-key", name: "worker" });
+  const worker = registered.session as { id: string; name: string };
+  const target = await env.adapter("omp", "target-key", "target");
+  await human.request("claude_hook", { event: "start", key: "sid:claude", sessionId: "claude", name: "claude" });
+  const claude = env.human();
+  await claude.request("claude_attach", { sessionId: "claude" });
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["orch", "worker", "claude", "target"]) await human.request("channel_add", { channel: "work", name });
+  await human.request("set_role", { name: "orch", role: "orchestrator" });
+  await human.request("set_role", { name: "claude", role: "orchestrator" });
+  for (const op of ["channel_add", "channel_remove", "set_role", "channel_create"]) {
+    const p = { channel: "work", name: "target", role: "worker" };
+    await assert.rejects(multi.client.request(op, p), { code: "bad_request" });
+    await assert.rejects(multi.client.request(op, { ...p, as: "unbound" }), { code: "bad_request" });
+    await assert.rejects(multi.client.request(op, { ...p, as: worker.id }), { code: "not_permitted" });
+  }
+  await multi.client.request("set_role", { name: "target", role: "worker", as: multi.session.id });
+  await multi.client.request("channel_remove", { channel: "work", name: "target", as: multi.session.id });
+  await claude.request("channel_add", { channel: "work", name: "target" });
+  await claude.request("set_role", { name: "target", role: null });
+  assert.equal((await human.sync()).sessions.find((s) => s.id === target.session.id)?.role, null);
+  await assert.rejects(claude.request("channel_remove", { channel: "work", sessionId: target.session.id }), { code: "not_permitted" });
+  await assert.rejects(claude.request("channel_create", { channel: "forbidden" }), { code: "not_permitted" });
+});
+
+test("channel additions require live targets and removals resolve only roster identities with current-name precedence", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await human.request("channel_create", { channel: "work" });
+  const first = await env.adapter("omp", "first-key", "alpha");
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  await first.client.request("channel_send", { channel: "work", text: "retained first identity" });
+  await first.client.request("rename", { name: "first-renamed" });
+  const gone = await env.watch(isSession("gone", "first-renamed"));
+  first.client.close();
+  await gone.event;
+  await assert.rejects(human.request("channel_add", { channel: "work", name: "first-renamed" }), { code: "not_live" });
+  env.clock.advance(GRACE_MS + 1);
+  env.daemon.sweep();
+  await assert.rejects(human.request("channel_add", { channel: "work", name: "first-renamed" }), { code: "not_live" });
+  await assert.rejects(human.request("channel_add", { channel: "work", name: "alpha" }), { code: "not_live" });
+  assert.equal(((await human.request("channel_members", { channel: "work" })).members as { state: string }[])[0].state, "removed");
+  const second = await env.adapter("omp", "second-key", "alpha");
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  await second.client.request("channel_send", { channel: "work", text: "retained second identity" });
+  await second.client.request("rename", { name: "second-renamed" });
+  await second.client.request("unregister");
+  const current = await env.adapter("omp", "current-key", "alpha");
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  await human.request("channel_remove", { channel: "work", name: "alpha" });
+  assert.deepEqual((await human.sync()).channels.find((c) => c.name === "work")?.memberIds?.sort(), [first.session.id, second.session.id].sort());
+  await assert.rejects(human.request("channel_remove", { channel: "work", name: "alpha" }), (error: unknown) => {
+    const e = error as { code: string; message: string };
+    assert.equal(e.code, "ambiguous_target");
+    for (const value of [first.session.id, second.session.id, "first-renamed", "second-renamed", "state=removed"]) {
+      assert.ok(e.message.includes(value));
+    }
+    return true;
+  });
+  await human.request("channel_remove", { channel: "work", sessionId: first.session.id });
+  await human.request("channel_remove", { channel: "work", name: "alpha" });
+  await assert.rejects(human.request("channel_remove", { channel: "work", name: current.session.name }), { code: "unknown_target" });
+  await assert.rejects(human.request("channel_remove", { channel: "work", sessionId: "s_missing" }), { code: "unknown_target" });
+  await assert.rejects(human.request("channel_remove", { channel: "work", name: "alpha", sessionId: current.session.id }), { code: "bad_request" });
+  await assert.rejects(human.request("channel_add", { channel: "work", name: "never-known" }), { code: "unknown_target" });
+
+  const duplicateOne = await env.adapter("omp", "duplicate-one", "duplicate");
+  await human.request("channel_add", { channel: "work", name: "duplicate" });
+  await duplicateOne.client.request("unregister");
+  const duplicateTwo = await env.adapter("omp", "duplicate-two", "duplicate");
+  await human.request("channel_add", { channel: "work", name: "duplicate" });
+  await duplicateTwo.client.request("unregister");
+  await assert.rejects(human.request("channel_remove", { channel: "work", name: "duplicate" }), { code: "ambiguous_target" });
+  await human.request("channel_remove", { channel: "work", sessionId: duplicateOne.session.id });
+  await human.request("channel_remove", { channel: "work", name: "duplicate" });
+  assert.deepEqual((await human.request("channel_members", { channel: "work" })).members, []);
+});
+
+test("retention drops deleted identities from rosters without deleting channels or empty read markers", async () => {
+  env = await startEnv({ historyDays: 7 });
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  await human.request("channel_create", { channel: "empty" });
+  await human.request("channel_add", { channel: "empty", name: "alpha" });
+  await alpha.client.request("channel_send", { channel: "work", text: "retained until prune" });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  await alpha.client.request("unregister");
+  assert.deepEqual((await human.sync()).channels.find((c) => c.name === "work")?.memberIds, [alpha.session.id]);
+  env.clock.advance(8 * 86_400_000);
+  env.daemon.prune();
+  const after = await human.sync();
+  assert.equal(after.sessions.some((s) => s.id === alpha.session.id), false);
+  assert.deepEqual(after.channels, [
+    { name: "empty", count: 0, lastAt: 0, lastOrder: 0, memberIds: [] },
+    { name: "work", count: 0, lastAt: 0, lastOrder: 0, memberIds: [] },
+  ]);
+  for (const channel of ["empty", "work"]) {
+    assert.ok(after.readStates.some((state) => state.scope.scope === "channel" && state.scope.channel === channel));
+    assert.equal((await human.readState({ scope: "channel", channel })).unread, 0);
+  }
+});
+
 test("thread reads retain both directions in durable order and isolate the caller", async () => {
   env = await startEnv();
   const human = env.human();
@@ -2371,6 +2560,12 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
       done,status,reason,attempts,created_at,updated_at)
      VALUES('m_incoming','human',NULL,'old-session','s_old',NULL,'already delivered',NULL,NULL,NULL,0,'delivered',NULL,0,13,13)`,
   );
+  db.run(
+    `INSERT INTO messages(
+      id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,
+      done,status,reason,attempts,created_at,updated_at)
+     VALUES('m_channel','old-session','s_old','#legacy',NULL,'legacy','old post',NULL,NULL,NULL,0,'posted',NULL,0,14,14)`,
+  );
 
   const daemon = new Daemon({
     socket: socketPath(),
@@ -2392,6 +2587,9 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
     const state = await client.readState({ scope: "session", sessionId: "s_old" });
     assert.deepEqual([state.position, state.unread], [2, 0]);
     const snapshot = await client.sync();
+    assert.deepEqual(snapshot.channels, [{ name: "legacy", count: 1, lastAt: 14, lastOrder: 5, memberIds: [] }]);
+    assert.deepEqual((await client.request("channel_members", { channel: "legacy" })).members, []);
+    assert.equal((await client.readState({ scope: "channel", channel: "legacy" })).unread, 0);
     const active = snapshot.sessions.find((session) => session.id === "s_old");
     assert.deepEqual(active?.previousNames, ["prior-session"]);
     const recovered = snapshot.sessions.find((session) => session.id === "s_removed");
@@ -2680,7 +2878,7 @@ test("control action survives database reopen in history, replay and queued deli
   }
 });
 
-test("legacy identity migration and database reopen preserve roles, queued headers and explicit unset", async () => {
+test("legacy identity migration and database reopen preserve channel rosters, roles and empty read markers", async () => {
   const previousHome = process.env.ASENQ_HOME;
   const home = mkdtempSync(join(tmpdir(), "asenq-roles-restart-"));
   process.env.ASENQ_HOME = home;
@@ -2707,6 +2905,12 @@ test("legacy identity migration and database reopen preserve roles, queued heade
     assert.ok(session && typeof session === "object" && "id" in session && typeof session.id === "string");
     const sessionId = session.id;
     const before = await human.sync();
+    await human.request("channel_create", { channel: "work" });
+    await human.request("channel_create", { channel: "empty" });
+    await human.request("channel_add", { channel: "work", name: "alpha" });
+    const emptyMarker = await human.readState({ scope: "channel", channel: "empty" });
+    const markedEmpty = await human.markRead({ scope: "channel", channel: "empty" }, 0, emptyMarker.version);
+    await agent.request("channel_send", { channel: "work", text: "before restart" });
     await human.request("set_role", { name: "alpha", role: "worker" });
     await agent.request("rename", { name: "renamed" });
     const gone = Promise.withResolvers<void>();
@@ -2729,9 +2933,14 @@ test("legacy identity migration and database reopen preserve roles, queued heade
     human = new AsenqClient();
     const restored = (await human.sync()).sessions.find((session) => session.id === sessionId);
     assert.deepEqual(restored && [restored.name, restored.previousNames, restored.role], ["renamed", ["alpha"], "worker"]);
+    assert.deepEqual((await human.request("channel_members", { channel: "work" })).members, [restored]);
+    assert.deepEqual(await human.readState({ scope: "channel", channel: "empty" }), markedEmpty.state);
+    assert.deepEqual((await human.sync()).channels.find((c) => c.name === "work")?.memberIds, [sessionId]);
     const replay = await human.replay(before.watermark);
     assert.ok(replay.events.some(({ event }) => event.type === "session" && event.action === "updated"
       && event.session.id === sessionId && event.session.role === "worker"));
+    assert.ok(replay.events.some(({ event }) => event.type === "channel" && event.action === "updated"
+      && event.channel.name === "work" && event.channel.memberIds?.includes(sessionId)));
     const delivery = Promise.withResolvers<Delivery>();
     agent = new AsenqClient({
       onPush: (push) => {
@@ -2760,6 +2969,27 @@ test("legacy identity migration and database reopen preserve roles, queued heade
     assert.equal(listed.find((session) => session.name === "renamed")?.role, null);
     await human.request("set_role", { name: "renamed", role: "orchestrator" });
     assert.equal((await human.sync()).sessions.find((session) => session.id === sessionId)?.role, "orchestrator");
+    agent = new AsenqClient();
+    await agent.request("register", { harness: "omp", key: "alpha-key", name: "renamed" });
+    await agent.request("unregister");
+    now += 8 * 86_400_000;
+    daemon.prune();
+    agent.close();
+    human.close();
+    await daemon.close();
+    db.close();
+    db = await openDb(join(home, "asenq.db"));
+    daemon = new Daemon({ ...options, db });
+    await daemon.listen();
+    human = new AsenqClient();
+    assert.deepEqual((await human.request("channel_members", { channel: "work" })).members, []);
+    const pruned = await human.sync();
+    assert.equal(pruned.sessions.some((s) => s.id === sessionId), false);
+    assert.deepEqual(pruned.channels, [
+      { name: "empty", count: 0, lastAt: 0, lastOrder: 0, memberIds: [] },
+      { name: "work", count: 0, lastAt: 0, lastOrder: 0, memberIds: [] },
+    ]);
+    assert.deepEqual(await human.readState({ scope: "channel", channel: "empty" }), markedEmpty.state);
   } finally {
     agent.close();
     human.close();
