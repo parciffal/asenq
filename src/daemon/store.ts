@@ -239,6 +239,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS messages_from_session_order ON messages(from_session,ord);
       CREATE INDEX IF NOT EXISTS messages_to_session_order ON messages(to_session,ord);
       CREATE INDEX IF NOT EXISTS messages_to_name_order ON messages(to_name,ord);
+      CREATE INDEX IF NOT EXISTS messages_reply_to ON messages(reply_to);
     `);
     const maximum = Number(this.db.get<{ n: number }>("SELECT COALESCE(max(ord),0) AS n FROM messages")?.n ?? 0);
     if ((this.meta("message_order") ?? -1) < maximum) this.setMeta("message_order", maximum);
@@ -374,7 +375,7 @@ export class Store {
     this.transaction(() => {
       const rollout = this.meta("delivery_sequence_rollout") === undefined;
       if (rollout) {
-        this.db.run("UPDATE messages SET delivery_seq=ord WHERE channel IS NULL AND status='delivered' AND delivery_seq IS NULL");
+        this.db.run("UPDATE messages SET delivery_seq=ord WHERE channel IS NULL AND status IN ('delivered','replied') AND delivery_seq IS NULL");
       }
       const maximum = Number(this.db.get<{ n: number }>(
         "SELECT COALESCE(max(delivery_seq),0) AS n FROM messages",
@@ -413,7 +414,7 @@ export class Store {
   }
 
   stampDelivery(row: MsgRow): void {
-    if (row.channel !== null || row.status !== "delivered" || row.delivery_seq != null) return;
+    if (row.channel !== null || (row.status !== "delivered" && row.status !== "replied") || row.delivery_seq != null) return;
     row.delivery_seq = this.nextDeliverySequence();
     this.db.run("UPDATE messages SET delivery_seq=? WHERE id=?", row.delivery_seq, row.id);
     this.recordDirectActivity(row.to_session, row.updated_at);
@@ -544,6 +545,16 @@ export class Store {
     return row && toIdentity(row);
   }
 
+  /** Active current-name holders win; multiple retained holders require a stable id. */
+  identityByName(name: string): SessionIdentity | { candidates: SessionIdentity[] } | undefined {
+    const active = this.sessionByName(name);
+    if (active) return this.identity(active.id);
+    const candidates = this.db.all<IdentityRow>(
+      "SELECT * FROM session_identities WHERE name=? ORDER BY id", name,
+    ).map(toIdentity);
+    return candidates.length > 1 ? { candidates } : candidates[0];
+  }
+
   identities(): SessionIdentity[] {
     return this.db.all<IdentityRow>("SELECT * FROM session_identities ORDER BY created_at,id").map(toIdentity);
   }
@@ -670,11 +681,34 @@ export class Store {
     )?.n ?? 0);
   }
 
+  failedCount(): number {
+    return Number(this.db.get<{ n: number }>(
+      "SELECT count(*) AS n FROM messages WHERE channel IS NULL AND status IN ('failed','expired')",
+    )?.n ?? 0);
+  }
+
+  /** Delivery confirmation is reciprocal by durable endpoints, not historical names. */
+  hasDeliveredReply(original: MsgRow): boolean {
+    if (original.channel !== null || (original.status !== "delivered"
+      && !(original.status === "posted" && original.to_session === null && original.to_name === "human"))) return false;
+    if ((!original.from_session && original.from_name !== "human")
+      || (!original.to_session && original.to_name !== "human")) return false;
+    return this.db.get<{ one: number }>(
+      `SELECT 1 AS one FROM messages WHERE channel IS NULL AND reply_to=? AND ord>?
+       AND (status IN ('delivered','replied') OR (status='posted' AND to_session IS NULL AND to_name='human'))
+       AND ((from_session IS NOT NULL AND from_session=?) OR (from_session IS NULL AND from_name='human' AND ? IS NULL))
+       AND ((to_session IS NOT NULL AND to_session=?) OR (to_session IS NULL AND to_name='human' AND ? IS NULL))
+       LIMIT 1`,
+      original.id, original.ord, original.to_session, original.to_session, original.from_session, original.from_session,
+    ) !== undefined;
+  }
+
   insertMsg(row: MsgRow): MsgRow {
     const order = (this.meta("message_order") ?? 0) + 1;
     this.setMeta("message_order", order);
     row.ord = order;
-    row.delivery_seq = row.channel === null && row.status === "delivered" ? this.nextDeliverySequence() : null;
+    row.delivery_seq = row.channel === null && (row.status === "delivered" || row.status === "replied")
+      ? this.nextDeliverySequence() : null;
     this.db.run(
       `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,text,file,kind,action,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq)
        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,

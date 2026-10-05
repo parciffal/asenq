@@ -5,7 +5,7 @@ import net from "node:net";
 import { isAbsolute, join } from "node:path";
 import {
   ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, NAME_RE, PROBE_MS,
-  PROTOCOL, RESERVED, RETRY_MS, slug,
+  PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, slug,
   type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
   type PingStatus, type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type SessionIdentity, type TailEvent,
 } from "../shared/protocol.js";
@@ -24,6 +24,7 @@ export type DaemonOpts = {
   now?: () => number;
   ackTimeoutMs?: number;
   graceMs?: number;
+  queueTtlMs?: number;
   /** Overrides the sweep (10 s), retry (30 s) and Claude probe (30 s) intervals. */
   tickMs?: number;
   /** Run the retry/sweep/probe/prune timers. Tests drive them by hand instead. */
@@ -40,6 +41,7 @@ type Result = Record<string, unknown>;
 
 /** Who is sending: a bound session, the human CLI user, or the daemon itself. */
 type Sender = { kind: "agent"; session: SessionRow } | { kind: "human" } | { kind: "asenq" };
+type RouteTarget = Pick<SessionIdentity, "id" | "name" | "inbound" | "state">;
 
 type Ack = { ok: boolean; reason?: string };
 type LineageDecision = { identityId?: string; reason?: string };
@@ -167,6 +169,7 @@ export class Daemon {
   private readonly ackTimeoutMs: number;
   private readonly graceMs: number;
   private readonly pingTimeoutMs: number;
+  private readonly queueTtlMs: number;
   private readonly startedAt: number;
 
   constructor(private opts: DaemonOpts) {
@@ -175,6 +178,7 @@ export class Daemon {
     this.ackTimeoutMs = opts.ackTimeoutMs ?? ACK_TIMEOUT_MS;
     this.graceMs = opts.graceMs ?? GRACE_MS;
     this.pingTimeoutMs = opts.pingTimeoutMs ?? 3000;
+    this.queueTtlMs = opts.queueTtlMs ?? QUEUE_TTL_MS;
     this.startedAt = this.now();
     // Adapters get the grace window to reconnect after a daemon restart; Claude rows are probed instead.
     for (const row of this.store.db.all<SessionRow>(
@@ -195,6 +199,7 @@ export class Daemon {
     await promise;
     chmodSync(this.opts.socket, 0o600);
     this.server = server;
+    this.sweep();
     if (this.opts.timers !== false) {
       this.intervals.push(
         setInterval(() => this.sweep(), this.opts.tickMs ?? 10_000),
@@ -489,7 +494,7 @@ export class Daemon {
   private directScope(s: Sender): { sql: string; params: (string | number)[] } {
     return s.kind === "agent"
       ? {
-        sql: "channel IS NULL AND (from_session=? OR (to_session=? AND status IN ('delivered','queued')))",
+        sql: "channel IS NULL AND (from_session=? OR (to_session=? AND status IN ('delivered','replied','queued')))",
         params: [s.session.id, s.session.id],
       }
       : { sql: "channel IS NULL AND (from_name='human' OR to_name='human')", params: [] };
@@ -545,7 +550,7 @@ export class Daemon {
   private unreadInbox(s: Sender): { sql: string; params: (string | number)[] } {
     if (s.kind === "agent") {
       return {
-        sql: " AND status='delivered' AND delivery_seq>(SELECT inbox_position FROM session_identities WHERE id=?)",
+        sql: " AND status IN ('delivered','replied') AND delivery_seq>(SELECT inbox_position FROM session_identities WHERE id=?)",
         params: [s.session.id],
       };
     }
@@ -578,7 +583,7 @@ export class Daemon {
     const since = this.messageCursor(p, "since", s);
     const before = this.messageCursor(p, "before", s);
     let sql = s.kind === "agent"
-      ? "channel IS NULL AND to_session=? AND status IN ('delivered','queued')"
+      ? "channel IS NULL AND to_session=? AND status IN ('delivered','replied','queued')"
       : "channel IS NULL AND to_name='human'";
     const params: (string | number)[] = s.kind === "agent" ? [s.session.id] : [];
     if (thread !== undefined) {
@@ -650,6 +655,7 @@ export class Daemon {
       sessions,
       channels,
       readStates: this.store.readStates(),
+      failedCount: this.store.failedCount(),
       sessionLastOrders: this.store.sessionLastOrders(),
       sessionLastActivity: this.store.sessionLastActivity(),
       sessionPings: this.store.sessionPings(),
@@ -1201,6 +1207,7 @@ export class Daemon {
       let total = 0;
       const role = this.store.identity(row.id)?.role ?? undefined;
       for (const m of this.store.queuedFor(row.id)) {
+        if (this.expireQueued(m)) continue;
         const msg = this.store.withReplyState(toWire(m), row.id);
         let text = renderInbound(msg, role);
         if (texts.length === 0 && text.length > POLL_BUDGET) {
@@ -1294,11 +1301,11 @@ export class Daemon {
       throw new AsenqError("bad_request", "action is only valid for kind control");
     }
     if (p.done !== undefined && typeof p.done !== "boolean") throw new AsenqError("bad_request", '"done" must be a boolean');
-    let stableTarget: SessionRow | undefined;
+    let stableTarget: RouteTarget | undefined;
     if (targetSessionId !== undefined) {
       this.requireHuman(s, "send by stable session identity");
-      stableTarget = this.store.session(targetSessionId);
-      if (!stableTarget) throw new AsenqError("unknown_target", `session ${targetSessionId} is removed or unknown`);
+      stableTarget = this.store.identity(targetSessionId);
+      if (!stableTarget) throw new AsenqError("unknown_target", `unknown retained session ${targetSessionId}`);
       if (to !== undefined && to !== stableTarget.name) {
         throw new AsenqError("unknown_target", `session ${targetSessionId} is now named ${stableTarget.name}, not ${to}`);
       }
@@ -1318,21 +1325,28 @@ export class Daemon {
       this.insert(row);
       return [{ to, msgId: row.id, status: "posted" }];
     }
-    let targets: SessionRow[];
+    let targets: RouteTarget[];
     if (stableTarget) {
       targets = [stableTarget];
     } else if (to === "*") {
       const self = s.kind === "agent" ? s.session.id : undefined;
       targets = this.store.live().filter((r) => r.id !== self);
     } else {
-      const row = this.store.sessionByName(to);
-      if (!row) throw this.unknownTarget(to);
-      targets = [row];
+      const identity = this.store.identityByName(to);
+      if (!identity) throw this.unknownTarget(to);
+      if ("candidates" in identity) {
+        const candidates = identity.candidates.map((candidate) => ({
+          id: candidate.id, name: candidate.name, harness: candidate.harness, cwd: candidate.cwd,
+          ...(candidate.removedAt === undefined ? { createdAt: candidate.createdAt } : { removedAt: candidate.removedAt }),
+        }));
+        throw new AsenqError("ambiguous_target", `ambiguous session "${to}"; retry by stable id: ${JSON.stringify(candidates)}`);
+      }
+      targets = [identity];
     }
     return Promise.all(targets.map((t) => this.routeOne(s, t, { ...base, id: newId("m_"), to_name: t.name, to_session: t.id })));
   }
 
-  private routeOne(s: Sender, target: Pick<SessionIdentity, "id" | "name" | "inbound" | "state">, row: MsgRow): Promise<SendResult> | SendResult {
+  private routeOne(s: Sender, target: RouteTarget, row: MsgRow): Promise<SendResult> | SendResult {
     const now = row.created_at;
     const finish = (status: MsgStatus, reason?: string): SendResult => {
       this.insert({ ...row, status, reason: reason ?? null });
@@ -1375,18 +1389,24 @@ export class Daemon {
         type: "message",
         msg: toStored(row),
         status: row.status,
+        failedCount: this.store.failedCount(),
         ...(row.reason ? { reason: row.reason } : {}),
       };
       return this.store.appendEvent(event, this.now());
     });
     this.publish(positioned);
     if (scope) this.emit({ type: "read", state: this.store.ensureRead(scope) });
+    this.confirmReplies(row);
   }
 
   private setStatus(msgId: string, status: MsgStatus, reason?: string, notify = true): void {
     const current = this.store.msg(msgId);
-    if (!current || current.status === "expired"
-      || (current.status === status && (status === "delivered" || current.reason === (reason ?? null)))) return;
+    if (!current || current.status === "replied" || current.status === "failed" || current.status === "expired"
+      || current.status === "dropped" || current.status === "rejected") return;
+    if (current.status === "queued" && status !== "queued" && status !== "expired"
+      && this.expireQueued(current)) return;
+    if (status === "delivered" && current.status !== "queued") return;
+    if (current.status === status && current.reason === (reason ?? null)) return;
     const positioned = this.store.transaction(() => {
       this.store.db.run("UPDATE messages SET status=?, reason=?, updated_at=? WHERE id=?", status, reason ?? null, this.now(), msgId);
       const row = this.store.msg(msgId);
@@ -1396,6 +1416,7 @@ export class Daemon {
         type: "message",
         msg: toStored(row),
         status,
+        failedCount: this.store.failedCount(),
         ...(reason ? { reason } : {}),
       };
       return this.store.appendEvent(event, this.now());
@@ -1404,6 +1425,30 @@ export class Daemon {
     this.publish(positioned);
     const row = this.store.msg(msgId)!;
     if (notify && (status === "failed" || status === "expired")) this.notifyFailure(row, reason ?? status);
+    if (status === "delivered") this.confirmReplies(row);
+  }
+
+  private confirmReplies(row: MsgRow): void {
+    if (row.channel !== null || (row.status !== "delivered"
+      && !(row.status === "posted" && row.to_session === null && row.to_name === "human"))) return;
+    if (this.store.hasDeliveredReply(row)) this.setStatus(row.id, "replied");
+    if (!row.reply_to) return;
+    const original = this.store.msg(row.reply_to);
+    if (original && this.store.hasDeliveredReply(original)) this.setStatus(original.id, "replied");
+  }
+
+  /** Every path out of the queue uses the same inclusive creation-time deadline. */
+  private expireQueued(row: MsgRow): boolean {
+    if (row.status !== "queued" || this.now() < row.created_at + this.queueTtlMs) return false;
+    this.setStatus(row.id, "expired", "queue TTL expired");
+    return true;
+  }
+
+  private expireQueues(): void {
+    for (const row of this.store.db.all<MsgRow>(
+      "SELECT * FROM messages WHERE status='queued' AND created_at<=? ORDER BY ord",
+      this.now() - this.queueTtlMs,
+    )) this.expireQueued(row);
   }
 
   /** Retains delivery notices for non-terminal senders, including while they are offline. */
@@ -1423,7 +1468,8 @@ export class Daemon {
   private failAttempt(row: MsgRow, reason: string): MsgStatus {
     const current = this.store.msg(row.id);
     if (!current || current.status !== "queued") return current?.status ?? "expired";
-    const attempts = row.attempts + 1;
+    if (this.expireQueued(current)) return "expired";
+    const attempts = current.attempts + 1;
     this.store.db.run("UPDATE messages SET attempts=?, reason=?, updated_at=? WHERE id=?", attempts, reason, this.now(), row.id);
     if (attempts >= MAX_ATTEMPTS) {
       this.setStatus(row.id, "failed", reason);
@@ -1446,6 +1492,7 @@ export class Daemon {
   private async attemptDelivery(msgId: string): Promise<MsgStatus> {
     const row = this.store.msg(msgId);
     if (!row || row.status !== "queued") return row?.status ?? "failed";
+    if (this.expireQueued(row)) return "expired";
     const target = row.to_session ? this.store.session(row.to_session) : undefined;
     if (!target || target.state !== "live") return "queued";
     const message = this.store.withReplyState(toWire(row), target.id);
@@ -1464,6 +1511,7 @@ export class Daemon {
       const r = await writeLine(target.claude_socket, claudeFrame(text, envelope));
       const current = this.store.msg(row.id);
       if (!current || current.status !== "queued") return current?.status ?? "expired";
+      if (this.expireQueued(current)) return "expired";
       if (r === "ok") {
         if (this.store.msg(row.id)?.status === "queued") this.setStatus(row.id, "delivered");
         return this.store.msg(row.id)?.status ?? "failed";
@@ -1493,9 +1541,10 @@ export class Daemon {
     const ack = await promise;
     const current = this.store.msg(row.id);
     if (!current || current.status !== "queued") return current?.status ?? "expired";
+    if (this.expireQueued(current)) return "expired";
     if (ack.ok) {
       this.setStatus(row.id, "delivered");
-      return "delivered";
+      return this.store.msg(row.id)!.status;
     }
     if (ack.reason === "connection closed") return "queued";
     return this.failAttempt(row, ack.reason ?? "rejected by adapter");
@@ -1520,6 +1569,7 @@ export class Daemon {
   // ---------------------------------------------------------------- timers
 
   async retry(): Promise<void> {
+    this.expireQueues();
     for (const s of this.store.live()) {
       if (s.harness === "claude" && !s.claude_socket) continue;
       await this.flush(s.id);
@@ -1529,6 +1579,7 @@ export class Daemon {
   sweep(): void {
     const now = this.now();
     this.expirePings();
+    this.expireQueues();
     for (const s of this.store.db.all<SessionRow>("SELECT * FROM sessions WHERE state='gone' AND gone_at<=?", now - this.graceMs)) {
       this.removeSession(s);
     }
@@ -1550,6 +1601,7 @@ export class Daemon {
   }
 
   prune(): void {
+    this.expireQueues();
     const cutoff = this.now() - (this.opts.historyDays ?? 7) * 86_400_000;
     const removedMessages = this.store.db.run(
       "DELETE FROM messages WHERE created_at<? AND status NOT IN ('queued','held')",

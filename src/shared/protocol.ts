@@ -4,6 +4,7 @@ export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
 export const MAX_LINE = 1024 * 1024;
 export const GRACE_MS = 120_000;
+export const QUEUE_TTL_MS = 86_400_000;
 export const ACK_TIMEOUT_MS = 10_000;
 export const RETRY_MS = 30_000;
 export const MAX_ATTEMPTS = 5;
@@ -39,7 +40,7 @@ export type WireMsg = {
 };
 
 export type MsgStatus =
-  | "queued" | "delivered" | "held" | "rejected" | "failed"
+  | "queued" | "delivered" | "replied" | "held" | "rejected" | "failed"
   | "expired" | "posted" | "dropped";
 
 /** Retained history and held replies include durable order and delivery state.
@@ -100,7 +101,7 @@ export type TailEvent =
   | { type: "session"; action: "registered" | "renamed" | "gone" | "removed" | "updated";
       name: string; harness: Harness; cwd?: string; oldName?: string; reason?: string; session: SessionIdentity }
   | { type: "channel"; action: "created" | "updated"; channel: ChannelSummary }
-  | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string }
+  | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string; failedCount?: number }
   | { type: "read"; state: ReadState }
   | { type: "ping"; sessionId: string; ping: PingStatus }
   | { type: "retention" };
@@ -113,6 +114,7 @@ export type SyncResult = {
   sessions: SessionIdentity[];
   channels: ChannelSummary[];
   readStates: ReadState[];
+  failedCount: number;
   /** Latest retained non-channel message order per stable session identity; absent means zero. */
   sessionLastOrders: Record<string, number>;
   /** Durable direct activity: outgoing creation or first incoming delivery, excluding channel posts. */
