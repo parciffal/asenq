@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { lockedPid } from "../daemon/main.js";
 import { readConfig, writeConfig } from "../shared/config.js";
 import { configPath, dbPath } from "../shared/paths.js";
+import { QUEUE_TTL_MS } from "../shared/protocol.js";
 import { editJson, isObj, readJson, report, type Json } from "./jsonfile.js";
 
 export const CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "PostToolUse", "UserPromptSubmit", "Stop"] as const;
@@ -224,7 +225,10 @@ export async function setup(argv: string[]): Promise<number> {
   const i = install();
 
   const prev = readConfig();
-  const cfg = { runtime: i.runtime, cli: i.cli, historyDays: prev?.historyDays ?? 7, claude: { envelope: prev?.claude.envelope ?? false } };
+  const cfg = {
+    runtime: i.runtime, cli: i.cli, historyDays: prev?.historyDays ?? 7,
+    queueTtlMs: prev?.queueTtlMs ?? QUEUE_TTL_MS, claude: { envelope: prev?.claude.envelope ?? false },
+  };
   if (prev && JSON.stringify(prev) === JSON.stringify(cfg)) report("=", `${configPath()} (unchanged)`);
   else {
     writeConfig(cfg);

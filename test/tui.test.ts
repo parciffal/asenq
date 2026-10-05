@@ -348,6 +348,75 @@ test("header counts human session and channel unread markers and gone sessions s
   await ui.until(() => ui.rows()[0].includes("2 live · 0 reconnecting"), "reconnected identity counter");
 });
 
+test("header hydrates retained expired messages, follows live expiry and decreases after pruning", async () => {
+  env = await startEnv({ queueTtlMs: 1000, historyDays: 1 });
+  const human = env.human();
+  const alpha = await env.adapter("omp", "failed-alpha", "alpha");
+  const beta = await env.adapter("omp", "failed-beta", "beta");
+  const gone = await env.watch((e) => e.type === "session" && e.action === "gone" && e.name === "beta");
+  beta.client.close();
+  await gone.event;
+  await human.request("send", { to: "beta", text: "expired before opening the console" });
+  env.clock.advance(1000);
+  env.daemon.sweep();
+
+  const ui = await startConsole(120, 32);
+  assert.match(ui.rows()[0], /1 live · 1 reconnecting · 0 held · 0 unread · 1 failed/);
+  const assertFailedStyle = (text: string): void => {
+    const header = ui.frame().lines[0];
+    assert.ok(typeof header !== "string" && header?.some((span) =>
+      span.text === text && span.style?.foreground === "red" && span.style.bold), "failed count is visibly an error");
+  };
+  assertFailedStyle("1 failed");
+  await human.request("send", { to: "beta", text: "expires while the console is open" });
+  env.clock.advance(1000);
+  env.daemon.sweep();
+  await ui.until(() => ui.rows()[0].includes("2 failed"), "live expiry updates the authoritative count");
+  await alpha.client.request("send", { to: "human", text: "an unrelated successful message" });
+  await ui.until(() => ui.rows()[0].includes("1 unread"), "successful message arrives");
+  assert.ok(ui.rows()[0].includes("2 failed"), "success does not clear retained failures outside the selected history");
+
+  ui.size.columns = 80;
+  await ui.press("s");
+  assert.match(ui.rows()[0], /1 L · 1 R · 0 H · 1 U · 2 F/);
+  assertFailedStyle("2 F");
+  assertWithin(ui);
+  for (const columns of [40, 20, 5, 2, 1]) {
+    ui.size.columns = columns;
+    await ui.press("s");
+    assert.ok(ui.rows()[0].includes("●"), "connection remains visible when counters cannot fit");
+    assertWithin(ui);
+  }
+  ui.size.columns = 120;
+  await ui.press("s");
+  env.clock.advance(86_400_000 - 2000 + 1);
+  env.daemon.prune();
+  await ui.until(() => ui.rows()[0].includes("1 failed"), "pruning only the older expiry decreases the count");
+  env.clock.advance(1000);
+  env.daemon.prune();
+  await ui.until(() => ui.rows()[0].includes("0 failed"), "pruning the remaining expiry clears the count");
+  assertWithin(ui);
+});
+
+test("a delivered direct reply renders the original as successful rather than failed", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "replied-alpha", "alpha");
+  const beta = await env.adapter("omp", "replied-beta", "beta");
+  const original = await alpha.client.request("send", { to: "beta", text: "original question" });
+  const msgId = (original.results as { msgId: string }[])[0].msgId;
+  await beta.nextDelivery();
+  const ui = await startConsole(120, 32);
+  await ui.until(() => ui.rows().some((row) => row.includes("original question")), "original conversation");
+  await beta.client.request("send", { to: "alpha", text: "direct answer", replyTo: msgId });
+  await alpha.nextDelivery();
+  await ui.until(() => ui.rows().some((row) => row.includes("replied")), "original changes to replied");
+  const statusRows = ui.frame().lines.filter((row) => lineText(row).includes("replied"));
+  assert.ok(statusRows.some((row) => typeof row !== "string" && row.some((span) =>
+    span.text === "replied" && span.style?.foreground === "green")), "replied is a successful transcript status");
+  assert.ok(ui.rows()[0].includes("0 failed"), "a replied message is not a failure");
+  assertWithin(ui);
+});
+
 test("compact tabs remain mouse reachable without stealing the connection hit area", async () => {
   env = await startEnv();
   const ui = await startConsole(20, 12);
@@ -1077,7 +1146,7 @@ test("chrome header shows all counters and highlights the active tab as a pill",
   env = await startEnv();
   await env.adapter("omp", "chrome-header", "reviewer");
   const ui = await startConsole(120, 32);
-  assert.match(ui.rows()[0], /1 live · 0 reconnecting · 0 held · 0 unread/);
+  assert.match(ui.rows()[0], /1 live · 0 reconnecting · 0 held · 0 unread · 0 failed/);
   assert.match(ui.rows()[0], /● connected$/);
   const spans = ui.frame().lines[0] as readonly { text: string; style?: { inverse?: boolean } }[];
   assert.ok(spans.some((span) => span.text.includes("Sessions") && span.style?.inverse), "active Sessions tab is an inverse pill");

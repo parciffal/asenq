@@ -1,10 +1,12 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { configPath } from "./paths.js";
+import { QUEUE_TTL_MS } from "./protocol.js";
 
 export type Config = {
   runtime: string;
   cli: string;
   historyDays: number;
+  queueTtlMs: number;
   claude: { envelope: boolean };
 };
 
@@ -16,6 +18,7 @@ export function readConfig(): Config | undefined {
     runtime: raw.runtime ?? "",
     cli: raw.cli ?? "",
     historyDays: raw.historyDays ?? 7,
+    queueTtlMs: raw.queueTtlMs ?? QUEUE_TTL_MS,
     claude: { envelope: raw.claude?.envelope ?? false },
   };
 }

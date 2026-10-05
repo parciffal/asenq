@@ -54,6 +54,7 @@ export async function runDaemon(): Promise<void> {
     replyDir: replyDir(),
     envelope: cfg?.claude.envelope ?? false,
     historyDays: cfg?.historyDays ?? 7,
+    queueTtlMs: cfg?.queueTtlMs,
     // Test seams: acceptance tests shorten the production timings through the environment.
     ackTimeoutMs: envMs("ASENQ_ACK_TIMEOUT_MS"),
     graceMs: envMs("ASENQ_GRACE_MS"),
