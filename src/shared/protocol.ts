@@ -1,4 +1,4 @@
-export const PROTOCOL = 12;
+export const PROTOCOL = 13;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;

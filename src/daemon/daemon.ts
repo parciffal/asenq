@@ -874,8 +874,12 @@ export class Daemon {
   }
 
   private nameTaken(name: string, exceptIdentityId?: string): boolean {
-    const holder = this.store.sessionByName(name);
-    return holder !== undefined && holder.id !== exceptIdentityId;
+    const resolved = this.store.identityByName(name);
+    if (!resolved) return false;
+    if ("candidates" in resolved) {
+      return resolved.candidates.some((identity) => identity.state !== "removed" && identity.id !== exceptIdentityId);
+    }
+    return resolved.state !== "removed" && resolved.id !== exceptIdentityId;
   }
 
   /** Revives the durable identity for a harness id; names never establish identity. */
@@ -907,6 +911,8 @@ export class Daemon {
       base = identity
         ? `${harness}-${seed.toLowerCase().replace(/[^a-z0-9]/g, "").slice(-6)}`
         : defaultName(harness, seed, isTaken, this.opts.defaultNameWords);
+    } else if (!identity && this.nameTaken(base)) {
+      throw new AsenqError("name_taken", `name "${base}" is taken`);
     }
     let chosen = base;
     for (let n = 2; isTaken(chosen); n++) {
@@ -1074,7 +1080,7 @@ export class Daemon {
       throw new AsenqError("invalid_name", `invalid name "${wanted}" (lowercase letters, digits, - and _; not ${RESERVED.join("/")})`);
     }
     if (name === target.name) return { name };
-    if (this.store.sessionByName(name)) throw new AsenqError("name_taken", `name "${name}" is taken`);
+    if (this.nameTaken(name, target.id)) throw new AsenqError("name_taken", `name "${name}" is taken`);
     this.store.db.run("UPDATE sessions SET name=? WHERE id=?", name, target.id);
     this.store.renameIdentity(target.id, target.name, name);
     this.emitSession("renamed", { ...target, name }, target.name);
