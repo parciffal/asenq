@@ -438,3 +438,22 @@ test("wide bordered conversation keeps every wrapped body row reachable and read
     assert.ok(seen.has(row.trim()), `reached wrapped row: ${row}`);
   }
 });
+
+test("unread archived sessions remain distinguishable at the 80-column boundary", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "archived-alpha", "alpha");
+  const bravo = await env.adapter("omp", "archived-bravo", "bravo");
+  for (const session of [alpha, bravo]) {
+    await session.client.request("send", { to: "human", text: "unread archived conversation" });
+    await session.client.request("unregister");
+  }
+  const ui = await startConsole(80, 18);
+  await ui.press("ENTER");
+  const listWidth = paneWidths(80)!.list;
+  const archived = ui.rows().map((row) => truncateTerminalText(row, listWidth)).filter((row) => row.includes("archived"));
+  assert.equal(archived.length, 2);
+  assert.ok(archived.some((row) => row.includes("al")), "alpha retains a visible name prefix");
+  assert.ok(archived.some((row) => row.includes("br")), "bravo retains a distinct visible name prefix");
+  for (const row of archived) assert.ok(row.includes("+1"), "unread count remains visible");
+  assertWithin(ui);
+});

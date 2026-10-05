@@ -463,11 +463,14 @@ export class ConsoleApp {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
           const right = [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)];
-          const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - 1);
+          const left = [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])];
+          const labelWidth = left.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+          // Harness metadata yields before a session name or former-name search cue.
+          const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - labelWidth - 2);
           const harness = ellipsize(harnessShortName(s.harness), harnessWidth);
           if (harness) right.unshift({ text: `${harness} `, style: theme.dim });
           return [justify(
-            [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])],
+            left,
             right,
             width, pick(selected, focused),
           )];
