@@ -192,7 +192,7 @@ test("wide console lists live sessions by recent activity, collapses the archive
 
   await ui.press("/");
   await ui.type("legacy");
-  await ui.until(() => ui.rows().some((row) => row.includes("retired") && row.includes("was l")), "former-name search");
+  await ui.until(() => ui.rows().some((row) => truncateTerminalText(row, listWidth).includes("retired")), "former-name search finds the archived session");
   await ui.press("ESCAPE");
   assert.equal(ui.rows().findIndex((row) => row.includes("retired")), -1, "clearing search collapses the archive again");
 });
