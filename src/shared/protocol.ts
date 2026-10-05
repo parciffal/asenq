@@ -20,6 +20,7 @@ export const INBOUND: Inbound[] = ["accept", "hold", "refuse"];
 
 export type ErrCode =
   | "bad_request" | "unknown_target" | "name_taken" | "invalid_name"
+  | "unknown_channel" | "not_live" | "ambiguous_target"
   | "too_large" | "not_registered" | "not_permitted" | "no_session" | "rate_limited" | "internal";
 
 export type Req = { id: number; op: string; [k: string]: unknown };
@@ -71,6 +72,7 @@ export type ChannelSummary = {
   count: number;
   lastAt: number;
   lastOrder: number;
+  memberIds?: string[];
 };
 
 export type HistoryScope =
@@ -93,6 +95,7 @@ export type ReadState = {
 export type TailEvent =
   | { type: "session"; action: "registered" | "renamed" | "gone" | "removed" | "updated";
       name: string; harness: Harness; cwd?: string; oldName?: string; reason?: string; session: SessionIdentity }
+  | { type: "channel"; action: "created" | "updated"; channel: ChannelSummary }
   | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string }
   | { type: "read"; state: ReadState }
   | { type: "retention" };
