@@ -118,7 +118,7 @@ type Target =
   | { kind: "list" }
   | { kind: "transcript" };
 type Hit = { row: number; start: number; end: number; target: Target };
-type Entry = { key?: string; rows(width: number, selected: boolean, focused: boolean): TerminalLine[] };
+type Entry = { key?: string; rows(width: number, selected: boolean): TerminalLine[] };
 type Shown = { key: string; layout: TranscriptLayout; top: number; height: number };
 type ComposeTarget = { kind: "session"; id: string; name: string } | { kind: "channel"; name: string };
 type Pane = { rows: TerminalLine[]; cursor?: TerminalCursor };
@@ -1096,7 +1096,6 @@ export class ConsoleApp {
 
   private listPane(width: number, height: number, y0: number, x0: number): Pane {
     const tab = this.tab;
-    const focused = this.focus === "list";
     const header: TerminalLine[] = [];
     let cursor: TerminalCursor | undefined;
     if (tab === "sessions" && (this.searching || this.query)) {
@@ -1127,7 +1126,7 @@ export class ConsoleApp {
     for (const entry of this.entries(tab)) {
       const isSelected = entry.key !== undefined && entry.key === selected;
       if (isSelected) selStart = rows.length;
-      for (const row of entry.rows(width, isSelected, focused)) {
+      for (const row of entry.rows(width, isSelected)) {
         rows.push(row);
         keys.push(entry.key);
       }
