@@ -455,6 +455,9 @@ export class Daemon {
         const ack: Ack = { ok: p.ok === true, reason: str(p, "reason") };
         const f = this.inflight.get(msgId);
         const reset = this.pendingResets.get(msgId);
+        if (p.reset !== undefined && (p.reset !== "pending" || !reset)) {
+          throw new AsenqError("bad_request", "compact receipt requires an active pending delivery");
+        }
         if (reset) {
           const actor = this.sender(c, p);
           if (reset.conn !== c || actor.kind !== "agent" || actor.session.id !== reset.sessionId) {
@@ -469,6 +472,8 @@ export class Daemon {
             }
             reset.received = true;
             reset.deadline = this.now() + this.resetTimeoutMs;
+            // Receipt is delivery acceptance; persist it before any queue-expiry sweep can run.
+            this.setStatus(msgId, "delivered");
           }
         }
         const row = this.store.msg(msgId);
@@ -1622,14 +1627,20 @@ export class Daemon {
     return {};
   }
 
+  private cancelReceipt(msgId: string, reason: string): void {
+    const pending = this.pendingResets.get(msgId);
+    if (!pending || pending.received) return;
+    this.inflight.get(msgId)?.settle({ ok: false, reason });
+    this.pendingResets.delete(msgId);
+    this.resetting.delete(pending.sessionId);
+    setImmediate(() => { if (!this.closing) void this.flush(pending.sessionId); });
+  }
+
   private cancelResets(matches: (pending: PendingReset) => boolean, reason: string): void {
     for (const [msgId, pending] of this.pendingResets) {
       if (!matches(pending)) continue;
       if (pending.received) this.finishReset(msgId, "failed", false, reason);
-      else {
-        this.pendingResets.delete(msgId);
-        this.resetting.delete(pending.sessionId);
-      }
+      else this.cancelReceipt(msgId, "connection closed");
     }
   }
 
@@ -1680,6 +1691,9 @@ export class Daemon {
     });
     if (!positioned) return;
     this.publish(positioned);
+    if (current.status === "queued" && status !== "queued" && status !== "delivered") {
+      this.cancelReceipt(msgId, reason ?? status);
+    }
     const row = this.store.msg(msgId)!;
     if (notify && (status === "failed" || status === "expired")) this.notifyFailure(row, reason ?? status);
     if (status === "delivered") this.confirmReplies(row);

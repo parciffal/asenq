@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import asenq from "../src/adapters/omp.js";
 import type { ExtensionAPI, ExtensionContext } from "../src/adapters/omp-types.js";
-import type { AsenqClient } from "../src/shared/client.js";
+import { AsenqClient } from "../src/shared/client.js";
 import { ACK_TIMEOUT_MS, type SendResult } from "../src/shared/protocol.js";
 import { logOf, startEnv, type TestEnv } from "./helpers.js";
 
@@ -232,6 +232,43 @@ test("an unflagged push delivers immediately without compacting", async () => {
     assert.deepEqual(compacts, []);
   } finally {
     stopHosts();
+    await env.close();
+  }
+});
+
+test("a rejected receipt queued behind timed-out compaction is handled immediately", async () => {
+  const env = await startEnv({ resetTimeoutMs: 20, queueTtlMs: 10 });
+  const gate = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
+  let observer: AsenqClient | undefined;
+  try {
+    const ctx = makeCtx("omp-queued-rejection", () => { started.resolve(); return gate.promise; });
+    const host = await boot(ctx, "queued-rejection");
+    const warnings: string[] = [];
+    host.pi.logger.warn = (message) => { warnings.push(message); };
+    const human = env.human();
+    await human.request("send", { to: "queued-rejection", text: "long compact", reset: "compact" });
+    await started.promise;
+    env.clock.advance(20);
+    env.daemon.sweep();
+    let expired = false;
+    observer = new AsenqClient({ onPush: (p) => {
+      if (!expired && p.push === "event" && p.event.type === "message" && p.event.msg.text === "expired queued compact" && p.event.status === "queued") {
+        expired = true;
+        env.clock.advance(10);
+        env.daemon.sweep();
+      }
+    } });
+    await observer.request("tail");
+    const [second] = (await human.request("send", { to: "queued-rejection", text: "expired queued compact", reset: "compact" })).results as SendResult[];
+    assert.equal(second.status, "expired", "the real daemon rejects its late receipt");
+    await flushTurns();
+    assert.ok(warnings.some((warning) => warning.includes("receipt ack")), "rejection is observed before the earlier compaction releases the delivery queue");
+    assert.deepEqual(host.sent, [], "a rejected compact request cannot inject while the first compaction remains pending");
+  } finally {
+    stopHosts();
+    gate.resolve();
+    observer?.close();
     await env.close();
   }
 });

@@ -63,8 +63,14 @@ export default function asenq(pi: ExtensionAPI): void {
   };
 
   /** Flagged pushes acknowledge receipt before waiting on the queue or compaction. */
-  const ackReceipt = (p: Delivery): Promise<void> =>
-    client!.request("ack", { as: p.session, msgId: p.msg.id, ok: true, reset: "pending" }).then(() => undefined);
+  const ackReceipt = (p: Delivery): Promise<boolean> =>
+    client!.request("ack", { as: p.session, msgId: p.msg.id, ok: true, reset: "pending" }).then(
+      () => true,
+      (e: unknown) => {
+        warn(`receipt ack ${p.msg.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+        return false;
+      },
+    );
 
   /** Reports the finished reset outcome and this adapter's delivery acceptance separately from receipt. */
   const reportReset = (p: Delivery, reset: ResetResult, ok: boolean, reason?: string): void => {
@@ -73,17 +79,10 @@ export default function asenq(pi: ExtensionAPI): void {
   };
 
   /** Compacts (when flagged) then injects, but only for the session this push was queued for. */
-  const deliver = async (p: Delivery, target: ExtensionContext | undefined, targetKey: string | undefined, receipt: Promise<void> | undefined): Promise<void> => {
+  const deliver = async (p: Delivery, target: ExtensionContext | undefined, targetKey: string | undefined, receipt: Promise<boolean> | undefined): Promise<void> => {
     const flagged = receipt !== undefined;
-    if (receipt) {
-      try {
-        await receipt;
-      } catch (e) {
-        // The daemon never accepted this delivery; never compact or inject an unacknowledged push.
-        warn(`receipt ack ${p.msg.id} failed: ${e instanceof Error ? e.message : String(e)}`);
-        return;
-      }
-    }
+    // Handle receipt rejection at initiation, not only once this task reaches the queue head.
+    if (receipt && !await receipt) return;
     // A push is only ever acted on for the binding it arrived under; a session switch must not leak it.
     const current = (): boolean => client !== undefined && target !== undefined && target === ctxRef
       && targetKey === binding?.key && targetKey === p.key && target.sessionManager.getSessionId() === p.key;

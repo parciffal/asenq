@@ -224,8 +224,8 @@ for (const timeout of [50, 10 * 60_000]) {
   });
 }
 
-test("queue expiry before compact receipt does not leave the target gated forever", async () => {
-  env = await startEnv({ ackTimeoutMs: 30, queueTtlMs: 10 });
+test("queue expiry before compact receipt immediately releases the target delivery gate", async () => {
+  env = await startEnv({ ackTimeoutMs: 1000, queueTtlMs: 10 });
   const human = env.human();
   const target = await env.adapter("omp", "expiry", "target", { autoAck: false });
   await target.client.request("register", { harness: "omp", key: "expiry", caps: ["compact"] });
@@ -234,11 +234,19 @@ test("queue expiry before compact receipt does not leave the target gated foreve
   await target.nextDelivery();
   env.clock.advance(10);
   env.daemon.sweep();
+  const next = target.nextDelivery();
+  const normalSending = human.request("send", { to: "target", text: "normal after expired reset" });
+  void normalSending.catch(() => {});
+  const observed = await Promise.race([
+    next.then((push) => ({ push })),
+    normalSending.then((result) => ({ result })),
+  ]);
+  assert.ok("push" in observed, "the next delivery must start without waiting for the expired reset's ACK timeout");
+  await target.client.request("ack", { msgId: observed.push.msg.id, ok: true });
+  assert.equal(((await normalSending).results as SendResult[])[0].status, "delivered");
   assert.equal(((await sending).results as SendResult[])[0].status, "expired");
-  const [normal] = (await human.request("send", { to: "target", text: "normal after expired reset" })).results as SendResult[];
   assert.deepEqual(target.deliveries.map(({ msg }) => msg.text), ["expires before receipt", "normal after expired reset"]);
-  await target.client.request("ack", { msgId: normal.msgId, ok: true });
-  assert.equal((await logOf(human, normal.msgId!)).status, "delivered");
+  assert.equal((await logOf(human, observed.push.msg.id)).status, "delivered");
 });
 
 test("expired compact receipt is rejected before the adapter may compact or inject", async () => {
@@ -254,4 +262,42 @@ test("expired compact receipt is rejected before the adapter may compact or inje
   await assert.rejects(target.client.request("ack", { as: target.session.id, msgId: push.msg.id, ok: true, reset: "pending" }), { code: "bad_request" });
   assert.equal(((await sending).results as SendResult[])[0].status, "expired");
   assert.equal((await logOf(human, push.msg.id)).resetResult, undefined, "no compaction outcome is claimed");
+});
+
+test("binding replacement rejects the old compact receipt and delivers on the new binding", async () => {
+  env = await startEnv({ ackTimeoutMs: 1000 });
+  const human = env.human();
+  const original = await env.adapter("omp", "replacement", "target", { autoAck: false });
+  await original.client.request("register", { harness: "omp", key: "replacement", caps: ["compact"] });
+  const sending = human.request("send", { to: "target", text: "only the replacement may receive", reset: "compact" });
+  void sending.catch(() => {});
+  const oldPush = await original.nextDelivery();
+  const next = Promise.withResolvers<Delivery>();
+  const replacement = new AsenqClient({ onPush: (p) => { if (p.push === "deliver") next.resolve(p); } });
+  try {
+    await replacement.request("register", { harness: "omp", key: "replacement", caps: ["compact"] });
+    await assert.rejects(original.client.request("ack", { as: original.session.id, msgId: oldPush.msg.id, ok: true, reset: "pending" }),
+      (e: { code: string }) => ["bad_request", "not_permitted", "not_registered"].includes(e.code));
+    const push = await next.promise;
+    assert.equal(push.msg.id, oldPush.msg.id);
+    assert.equal(push.reset, "compact");
+    await replacement.request("ack", { as: push.session, msgId: push.msg.id, ok: true, reset: "pending" });
+    await replacement.request("reset_result", { as: push.session, msgId: push.msg.id, reset: "compacted", ok: true });
+    await sending;
+    const retained = await logOf(human, push.msg.id);
+    assert.deepEqual([retained.status, retained.resetResult], ["delivered", "compacted"]);
+  } finally { replacement.close(); }
+});
+
+test("a late compact receipt after ACK timeout cannot claim unsupported delivery", async () => {
+  env = await startEnv({ ackTimeoutMs: 30 });
+  const human = env.human();
+  const target = await env.adapter("omp", "ack-timeout", "target", { autoAck: false });
+  await target.client.request("register", { harness: "omp", key: "ack-timeout", caps: ["compact"] });
+  const sending = human.request("send", { to: "target", text: "late receipt must not authorize compaction", reset: "compact" });
+  const push = await target.nextDelivery();
+  assert.equal(((await sending).results as SendResult[])[0].status, "queued");
+  await assert.rejects(target.client.request("ack", { as: target.session.id, msgId: push.msg.id, ok: true, reset: "pending" }), { code: "bad_request" });
+  const retained = await logOf(human, push.msg.id);
+  assert.deepEqual([retained.status, retained.resetResult], ["queued", undefined]);
 });

@@ -53,6 +53,7 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
   const bound = new Map<string, { id: string; name: string }>();
   const registering = new Map<string, Promise<{ id: string; name: string } | undefined>>();
   const children = new Set<string>();
+  let disposed = false;
 
   const sdk = ctx.client.session;
   /** Compaction needs both history (to pick a model) and summarize; absent, the cap is not declared. */
@@ -83,10 +84,12 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
   });
 
   /** Compaction outcome for a flagged push; never throws and never suppresses the message. */
-  async function compact(key: string): Promise<ResetResult> {
+  async function compact(p: DeliveryPush): Promise<ResetResult> {
+    const key = p.key;
     if (!canCompact) return "unsupported";
     try {
       const listed = await sdk.messages!({ path: { id: key } });
+      if (disposed || bound.get(key)?.id !== p.session) return "failed";
       if (listed.error || !listed.data) return "failed";
       const model = latestModel(listed.data);
       if (!model) return "failed";
@@ -100,7 +103,7 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
 
   /** Injects the message, refusing a binding that was deleted or rebound since it was registered. */
   async function inject(p: DeliveryPush): Promise<DeliveryAttempt> {
-    if (bound.get(p.key)?.id !== p.session) return { ok: false, reason: "session not registered" };
+    if (disposed || bound.get(p.key)?.id !== p.session) return { ok: false, reason: "session not registered" };
     try {
       const result = await sdk.promptAsync({
         path: { id: p.key },
@@ -126,8 +129,8 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
   async function deliverCompact(p: DeliveryPush): Promise<void> {
     let reset: ResetResult = "failed";
     let attempt: DeliveryAttempt = { ok: false, reason: "session not registered" };
-    if (bound.get(p.key)?.id === p.session) {
-      reset = await compact(p.key);
+    if (!disposed && bound.get(p.key)?.id === p.session) {
+      reset = await compact(p);
       // summarize can take arbitrarily long, so a stale binding is caught by inject() right before the prompt.
       attempt = await inject(p);
     }
@@ -168,6 +171,7 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
   }
 
   async function register(ocId: string, info?: SessionInfo): Promise<{ id: string; name: string } | undefined> {
+    if (disposed) return undefined;
     const existing = bound.get(ocId);
     if (existing) return existing;
     if (children.has(ocId)) return undefined;
@@ -184,6 +188,7 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
         if (name) envNameUsed = true;
         const r = await client.request("register", { harness: "opencode", key: ocId, name, cwd: ctx.directory, caps });
         const s = r.session as { id: string; name: string };
+        if (disposed) return undefined;
         bound.set(ocId, s);
         log("info", `registered session ${ocId} as ${s.name}`);
         return s;
@@ -239,6 +244,8 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
       }
     },
     async dispose() {
+      disposed = true;
+      bound.clear();
       client.close();
     },
   };

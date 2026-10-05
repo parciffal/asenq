@@ -337,7 +337,6 @@ test("does not inject into a session deleted while its compaction is pending", a
   const name = await register(env, h, "oc-1");
 
   const delivered = await env.watch(deliveredFor("stale task"));
-  const failed = await env.watch(failedFor("stale task"));
   const result = await send(env.human(), name, "stale task", "compact");
   assert.equal(result.reset, "pending");
   await delivered.event;
@@ -346,7 +345,24 @@ test("does not inject into a session deleted while its compaction is pending", a
   // The OpenCode session disappears while summarize is still held; the message must not be injected into it.
   await h.event?.({ event: { type: "session.deleted", properties: { info: { id: "oc-1" } } } });
   held.resolve();
-  // The daemon either records the rejected delivery or refuses the completion report from the gone binding.
-  await Promise.race([failed.event, sdk.logHappened("reset_result")]);
+  // Wait for the resumed handler, not the daemon's earlier disconnect failure event.
+  await sdk.logHappened("reset_result");
   assert.equal(sdk.prompts.length, 0, "a deleted session must not receive the message");
+});
+
+test("disposing the plugin during summarization cannot launch a stale task", async () => {
+  env = await startEnv();
+  const sdk = fakeSdk();
+  sdk.setMessages([{ info: { role: "user", model: { providerID: "p", modelID: "m" } } }]);
+  const held = Promise.withResolvers<void>();
+  sdk.setSummarize(() => held.promise.then(() => ({ data: true })));
+  const h = await startPlugin(sdk);
+  const name = await register(env, h, "disposed-session");
+  const result = await send(env.human(), name, "must not start after disposal", "compact");
+  assert.equal(result.reset, "pending");
+  await sdk.callHappened("summarize");
+  await h.dispose?.();
+  held.resolve();
+  await sdk.logHappened("reset_result"); // Completion failed on the closed client, after any attempted injection.
+  assert.deepEqual(sdk.prompts, [], "disposal invalidates the harness binding before an awaited operation resumes");
 });

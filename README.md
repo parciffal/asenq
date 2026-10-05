@@ -164,6 +164,8 @@ Held and queued sends retain the request but omit the initial reset outcome. The
 
 A pending reset has a **10-minute** daemon-side cap (`DaemonOpts.resetTimeoutMs`); sweep expiry records failure and releases deferred delivery attempts. Disconnect also ends the pending reset as failed; deferred messages remain queued for reconnection. A hung harness API is not repaired by this deadline: subsequent attempts still use normal delivery acknowledgments and retries. An adapter injection error or an interrupted accepted delivery is recorded as failed without repeating compaction.
 
+Before receipt acceptance, queue expiry or delivery-binding removal/replacement cancels the pending attempt and immediately releases the target's delivery gate. A stale compact receipt is rejected, not relabeled as unsupported; adapters do not compact or inject after that rejection.
+
 This summarizes the existing context; it never clears context or creates a new harness session. The harness session ID and asenq identity stay unchanged.
 
 ### Human-assigned roles
