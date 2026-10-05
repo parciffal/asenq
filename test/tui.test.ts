@@ -2113,3 +2113,47 @@ test("pushed channel mention stays in the direct conversation and names its chan
   assert.ok(ui.rows().some((row) => row.includes("thread review")));
   assertWithin(ui);
 });
+
+test("channel mention picker uses the pinned opening boundary for typing and paste", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await env.adapter("omp", "mention-boundary-alpha", "alpha");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  const ui = await startConsole(80, 24);
+  await ui.press("#");
+  await ui.press("c");
+  const expected: string[] = [];
+  const composerRows = (): string[] => {
+    const rows = ui.rows();
+    const top = rows.findIndex((row) => row.includes("to #work"));
+    assert.ok(top >= 0, "channel composer remains visible");
+    return rows.slice(top + 1, -1);
+  };
+  for (const mode of ["typing", "paste"]) {
+    const insert = async (text: string): Promise<void> => {
+      if (mode === "typing") await ui.type(text);
+      else await ui.paste(text);
+    };
+    for (const literal of ["foo@alpha", "foo+@alpha.example", "foo-@alpha.example", "foo.@alpha", "foo_@alpha", "foo,@alpha"]) {
+      const split = literal.indexOf("@") + 3;
+      await insert(`${mode}: ${literal.slice(0, split)}`);
+      assert.ok(!composerRows().some((row) => row.includes("@alpha")), "a blocked opening cannot offer a completed member");
+      await insert(literal.slice(split));
+      await ui.press("ENTER"); // literal input sends, rather than accepting a picker
+      expected.push(`${mode}: ${literal}`);
+    }
+    for (const opening of ["", " ", "\n", "(", "[", "{", "<", "\"", "'", "`"]) {
+      await insert(`${opening}@al`);
+      assert.ok(composerRows().some((row) => row.includes("@alpha")), "allowed opening offers the member");
+      await ui.press("ENTER");
+      const closing = opening === "(" ? ")" : opening === "\"" || opening === "'" || opening === "`" ? opening : "";
+      if (closing) await insert(closing);
+      await ui.press("ENTER");
+      expected.push(`${opening}@alpha${closing}`);
+    }
+  }
+  const posts = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  assert.deepEqual(posts.map((post) => post.text), expected);
+  assertWithin(ui);
+});

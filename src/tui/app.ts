@@ -1573,7 +1573,7 @@ export class ConsoleApp {
     }
     const key = this.draftKey(target);
     const draft = this.drafts.get(key) ?? "";
-    const match = /(?:^|[^A-Za-z0-9_@])@([A-Za-z0-9_-]*)$/.exec(draft.slice(0, this.cursor));
+    const match = /(?:^|[\s(\[<{"'`])@([A-Za-z0-9_-]*)$/.exec(draft.slice(0, this.cursor));
     if (!match || match.index + match[0].length !== this.cursor) {
       this.mention = undefined;
       return;
