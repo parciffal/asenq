@@ -1,5 +1,5 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type MsgStatus, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
 import { renderMessageBody } from "./render.js";
 
 export type ParamSpec = {
@@ -168,7 +168,7 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
-type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean };
+type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; status?: MsgStatus; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
@@ -178,7 +178,7 @@ export function formatSendResults(results: SendResult[]): string {
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
-    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
+    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
     .join("\n\n");
 }
 
@@ -204,7 +204,7 @@ function formatInbox(msgs: Msg[], hasMore: boolean, advancing: boolean): string 
         const recovery = `Full text: asenq_inbox id=${m.id}.`
           + (m.thread ? " Or use asenq_thread_read with this message's thread." : "");
         const marker = `\n\n[truncated message ${m.id}; more available. ${recovery}]`;
-        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}\n`;
+        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}\n`;
         const body = renderMessageBody(m);
         const visible = text.length - body.length < 16_000 - marker.length ? text : header + body;
         let end = Math.min(visible.length, 16_000 - marker.length);
