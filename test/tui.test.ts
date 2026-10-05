@@ -47,7 +47,6 @@ async function startConsole(columns: number, rows: number, client?: ConsoleDeps[
   const size = { columns, rows };
   const app = new ConsoleApp({
     ...(client ? { client } : {}),
-    now: () => env!.clock.now(),
     screen: (options) => {
       handlers = options;
       return { size, start() {}, render(next) { frame = next; }, cleanup() {} };
@@ -1541,47 +1540,147 @@ test("Ctrl+X closes only a selected session row after one-key confirmation and l
   assertWithin(ui);
 });
 
-test("close all stale refreshes configuration and direct activity and pins the confirmed identities", async () => {
-  env = await startEnv({ staleHours: 2 });
+test("close all stale probes quiet sessions and excludes responding and unknown identities", async () => {
+  const pingTimeoutMs = 25;
+  env = await startEnv({ pingTimeoutMs });
   const human = env.human();
-  const idle: Adapter[] = [];
-  for (let index = 0; index < 12; index++) idle.push(await env.adapter("omp", `idle-${index}`, `idle-${index}`));
-  const active = await env.adapter("omp", "active-key", "active");
+  const quiet = await env.adapter("omp", "quiet-key", "quiet");
+  const hung = await env.adapter("omp", "hung-key", "hung", { autoPong: false });
+  const legacy = await env.adapter("omp", "legacy-key", "legacy", { pingSupport: false });
+  const hookOnly = (await human.request("claude_hook", {
+    event: "start", key: "sid:hook-only", sessionId: "hook-only", socket: null, name: "hook-only",
+  })).session as { id: string; name: string };
+  const deadSocket = join(env.home, "dead-claude.sock");
+  const deadClaude = (await human.request("claude_hook", {
+    event: "start", key: deadSocket, socket: deadSocket, sessionId: "dead-claude", name: "dead-claude",
+  })).session as { id: string; name: string };
+  env.clock.advance(6 * 3_600_000 + 1);
   const ui = await startConsole(120, 28);
-  env.clock.advance(2 * 3_600_000);
-  await idle[0].client.request("channel_send", { channel: "updates", text: "channel activity is not direct activity" });
-  await active.client.request("send", { to: "human", text: "recent direct activity" });
+  await ui.press("?");
+  await ui.type("Close all stale");
+  const action = ui.press("ENTER");
+  await hung.nextPing();
+  await quiet.nextPing();
+  await quiet.client.request("list"); // round trip after its automatic pong, before expiring hung
+  env.clock.advance(pingTimeoutMs);
+  env.daemon.sweep();
+  await action;
+  const rows = ui.rows().join("\n");
+  assert.match(rows, /2 conversations/, "only the hung adapter and dead Claude socket are counted");
+  for (const session of [hung.session, deadClaude]) {
+    assert.ok(rows.includes(`${session.name} (${session.id})`), "failed probes identify their close targets");
+  }
+  for (const session of [quiet.session, legacy.session, hookOnly]) {
+    assert.ok(!rows.includes(session.id), "responsive or unsupported quiet sessions are not close targets");
+  }
+  await ui.press("y");
+  const snapshot = await human.sync();
+  for (const session of [hung.session, deadClaude]) {
+    assert.equal(snapshot.sessions.find((s) => s.id === session.id)!.state, "removed");
+  }
+  for (const session of [quiet.session, legacy.session, hookOnly]) {
+    assert.equal(snapshot.sessions.find((s) => s.id === session.id)!.state, "live");
+  }
+  assert.equal(snapshot.sessionPings[quiet.session.id], "responding", "six hours without direct messages does not make a responding session stale");
+  assert.equal(snapshot.sessionPings[legacy.session.id], "unknown", "older adapters remain safe without capabilities");
+  assert.equal(snapshot.sessionPings[hookOnly.id], "unknown", "hook-only Claude has no socket to probe");
+  assertWithin(ui);
+});
+
+test("close all stale bounds its preview, cancels safely and submits only the confirmed identities", async () => {
+  const pingTimeoutMs = 25;
+  env = await startEnv({ pingTimeoutMs });
+  const human = env.human();
+  const hung: Adapter[] = [];
+  for (let index = 0; index < 12; index++) {
+    hung.push(await env.adapter("omp", `hung-${index}`, `hung-${index}`, { autoPong: false }));
+  }
+  const quiet = await env.adapter("omp", "snapshot-quiet", "quiet");
   const gone = await env.adapter("omp", "gone-key", "gone");
-  const goneEvent = await env.watch((event) => event.type === "session" && event.action === "gone" && event.name === "gone");
+  const goneEvent = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === gone.session.id);
   gone.client.close();
   await goneEvent.event;
   const archived = await env.adapter("omp", "archive-key", "archived");
   await human.request("close", { identity: archived.session.id });
-  const targetIds = new Set(idle.map((a) => a.session.id));
-  targetIds.add(gone.session.id);
+  const ui = await startConsole(120, 28);
+  const targetIds = new Set([...hung.map((adapter) => adapter.session.id), gone.session.id]);
   const preview = async (): Promise<void> => {
-    await paletteAction(ui, "Close all stale");
+    await ui.press("?");
+    await ui.type("Close all stale");
+    const action = ui.press("ENTER");
+    await Promise.all(hung.map((adapter) => adapter.nextPing()));
+    await quiet.nextPing();
+    await quiet.client.request("list");
+    env!.clock.advance(pingTimeoutMs);
+    env!.daemon.sweep();
+    await action;
     const rows = ui.rows().join("\n");
-    assert.ok(rows.includes("13"), "all twelve idle sessions and the recently gone session are counted");
-    const snapshot = await human.sync();
-    for (const session of snapshot.sessions.filter((s) => targetIds.has(s.id)).slice(0, 10)) {
-      assert.ok(rows.includes(`${session.name} (${session.id})`), "preview shows the first ten targets by name and identity");
+    assert.match(rows, /13 conversations/, "all twelve hung sessions and the disconnected session are counted");
+    const targets = (await human.sync()).sessions.filter((session) => targetIds.has(session.id));
+    for (const session of targets.slice(0, 10)) {
+      assert.ok(rows.includes(`${session.name} (${session.id})`), "preview names the first ten exact targets");
     }
-    assert.ok(rows.includes("and 3 more"), "omitted names have an explicit count");
-    assert.ok(!rows.includes(active.session.id) && !rows.includes(archived.session.id), "active and archived sessions are excluded");
+    for (const session of targets.slice(10)) {
+      assert.ok(!rows.includes(session.id), "remaining targets are counted instead of expanding the preview");
+    }
+    assert.ok(rows.includes("and 3 more"), "the preview reports its omitted target count");
+    assert.ok(!rows.includes(quiet.session.id) && !rows.includes(archived.session.id), "responding and archived identities are excluded");
   };
   await preview();
   await ui.press("n");
   assert.equal((await human.sync()).sessions.filter((s) => targetIds.has(s.id) && s.state === "removed").length, 0, "cancel closes no targets");
   await preview();
   const later = await env.adapter("omp", "later-key", "later");
-  env.clock.advance(2 * 3_600_000);
+  for (const adapter of [quiet, later]) {
+    const disconnected = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === adapter.session.id);
+    adapter.client.close();
+    await disconnected.event;
+  }
   await ui.press("y");
-  await ui.until(() => ui.rows()[0].includes("2 live"), "confirmed stale batch closes");
   const snapshot = await human.sync();
-  for (const id of targetIds) assert.equal(snapshot.sessions.find((s) => s.id === id)!.state, "removed");
-  assert.equal(snapshot.sessions.find((s) => s.id === active.session.id)!.state, "live", "newly stale session is not silently included");
-  assert.equal(snapshot.sessions.find((s) => s.id === later.session.id)!.state, "live", "new session is not silently included");
+  for (const id of targetIds) assert.equal(snapshot.sessions.find((session) => session.id === id)!.state, "removed");
+  for (const adapter of [quiet, later]) {
+    assert.equal(snapshot.sessions.find((session) => session.id === adapter.session.id)!.state, "gone", "newly disconnected and newly arrived identities are not silently added");
+  }
+  assertWithin(ui);
+});
+
+test("Ping sessions refreshes rows and external pongs and disconnection update an already open console", async () => {
+  const pingTimeoutMs = 25;
+  env = await startEnv({ pingTimeoutMs });
+  const human = env.human();
+  const hung = await env.adapter("omp", "ping-status-key", "worker", { autoPong: false });
+  const ui = await startConsole(120, 24);
+  await ui.press("?");
+  await ui.type("Ping sessions");
+  const action = ui.press("ENTER");
+  await hung.nextPing();
+  env.clock.advance(pingTimeoutMs);
+  env.daemon.sweep();
+  await action;
+  assert.ok(ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "failed ping renders on the live session row");
+  assert.equal((await human.sync()).sessions.find((session) => session.id === hung.session.id)!.state, "live", "ping failure does not disconnect or close the session");
+  assert.ok(!ui.rows().some((row) => row.includes("y confirm")), "Ping sessions never opens a destructive confirmation");
+
+  const external = human.request("ping", { sessionId: hung.session.id });
+  const probe = await hung.nextPing();
+  await hung.client.request("pong", { pingId: probe.pingId });
+  await external;
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "external response replaces cached failed status");
+
+  const failedAgain = human.request("ping", { sessionId: hung.session.id });
+  await hung.nextPing();
+  env.clock.advance(pingTimeoutMs);
+  env.daemon.sweep();
+  await failedAgain;
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "external failed ping updates the connected console");
+  const gone = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === hung.session.id);
+  hung.client.close();
+  await gone.event;
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("gone") && !row.includes("not_responding")), "disconnection clears cached ping");
+  const revived = await env.adapter("omp", "ping-status-key", "worker");
+  assert.equal(revived.session.id, hung.session.id);
+  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "revival does not inherit a failed ping");
   assertWithin(ui);
 });
 

@@ -25,13 +25,18 @@ export default function asenq(pi: ExtensionAPI): void {
 
   const register = async (key: string, name: string | undefined): Promise<void> => {
     if (!client || !ctxRef) return;
-    const r = await client.request("register", { harness: "omp", key, name, cwd: ctxRef.cwd });
+    const r = await client.request("register", { harness: "omp", key, name, cwd: ctxRef.cwd, caps: ["ping"] });
     binding = { key, name: (r.session as { name: string }).name };
     setStatus();
   };
 
   const onPush = (p: Push): void => {
-    if (p.push !== "deliver" || !client) return;
+    if (!client) return;
+    if (p.push === "ping") {
+      client.request("pong", { pingId: p.pingId }).catch((e: unknown) => warn(`pong failed: ${String(e)}`));
+      return;
+    }
+    if (p.push !== "deliver") return;
     let ok = true;
     let reason: string | undefined;
     try {

@@ -3,7 +3,7 @@ import { AsenqClient, type ClientOpts } from "../shared/client.js";
 import { KINDS } from "../shared/protocol.js";
 import { isStaleSession } from "../shared/sessions.js";
 import type {
-  ChannelSummary, HistoryScope, InboxSummary, PositionedEvent, ReadScope, ReadState, SendResult,
+  ChannelSummary, HistoryScope, InboxSummary, PingStatus, PositionedEvent, ReadScope, ReadState, SendResult,
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
 import { renderMessageBody } from "../shared/render.js";
@@ -32,7 +32,6 @@ export interface Screen {
 export type ConsoleDeps = {
   client?(options: ClientOpts): AsenqClient;
   screen?(options: TerminalAdapterOptions): Screen;
-  now?(): number;
 };
 
 const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"]] as const;
@@ -43,7 +42,7 @@ const ACTION_GROUPS = [
   ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
-  ["Sessions", ["Rename session", "Inbound policy", "Set role", "Close session", "Close all stale"]],
+  ["Sessions", ["Rename session", "Inbound policy", "Set role", "Ping sessions", "Close session", "Close all stale"]],
   ["Channels", ["Create channel", "Add channel member", "Remove channel member"]],
   ["Archive", ["Purge conversation", "Purge all archives"]],
   ["Daemon", ["Daemon status", "Daemon start", "Daemon stop", "Reconnect", "Setup", "Remove setup", "Doctor"]],
@@ -66,7 +65,7 @@ const HELP = [
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
   "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
   "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
-  "Session list: Ctrl+X closes the selected session after y/n confirmation. ? → Close all stale pings first and previews disconnected or nonresponding sessions. Archive: ? → Purge conversation / Purge all archives permanently deletes only the confirmed identities.",
+  "Session list: Ctrl+X closes the selected session after y/n confirmation. ? → Ping sessions refreshes responding status without a model turn. ? → Close all stale pings first and previews disconnected or not_responding sessions; quiet responding and unknown sessions are kept. Archive: ? → Purge conversation / Purge all archives permanently deletes only the confirmed identities.",
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
@@ -152,9 +151,9 @@ const jumpRank = (name: string, query: string): number => {
 export class ConsoleApp {
   private readonly screen: Screen;
   private readonly client: AsenqClient;
-  private readonly now: () => number;
   private sessions: SessionIdentity[] = [];
   private sessionOrders: Record<string, number> = {};
+  private sessionPings: Record<string, PingStatus> = {};
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
   private readStates = new Map<string, ReadState>();
@@ -202,7 +201,6 @@ export class ConsoleApp {
   private resolve?: (code: number) => void;
 
   constructor(deps: ConsoleDeps = {}) {
-    this.now = deps.now ?? Date.now;
     const clientOptions: ClientOpts = {
       autoStart: true,
       onPush: (p) => {
@@ -383,6 +381,7 @@ export class ConsoleApp {
   private applySnapshot(s: SyncResult): void {
     this.sessions = s.sessions;
     this.sessionOrders = { ...s.sessionLastOrders };
+    this.sessionPings = { ...s.sessionPings };
     this.channels = s.channels;
     this.readStates = new Map(s.readStates.map((r) => [keyOf(r.scope), r]));
     this.watermark = s.watermark;
@@ -419,8 +418,9 @@ export class ConsoleApp {
         this.activity = [];
         this.summaries = [];
         this.sessions = [];
+        this.sessionPings = {};
         this.readStates.clear();
-        this.heldIds.clear();
+        this.heldMessages.clear();
         this.panel = undefined;
         this.readHold = undefined;
         this.watermark = 0;
@@ -492,6 +492,9 @@ export class ConsoleApp {
       if (index >= 0) this.sessions[index] = e.session;
       else this.sessions.push(e.session);
       for (const summary of this.summaries) if (summary.sessionId === e.session.id) summary.name = e.session.name;
+      if (e.session.state !== "live") delete this.sessionPings[e.session.id];
+    } else if (e.type === "ping") {
+      if (this.session(e.sessionId)?.state === "live") this.sessionPings[e.sessionId] = e.ping;
     } else if (e.type === "retention") {
       this.resync = true;
     }
@@ -525,7 +528,9 @@ export class ConsoleApp {
   // ------------------------------------------------------------------ lists
 
   private stateLabel(s: SessionIdentity): TerminalSpan {
-    if (s.state === "live") return { text: "live", style: theme.ok };
+    if (s.state === "live") return this.sessionPings[s.id] === "not_responding"
+      ? { text: "not_responding", style: theme.warn }
+      : { text: "live", style: theme.ok };
     if (s.state === "gone") return { text: "gone", style: theme.warn };
     return { text: "archived", style: theme.dim };
   }
@@ -747,6 +752,7 @@ export class ConsoleApp {
       }
       sessionId = e.msg.from === "human" ? e.msg.toSessionId : e.msg.fromSessionId ?? e.msg.toSessionId;
     } else if (e.type === "session") sessionId = e.session.id;
+    else if (e.type === "ping") sessionId = e.sessionId;
     else if (e.type === "read") sessionId = e.state.scope.scope === "session" ? e.state.scope.sessionId : undefined;
     const session = sessionId && this.session(sessionId);
     if (!session) {
@@ -879,7 +885,7 @@ export class ConsoleApp {
         ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
       ];
       const right: TerminalSpan[] = item.session
-        ? [{ text: item.session.state === "gone" ? "reconnecting" : item.session.state === "live" ? "live" : "archived", style: this.stateLabel(item.session).style }]
+        ? [item.session.state === "gone" ? { text: "reconnecting", style: theme.warn } : this.stateLabel(item.session)]
         : [{ text: "channel", style: theme.dim }];
       this.hits.push({ row: y0 + inset + rows.length, start: inset, end: width - inset, target: { kind: "finder", key: item.key } });
       rows.push(justify(left, right, innerWidth, selected ? theme.selected : undefined));
@@ -1887,6 +1893,18 @@ export class ConsoleApp {
     this.openForm(title, labels.map((label, i) => ({ label, value: defaults[i] ?? "" })), submit, description);
   }
 
+  private async pingSessions(): Promise<SyncResult> {
+    this.say("Pinging sessions…");
+    this.render();
+    await this.client.request("ping");
+    await this.replay();
+    const snapshot = await this.client.sync();
+    this.sessionPings = { ...snapshot.sessionPings };
+    this.say("Session ping complete");
+    this.render();
+    return snapshot;
+  }
+
   private confirmSessions(operation: "close" | "purge", sessions: SessionIdentity[]): void {
     if (!sessions.length) {
       this.say(operation === "close" ? "No stale sessions to close" : "No archived conversations to purge");
@@ -2132,15 +2150,17 @@ export class ConsoleApp {
             this.say(`${name}: ${role}`);
           }, [selected?.name ?? "", selected?.role ?? "unset"], ["Roles do not restrict messaging. Orchestrators can edit members and roles within their own channels."]);
           break;
+        case "Ping sessions":
+          await this.pingSessions();
+          break;
         case "Close session":
           if (this.tab !== "sessions" || !selected) throw new Error("Select a session row to close");
           this.confirmSessions("close", [selected]);
           break;
         case "Close all stale": {
-          const snapshot = await this.client.sync();
-          const now = this.now();
+          const snapshot = await this.pingSessions();
           this.confirmSessions("close", snapshot.sessions.filter((session) =>
-            isStaleSession(session, snapshot.sessionLastActivity[session.id], now, snapshot.staleHours)));
+            isStaleSession(session, snapshot.sessionPings[session.id])));
           break;
         }
         case "Purge conversation":
