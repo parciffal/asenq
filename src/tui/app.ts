@@ -16,6 +16,7 @@ import {
   type TerminalLine, type TerminalSize, type TerminalSpan,
 } from "./terminal.js";
 import { roundedPanel } from "./panel.js";
+import { hintSpans } from "./chrome.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -121,6 +122,8 @@ export class ConsoleApp {
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
   private readStates = new Map<string, ReadState>();
+  private heldIds = new Set<string>();
+  private heldDirty = false;
   private streams = new Map<string, Stream>();
   private activity: PositionedEvent[] = [];
   private activityFilter: ActivityFilter = "important";
@@ -282,10 +285,14 @@ export class ConsoleApp {
     try {
       const previous = this.watermark;
       const snapshot = await this.client.sync();
-      const [summaries, events] = await Promise.all([this.client.inboxSummaries(), this.client.recentEvents()]);
+      const [summaries, events, held] = await Promise.all([
+        this.client.inboxSummaries(), this.client.recentEvents(), this.client.request("held"),
+      ]);
       this.applySnapshot(snapshot);
       this.summaries = summaries;
       this.activity = events;
+      this.heldIds = new Set((held.messages as StoredMessage[]).map((m) => m.id));
+      this.heldDirty = false;
       if (previous) this.watermark = previous; // replay missed events before trusting the new watermark
       this.connection = "connected";
       if (this.notice?.kind === "error" && this.notice.text.startsWith("Disconnected")) this.notice = undefined;
@@ -327,6 +334,13 @@ export class ConsoleApp {
         }
         if (!r.hasMore) break;
       }
+      // Refresh only after relevant replay transitions; the held op is authoritative even
+      // when a hold and its release both occurred between snapshots.
+      if (this.heldDirty && !this.resync) {
+        const held = await this.client.request("held");
+        this.heldIds = new Set((held.messages as StoredMessage[]).map((m) => m.id));
+        this.heldDirty = false;
+      }
     } catch (e) {
       this.connection = "offline";
       this.say(`Disconnected: ${stringify(e)} · reconnecting`, "error");
@@ -350,6 +364,7 @@ export class ConsoleApp {
     }
     const e = item.event;
     if (e.type === "message") {
+      if (e.status === "held" || this.heldIds.has(e.msg.id)) this.heldDirty = true;
       const m: StoredMessage = { ...e.msg, status: e.status, ...(e.reason ? { reason: e.reason } : {}) };
       if (!e.reason) delete m.reason;
       if (!m.channel) {
@@ -653,40 +668,80 @@ export class ConsoleApp {
   }
 
   private tabBar(width: number): TerminalLine {
-    const badge = (tab: Tab): string => {
-      let unread = 0;
-      for (const [key, state] of this.readStates) {
-        if (tab === "inbox" && key.startsWith("s:")) unread += state.unread;
-        if (tab === "channels" && key.startsWith("c:")) unread += state.unread;
-      }
-      return unread ? ` ${unread}` : "";
-    };
+    let inboxUnread = 0;
+    let channelUnread = 0;
+    for (const [key, state] of this.readStates) {
+      if (key.startsWith("s:")) inboxUnread += state.unread;
+      if (key.startsWith("c:")) channelUnread += state.unread;
+    }
+    // One entry per counter: adding another does not change the fitting or hit logic.
+    const counters = [
+      { count: this.sessions.filter((s) => s.state === "live").length, label: "live", short: "L", style: theme.dim },
+      { count: this.sessions.filter((s) => s.state === "gone").length, label: "reconnecting", short: "R", style: theme.warn },
+      { count: this.heldIds.size, label: "held", short: "H", style: theme.warn },
+      { count: inboxUnread + channelUnread, label: "unread", short: "U", style: theme.unread },
+    ];
     const connection: TerminalSpan = this.connection === "connected"
       ? { text: "● connected", style: theme.ok }
       : this.connection === "offline" ? { text: "○ offline", style: theme.bad } : { text: "◌ connecting", style: theme.warn };
-    const brand: TerminalSpan = { text: " asenq ", style: { ...theme.brand, inverse: true } };
-    const build = (short: boolean): { spans: TerminalSpan[]; hits: Hit[] } => {
-      // Narrow terminals keep the active tab's full name and abbreviate the others.
-      const spans: TerminalSpan[] = [brand, { text: " " }];
+    const used = (spans: TerminalSpan[]): number => spans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+    type Fit = { labels: "full" | "active" | "short" | "minimal"; brand: boolean; badges: boolean; counters: "full" | "short" | "none"; status: boolean };
+    // Fit complete tab targets and the connection first, abbreviating counters as a group
+    // before omitting them; only then shorten tabs and finally remove brand/badges.
+    const fits: Fit[] = [
+      { labels: "full", brand: true, badges: true, counters: "full", status: true },
+      { labels: "full", brand: true, badges: true, counters: "short", status: true },
+      { labels: "full", brand: true, badges: true, counters: "none", status: true },
+      { labels: "full", brand: true, badges: true, counters: "none", status: false },
+      { labels: "active", brand: true, badges: false, counters: "none", status: true },
+      { labels: "active", brand: true, badges: false, counters: "none", status: false },
+      { labels: "short", brand: false, badges: false, counters: "none", status: true },
+      { labels: "short", brand: false, badges: false, counters: "none", status: false },
+      { labels: "minimal", brand: false, badges: false, counters: "none", status: false },
+    ];
+    for (const fit of fits) {
+      const left: TerminalSpan[] = fit.brand ? [{ text: " asenq ", style: { ...theme.brand, inverse: true } }, { text: " " }] : [];
       const hits: Hit[] = [];
-      let column = terminalTextWidth(brand.text) + 1;
+      let column = used(left);
       for (const [tab, label] of TABS) {
         const active = tab === this.tab;
-        const text = ` ${short && !active ? label[0] : label}${badge(tab)} `;
-        const style = active ? (this.focus === "tabs" ? { ...theme.accentBold, inverse: true } : theme.focused) : theme.dim;
-        spans.push({ text, style });
-        hits.push({ row: 0, start: column, end: column + terminalTextWidth(text), target: { kind: "tab", tab } });
-        column += terminalTextWidth(text);
+        const full = fit.labels === "full" || (fit.labels === "active" && active);
+        const text = fit.labels === "minimal" ? label[0] : ` ${full ? label : label[0]}`;
+        const style = active ? { ...theme.accentBold, inverse: true } : theme.dim;
+        const spans: TerminalSpan[] = [{ text, style }];
+        const unread = tab === "inbox" ? inboxUnread : tab === "channels" ? channelUnread : 0;
+        if (fit.badges && unread) spans.push({ text: ` ${unread}`, style: theme.unread });
+        if (fit.labels !== "minimal") spans.push({ text: " ", style });
+        const length = used(spans);
+        left.push(...spans);
+        hits.push({ row: 0, start: column, end: column + length, target: { kind: "tab", tab } });
+        column += length;
       }
-      return { spans, hits };
-    };
-    const used = (spans: TerminalSpan[]): number => spans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-    let bar = build(false);
-    if (used(bar.spans) + terminalTextWidth(connection.text) + 1 > width) bar = build(true);
-    // The symbol alone still distinguishes the states (● ○ ◌) when there is no room for the word.
-    const status = used(bar.spans) + terminalTextWidth(connection.text) + 1 > width ? { ...connection, text: connection.text.slice(0, 1) } : connection;
-    this.hits.push(...bar.hits);
-    return justify(bar.spans, [status], width);
+      const right: TerminalSpan[] = [];
+      if (fit.counters !== "none") {
+        counters.forEach((counter, index) => {
+          if (index) right.push({ text: " · ", style: theme.dim });
+          right.push({ text: `${counter.count} ${fit.counters === "full" ? counter.label : counter.short}`, style: counter.style });
+        });
+        right.push({ text: "  " });
+      }
+      right.push(fit.status ? connection : { ...connection, text: connection.text.slice(0, 1) });
+      const gap = width - column - used(right);
+      // Never clip constructed tabs: recorded hit regions must exactly match visible cells.
+      if (gap >= (fit.labels === "minimal" ? 0 : 1)) {
+        this.hits.push(...hits);
+        return [...left, { text: " ".repeat(gap) }, ...right];
+      }
+    }
+    // Below five cells there is no room for four mouse tabs plus the state symbol.
+    // Keyboard tab shortcuts and the palette remain available; show only the active target.
+    if (width <= 1) return clipSpans([{ ...connection, text: connection.text.slice(0, 1) }], width);
+    this.hits.push({ row: 0, start: 0, end: 1, target: { kind: "tab", tab: this.tab } });
+    return [
+      { text: TABS.find(([tab]) => tab === this.tab)![1][0], style: { ...theme.accentBold, inverse: true } },
+      { text: " ".repeat(width - 2) },
+      { ...connection, text: connection.text.slice(0, 1) },
+    ];
   }
 
   private footer(width: number): TerminalLine {
@@ -698,16 +753,13 @@ export class ConsoleApp {
       : this.focus === "tabs" ? "←→ switch · Enter open · ? menu"
       : "↑↓ move · Enter open · Tab focus · ? menu";
     const notice = this.notice;
-    let left: TerminalSpan[];
-    if (notice) {
-      const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
-      left = [{ text: notice.kind === "error" ? "✖ " : notice.kind === "new" ? "● " : "· ", style }, { text: notice.text, style }];
-      if (notice.kind === "error") left.push({ text: " · Esc dismiss", style: theme.dim });
-    } else {
-      const live = this.sessions.filter((s) => s.state === "live").length;
-      left = [{ text: `${live} live · ${this.sessions.length} sessions`, style: theme.dim }];
-    }
-    const right = clipSpans([{ text: hints, style: theme.dim }], notice ? Math.floor(width / 2) : width);
+    if (!notice) return padSpans(hintSpans(hints, width), width);
+    const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
+    const left: TerminalSpan[] = [
+      { text: notice.kind === "error" ? "✖ " : notice.kind === "new" ? "● " : "· ", style },
+      { text: notice.text, style },
+    ];
+    const right = hintSpans(notice.kind === "error" ? `Esc dismiss · ${hints}` : hints, Math.floor(width / 2));
     return justify(left, right, width);
   }
 
