@@ -1,14 +1,10 @@
-import type { SessionIdentity } from "./protocol.js";
-
-export const DEFAULT_STALE_HOURS = 6;
+import type { PingStatus, SessionIdentity } from "./protocol.js";
 
 export function isStaleSession(
-  session: Pick<SessionIdentity, "state" | "createdAt">,
-  lastDirectAt: number | undefined,
-  now: number,
-  staleHours: number = DEFAULT_STALE_HOURS,
+  session: Pick<SessionIdentity, "state">,
+  ping: PingStatus | null | undefined,
 ): boolean {
   if (session.state === "removed") return false;
   if (session.state === "gone") return true;
-  return now - (lastDirectAt ?? session.createdAt) >= staleHours * 3600_000;
+  return ping === "not_responding";
 }

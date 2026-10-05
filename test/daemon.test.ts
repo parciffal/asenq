@@ -3504,8 +3504,8 @@ test("Claude terminal close forgets both recorded session ids and transcript lin
   })).session, fresh);
 });
 
-test("stale boundaries use direct outgoing creation and first incoming delivery, ignoring held messages and channel posts", async () => {
-  env = await startEnv({ staleHours: 2 });
+test("direct activity uses outgoing creation and first incoming delivery, ignoring held messages and channel posts", async () => {
+  env = await startEnv();
   const human = env.human();
   const alpha = await env.adapter("omp", "stale-sender", "alpha");
   const beta = await env.adapter("omp", "stale-target", "beta");
@@ -3516,15 +3516,9 @@ test("stale boundaries use direct outgoing creation and first incoming delivery,
   const [held] = await send(alpha.client, "beta", "not incoming activity until delivered");
   await beta.client.request("channel_send", { channel: "work", text: "not direct activity" });
   let synced = await human.sync();
-  assert.equal(synced.staleHours, 2);
   assert.equal(synced.sessionLastActivity[alpha.session.id], created + 3600_000);
   assert.equal(synced.sessionLastActivity[beta.session.id], undefined);
   assert.equal(synced.sessionLastActivity[idle.session.id], undefined);
-  env.clock.advance(3600_000 - 1);
-  const betaIdentity = synced.sessions.find((session) => session.id === beta.session.id)!;
-  assert.equal(isStaleSession(betaIdentity, undefined, env.clock.now(), synced.staleHours), false);
-  env.clock.advance(1);
-  assert.equal(isStaleSession(betaIdentity, undefined, env.clock.now(), synced.staleHours), true);
   assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
   const deliveredAt = env.clock.now();
   synced = await human.sync();
@@ -3532,18 +3526,6 @@ test("stale boundaries use direct outgoing creation and first incoming delivery,
   env.clock.advance(3600_000);
   await beta.client.request("ack", { msgId: held.msgId, ok: true });
   assert.equal((await human.sync()).sessionLastActivity[beta.session.id], deliveredAt);
-  env.clock.advance(3600_000 - 1);
-  assert.equal(isStaleSession(betaIdentity, deliveredAt, env.clock.now(), 2), false);
-  env.clock.advance(1);
-  assert.equal(isStaleSession(betaIdentity, deliveredAt, env.clock.now(), 2), true);
-  const goneEvent = await env.watch(isSession("gone", "idle"));
-  idle.client.close();
-  await goneEvent.event;
-  const goneIdentity = (await human.sync()).sessions.find((session) => session.id === idle.session.id)!;
-  assert.equal(isStaleSession(goneIdentity, env.clock.now(), env.clock.now(), 100), true);
-  await human.request("close", { identity: idle.session.id });
-  const removedIdentity = (await human.sync()).sessions.find((session) => session.id === idle.session.id)!;
-  assert.equal(isStaleSession(removedIdentity, undefined, env.clock.now(), 0), false);
 });
 
 test("offline incoming activity starts at late delivery, never queue creation", async () => {
@@ -3564,12 +3546,10 @@ test("offline incoming activity starts at late delivery, never queue creation", 
   await delivered.event;
   const synced = await human.sync();
   assert.equal(synced.sessionLastActivity[beta.session.id], env.clock.now());
-  assert.equal(isStaleSession(synced.sessions.find((session) => session.id === beta.session.id)!,
-    synced.sessionLastActivity[beta.session.id], env.clock.now(), synced.staleHours), false);
 });
 
-test("direct activity survives message retention and database reopen with a threshold longer than history retention", async () => {
-  env = await startEnv({ historyDays: 1, staleHours: 96 });
+test("direct activity survives message retention and database reopen", async () => {
+  env = await startEnv({ historyDays: 1 });
   let human = env.human();
   const alpha = await env.adapter("omp", "durable-activity", "alpha");
   const created = env.clock.now();
@@ -3587,11 +3567,6 @@ test("direct activity survives message retention and database reopen with a thre
   const session = synced.sessions.find((identity) => identity.id === alpha.session.id)!;
   assert.equal(synced.sessionLastActivity[session.id], activeAt);
   assert.equal(session.createdAt, created);
-  assert.equal(isStaleSession(session, activeAt, env.clock.now(), synced.staleHours), false);
-  env.clock.advance(2 * 86_400_000 - 1);
-  assert.equal(isStaleSession(session, activeAt, env.clock.now(), synced.staleHours), false);
-  env.clock.advance(1);
-  assert.equal(isStaleSession(session, activeAt, env.clock.now(), synced.staleHours), true);
 });
 
 test("reply availability treats private and missing targets identically for agents, while human history is authoritative", async () => {
@@ -3651,7 +3626,7 @@ test("purging an old terminal identity leaves the replacement harness associatio
 });
 
 test("late Claude lineage carries durable provisional direct activity after its original messages were retained away", async () => {
-  env = await startEnv({ historyDays: 1, staleHours: 96 });
+  env = await startEnv({ historyDays: 1 });
   const human = env.human();
   const originalPath = join(env.home, "activity-ancestor.jsonl");
   const latePath = join(env.home, "activity-late.jsonl");
@@ -3683,6 +3658,332 @@ test("late Claude lineage carries durable provisional direct activity after its 
   const synced = await human.sync();
   assert.equal(synced.sessionLastActivity[ancestor.id], activeAt);
   assert.equal(synced.sessionLastActivity[provisional.id], undefined);
-  assert.equal(isStaleSession(synced.sessions.find((session) => session.id === ancestor.id)!,
-    activeAt, env.clock.now(), synced.staleHours), false);
+});
+
+test("human ping distinguishes quiet responsive, hung, dead Claude, hook-only Claude and legacy sessions", async () => {
+  env = await startEnv({ pingTimeoutMs: 20 });
+  const human = env.human();
+  const responsive = await env.adapter("omp", "ping-responsive", "z-responsive");
+  const hung = await env.adapter("opencode", "ping-hung", "a-hung", { autoPong: false });
+  const legacy = await env.adapter("omp", "ping-legacy", "d-legacy", { pingSupport: false });
+  const dead = (await human.request("claude_hook", {
+    event: "start", key: "ping-dead", sessionId: "ping-dead", name: "b-dead",
+    socket: join(env.home, "missing-claude.sock"),
+  })).session as { id: string; name: string };
+  const hookOnly = await env.adapter("claude", "ping-hook", "c-hook");
+  env.clock.advance(6 * 3600_000);
+  const responding = await env.watch((event) => event.type === "ping"
+    && event.sessionId === responsive.session.id && event.ping === "responding");
+  const deadResult = await env.watch((event) => event.type === "ping" && event.sessionId === dead.id);
+  const pending = human.request("ping");
+  await hung.nextPing();
+  await responding.event;
+  await deadResult.event;
+  env.clock.advance(19);
+  env.daemon.sweep();
+  assert.equal((await human.sync()).sessionPings[hung.session.id], undefined);
+  env.clock.advance(1);
+  env.daemon.sweep();
+  assert.deepEqual((await pending).results, [
+    { sessionId: hung.session.id, name: "a-hung", ping: "not_responding" },
+    { sessionId: dead.id, name: "b-dead", ping: "not_responding" },
+    { sessionId: hookOnly.session.id, name: "c-hook", ping: "unknown" },
+    { sessionId: legacy.session.id, name: "d-legacy", ping: "unknown" },
+    { sessionId: responsive.session.id, name: "z-responsive", ping: "responding" },
+  ]);
+  assert.deepEqual(hookOnly.pings, []);
+  assert.deepEqual(legacy.pings, []);
+  const snapshot = await human.sync();
+  assert.ok(snapshot.sessions.every((session) => session.state === "live"));
+  assert.equal(snapshot.sessionLastActivity[responsive.session.id], undefined);
+  const stale = snapshot.sessions.filter((session) => isStaleSession(session, snapshot.sessionPings[session.id]));
+  assert.deepEqual(stale.map((session) => session.id).sort(), [hung.session.id, dead.id].sort());
+  for (const session of stale) await human.request("close", { identity: session.id });
+  assert.deepEqual((await human.sync()).sessions.filter((session) => session.state === "live")
+    .map((session) => session.id).sort(), [responsive.session.id, hookOnly.session.id, legacy.session.id].sort());
+});
+
+test("ping targets current names or stable ids and denies every bound agent, even on multi-session connections", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "ping-target", "alpha");
+  await alpha.client.request("rename", { name: "renamed" });
+  const expected = [{ sessionId: alpha.session.id, name: "renamed", ping: "responding" }];
+  assert.deepEqual((await human.request("ping", { name: "renamed" })).results, expected);
+  assert.deepEqual((await human.request("ping", { sessionId: alpha.session.id })).results, expected);
+  await assert.rejects(human.request("ping", { name: "alpha" }), { code: "unknown_target" });
+  await assert.rejects(human.request("ping", { sessionId: "s_missing" }), { code: "unknown_target" });
+  await assert.rejects(human.request("ping", { name: "renamed", sessionId: alpha.session.id }), { code: "bad_request" });
+  await assert.rejects(alpha.client.request("ping"), { code: "bad_request" });
+  await alpha.client.request("register", { harness: "opencode", key: "second-ping-binding", name: "second", caps: ["ping"] });
+  await assert.rejects(alpha.client.request("ping"), { code: "bad_request" });
+  await assert.rejects(alpha.client.request("ping", { as: alpha.session.id }), { code: "bad_request" });
+  const claude = (await human.request("claude_hook", {
+    event: "start", key: "attached-ping", sessionId: "attached-ping", name: "claude",
+  })).session as { id: string };
+  const attached = env.human();
+  await attached.request("claude_attach", { sessionId: "attached-ping" });
+  await assert.rejects(attached.request("ping", { sessionId: claude.id }), { code: "bad_request" });
+});
+
+test("foreign and expired pongs are harmless; default timeout uses clock and only a current response replaces failure", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "ping-token", "alpha", { autoPong: false });
+  const foreign = await env.adapter("omp", "ping-foreign", "foreign", { autoPong: false });
+  const pending = human.request("ping", { sessionId: alpha.session.id });
+  const ping = await alpha.nextPing();
+  await foreign.client.request("pong", { pingId: ping.pingId });
+  await human.request("pong", { pingId: ping.pingId });
+  await alpha.client.request("pong", { pingId: "unknown-token" });
+  assert.deepEqual((await human.sync()).sessionPings, {});
+  env.clock.advance(2999);
+  env.daemon.sweep();
+  assert.deepEqual((await human.sync()).sessionPings, {});
+  env.clock.advance(1);
+  // timers:false never expires a request without the explicit sweep, even beyond the deadline.
+  let settled = false;
+  void pending.then(() => { settled = true; });
+  await human.sync();
+  assert.equal(settled, false);
+  env.daemon.sweep();
+  assert.deepEqual((await pending).results, [{ sessionId: alpha.session.id, name: "alpha", ping: "not_responding" }]);
+  await alpha.client.request("pong", { pingId: ping.pingId });
+  assert.deepEqual((await human.sync()).sessionPings, { [alpha.session.id]: "not_responding" });
+  const updated = await env.watch((event) => event.type === "ping" && event.sessionId === alpha.session.id
+    && event.ping === "responding");
+  const next = human.request("ping", { name: "alpha" });
+  const fresh = await alpha.nextPing();
+  await alpha.client.request("pong", { pingId: fresh.pingId });
+  await next;
+  assert.deepEqual(await updated.event, { type: "ping", sessionId: alpha.session.id, ping: "responding" });
+  assert.deepEqual((await human.sync()).sessionPings, { [alpha.session.id]: "responding" });
+});
+
+test("concurrent ping completion preserves newest result; replacement invalidates old tokens and capabilities", async () => {
+  env = await startEnv({ pingTimeoutMs: 10 });
+  const human = env.human();
+  const alpha = await env.adapter("opencode", "ping-generation", "alpha", { autoPong: false });
+  const first = human.request("ping", { sessionId: alpha.session.id });
+  const old = await alpha.nextPing();
+  const second = human.request("ping", { sessionId: alpha.session.id });
+  const newest = await alpha.nextPing();
+  await alpha.client.request("pong", { pingId: newest.pingId });
+  assert.deepEqual((await second).results, [{ sessionId: alpha.session.id, name: "alpha", ping: "responding" }]);
+  env.clock.advance(10);
+  env.daemon.sweep();
+  assert.deepEqual((await first).results, [{ sessionId: alpha.session.id, name: "alpha", ping: "not_responding" }]);
+  assert.equal((await human.sync()).sessionPings[alpha.session.id], "responding");
+  await alpha.client.request("pong", { pingId: old.pingId });
+  const replacing = human.request("ping", { sessionId: alpha.session.id });
+  const abandoned = await alpha.nextPing();
+  const replacement = await env.adapter("opencode", "ping-generation", "ignored", { pingSupport: false });
+  assert.equal(replacement.session.id, alpha.session.id);
+  assert.deepEqual((await replacing).results, [{ sessionId: alpha.session.id, name: "alpha", ping: "unknown" }]);
+  const noCaps = await human.request("ping", { sessionId: alpha.session.id });
+  assert.deepEqual(noCaps.results, [{ sessionId: alpha.session.id, name: "alpha", ping: "unknown" }]);
+  await alpha.client.request("pong", { pingId: abandoned.pingId });
+  await replacement.client.request("pong", { pingId: abandoned.pingId });
+  assert.equal((await human.sync()).sessionPings[alpha.session.id], "unknown");
+  assert.deepEqual(replacement.pings, []);
+});
+
+test("capabilities and tokens belong to individual bindings on shared OpenCode connections", async () => {
+  env = await startEnv({ pingTimeoutMs: 10 });
+  const human = env.human();
+  const multi = await env.adapter("opencode", "ping-multi-one", "one", { autoPong: false });
+  const two = (await multi.client.request("register", {
+    harness: "opencode", key: "ping-multi-two", name: "two",
+  })).session as { id: string; name: string };
+  assert.deepEqual((await human.request("ping", { sessionId: two.id })).results,
+    [{ sessionId: two.id, name: "two", ping: "unknown" }]);
+  const first = human.request("ping", { sessionId: multi.session.id });
+  await multi.client.request("pong", { pingId: (await multi.nextPing()).pingId });
+  assert.deepEqual((await first).results, [{ sessionId: multi.session.id, name: "one", ping: "responding" }]);
+  await multi.client.request("register", { harness: "opencode", key: "ping-multi-two", caps: ["ping"] });
+  const all = human.request("ping");
+  const onePing = await multi.nextPing();
+  const twoPing = await multi.nextPing();
+  await multi.client.request("pong", { pingId: twoPing.pingId });
+  assert.equal((await human.sync()).sessionPings[two.id], "responding");
+  env.clock.advance(10);
+  env.daemon.sweep();
+  assert.deepEqual((await all).results, [
+    { sessionId: multi.session.id, name: "one", ping: "not_responding" },
+    { sessionId: two.id, name: "two", ping: "responding" },
+  ]);
+  await multi.client.request("pong", { pingId: onePing.pingId });
+  assert.equal((await human.sync()).sessionPings[multi.session.id], "not_responding");
+});
+
+test("gone clears persisted ping and cancels probes; revival reuses identity without inheriting failure", async () => {
+  env = await startEnv({ pingTimeoutMs: 10 });
+  let human = env.human();
+  const alpha = await env.adapter("omp", "ping-gone", "alpha", { autoPong: false });
+  const failed = human.request("ping", { sessionId: alpha.session.id });
+  await alpha.nextPing();
+  env.clock.advance(10);
+  env.daemon.sweep();
+  await failed;
+  const probing = human.request("ping", { sessionId: alpha.session.id });
+  await alpha.nextPing();
+  const gone = await env.watch(isSession("gone", "alpha"));
+  alpha.client.close();
+  await gone.event;
+  assert.deepEqual((await probing).results, [{ sessionId: alpha.session.id, name: "alpha", ping: "unknown" }]);
+  const snapshot = await human.sync();
+  assert.deepEqual(snapshot.sessionPings, {});
+  assert.equal(isStaleSession(snapshot.sessions.find((session) => session.id === alpha.session.id)!, undefined), true);
+  assert.deepEqual((await human.request("ping")).results, []);
+  await env.restart();
+  human = env.human();
+  const revived = await env.adapter("omp", "ping-gone", "ignored");
+  assert.equal(revived.session.id, alpha.session.id);
+  assert.deepEqual((await human.sync()).sessionPings, {});
+  await human.request("ping");
+  await env.restart();
+  human = env.human();
+  assert.deepEqual((await human.sync()).sessionPings, {});
+});
+
+test("Claude socket ping persists across reopen without a delivery or model turn", async () => {
+  env = await startEnv();
+  let human = env.human();
+  const path = join(env.home, "ping-live-claude.sock");
+  const fixture = await fakeClaude(path);
+  try {
+    const claude = (await human.request("claude_hook", {
+      event: "start", key: "ping-live-claude", sessionId: "ping-live-claude", name: "claude", socket: path,
+    })).session as { id: string };
+    assert.deepEqual((await human.request("ping")).results, [{ sessionId: claude.id, name: "claude", ping: "responding" }]);
+    assert.deepEqual(fixture.lines, []);
+    assert.deepEqual((await human.historyPage({ scope: "session", sessionId: claude.id })).messages, []);
+    await env.restart();
+    human = env.human();
+    assert.deepEqual((await human.sync()).sessionPings, { [claude.id]: "responding" });
+    await human.request("close", { identity: claude.id });
+    assert.deepEqual((await human.sync()).sessionPings, {});
+    assert.equal(isStaleSession((await human.sync()).sessions.find((session) => session.id === claude.id)!, "not_responding"), false);
+    await human.request("purge", { identity: claude.id });
+    assert.ok((await human.replay(0)).events.every(({ event }) => event.type !== "ping" || event.sessionId !== claude.id));
+  } finally {
+    await fixture.stop();
+  }
+});
+
+for (const removal of ["gone", "removed", "closed"] as const) {
+  test(`close retains one delivery notice for a ${removal} sender only when revival is allowed`, async () => {
+    env = await startEnv();
+    const human = env.human();
+    const sender = await env.adapter("omp", "notice-sender", "sender");
+    const target = await env.adapter("omp", "notice-target", "target");
+    const targetGone = await env.watch(isSession("gone", "target"));
+    target.client.close();
+    await targetGone.event;
+    const [queued] = await send(sender.client, "target", "waiting while target is offline");
+    assert.equal(queued.status, "queued");
+    if (removal === "closed") await human.request("close", { identity: sender.session.id });
+    else {
+      const gone = await env.watch(isSession("gone", "sender"));
+      sender.client.close();
+      await gone.event;
+      if (removal === "removed") {
+        env.clock.advance(GRACE_MS);
+        env.daemon.sweep();
+      }
+    }
+    await human.request("close", { identity: target.session.id });
+    await human.request("close", { identity: target.session.id });
+    const beforeRevival = await human.historyPage({ scope: "session", sessionId: sender.session.id });
+    const notices = beforeRevival.messages.filter((message) => message.from === "asenq" && message.replyTo === queued.msgId);
+    assert.deepEqual(notices.map((message) => message.status), removal === "closed" ? [] : ["queued"]);
+    const revived = await env.adapter("omp", "notice-sender", "ignored", { autoAck: false });
+    if (removal === "closed") {
+      assert.notEqual(revived.session.id, sender.session.id);
+      assert.deepEqual((await revived.client.request("inbox")).messages, []);
+    } else {
+      assert.equal(revived.session.id, sender.session.id);
+      const delivered = await revived.nextDelivery();
+      assert.equal(delivered.msg.id, notices[0].id);
+      await revived.client.request("ack", { msgId: delivered.msg.id, ok: true });
+      const inbox = (await revived.client.request("inbox")).messages as StoredMessage[];
+      assert.deepEqual(inbox.filter((message) => message.from === "asenq").map((message) => [message.id, message.status]),
+        [[notices[0].id, "delivered"]]);
+      await env.daemon.retry();
+      assert.deepEqual(revived.deliveries.map((delivery) => delivery.msg.id), [notices[0].id]);
+    }
+  });
+}
+
+test("close and purge remove memberships while preserving channels, unrelated members and purged author posts", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const closing = await env.adapter("omp", "membership-close", "closing");
+  const purging = await env.adapter("omp", "membership-purge", "purging");
+  const kept = await env.adapter("omp", "membership-kept", "kept");
+  for (const channel of ["work", "review"]) {
+    await human.request("channel_create", { channel });
+    for (const name of ["closing", "purging", "kept"]) await human.request("channel_add", { channel, name });
+  }
+  const post = await purging.client.request("channel_send", { channel: "work", text: "retain author history" });
+  const before = await human.sync();
+  await human.request("close", { identity: closing.session.id });
+  const fresh = await env.adapter("omp", "membership-close", "fresh");
+  assert.notEqual(fresh.session.id, closing.session.id);
+  await purging.client.request("unregister");
+  await human.request("purge", { identity: purging.session.id });
+  const snapshot = await human.sync();
+  assert.deepEqual(snapshot.channels.map((channel) => [channel.name, channel.memberIds]).sort(),
+    [["review", [kept.session.id]], ["work", [kept.session.id]]]);
+  assert.deepEqual((await human.request("channel_members", { channel: "work" })).members,
+    snapshot.sessions.filter((session) => session.id === kept.session.id));
+  assert.deepEqual((await human.historyPage({ scope: "channel", channel: "work" })).messages.map((message) => message.id), [post.msgId]);
+  const events = (await human.replay(before.watermark)).events.filter(({ event }) => event.type === "channel");
+  for (const name of ["work", "review"]) {
+    assert.deepEqual(events.filter(({ event }) => event.type === "channel" && event.channel.name === name)
+      .map(({ event }) => event.type === "channel" && event.channel.memberIds.slice().sort()), [
+      [purging.session.id, kept.session.id].sort(), [kept.session.id],
+    ]);
+  }
+});
+
+for (const action of ["unregister", "close", "shutdown"] as const) {
+  test(`${action} cancels pending ping without a stale completion changing revived identities`, async () => {
+    env = await startEnv({ pingTimeoutMs: 10 });
+    const human = env.human();
+    const alpha = await env.adapter("omp", "ping-cancel", "alpha", { autoPong: false });
+    const pending = human.request("ping", { sessionId: alpha.session.id });
+    // Install the rejection handler before shutdown destroys the human's connection.
+    const result = pending.then((reply) => ({ reply, error: undefined }),
+      (error: unknown) => ({ reply: undefined, error }));
+    const abandoned = await alpha.nextPing();
+    if (action === "shutdown") {
+      await env.daemon.close();
+      assert.ok((await result).error instanceof Error);
+      return;
+    }
+    if (action === "unregister") await alpha.client.request("unregister");
+    else await human.request("close", { identity: alpha.session.id });
+    assert.deepEqual((await result).reply?.results,
+      [{ sessionId: alpha.session.id, name: "alpha", ping: "unknown" }]);
+    const replacement = await env.adapter("omp", "ping-cancel", "replacement");
+    assert.equal(replacement.session.id === alpha.session.id, action === "unregister");
+    await replacement.client.request("pong", { pingId: abandoned.pingId });
+    await human.request("ping", { sessionId: replacement.session.id });
+    env.clock.advance(10);
+    env.daemon.sweep();
+    assert.equal((await human.sync()).sessionPings[replacement.session.id], "responding");
+  });
+}
+
+test("deadline pongs without a prior sweep expire rather than revive the target", async () => {
+  env = await startEnv({ pingTimeoutMs: 10 });
+  const human = env.human();
+  const alpha = await env.adapter("omp", "deadline-pong", "alpha", { autoPong: false });
+  const pending = human.request("ping", { sessionId: alpha.session.id });
+  const ping = await alpha.nextPing();
+  env.clock.advance(10);
+  await alpha.client.request("pong", { pingId: ping.pingId });
+  assert.deepEqual((await pending).results, [{ sessionId: alpha.session.id, name: "alpha", ping: "not_responding" }]);
+  assert.equal((await human.sync()).sessionPings[alpha.session.id], "not_responding");
 });

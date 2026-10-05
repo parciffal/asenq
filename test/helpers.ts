@@ -8,12 +8,15 @@ import type { Harness, Push, TailEvent, WireMsg } from "../src/shared/protocol.j
 import { openDb, type Db } from "../src/shared/sqlite.js";
 
 export type Delivery = Extract<Push, { push: "deliver" }>;
+export type Ping = Extract<Push, { push: "ping" }>;
 
 export type Adapter = {
   client: AsenqClient;
   session: { id: string; name: string };
   deliveries: Delivery[];
   nextDelivery(): Promise<Delivery>;
+  pings: Ping[];
+  nextPing(): Promise<Ping>;
 };
 
 export type TestEnv = {
@@ -21,7 +24,9 @@ export type TestEnv = {
   daemon: Daemon;
   clock: { now(): number; advance(ms: number): void };
   human(): AsenqClient;
-  adapter(harness: Harness, key: string, name?: string, opts?: { cwd?: string; autoAck?: boolean }): Promise<Adapter>;
+  adapter(harness: Harness, key: string, name?: string, opts?: {
+    cwd?: string; autoAck?: boolean; pingSupport?: boolean; autoPong?: boolean;
+  }): Promise<Adapter>;
   /** Subscribes to tail events now; `event` resolves with the first one matching `pred`. */
   watch(pred: (e: TailEvent) => boolean): Promise<{ event: Promise<TailEvent> }>;
   /** Closes clients and reopens the same database with a fresh daemon; the manual clock is retained. */
@@ -52,19 +57,40 @@ export async function startEnv(opts: Partial<DaemonOpts> = {}, seed?: (db: Db) =
     human: () => track(new AsenqClient()),
     async adapter(harness, key, name, o = {}) {
       const deliveries: Delivery[] = [];
+      const pings: Ping[] = [];
+      let pingWaiter: (() => void) | undefined;
       let waiter: (() => void) | undefined;
       const client: AsenqClient = track(new AsenqClient({
         onPush: (p) => {
+          if (p.push === "ping") {
+            pings.push(p);
+            pingWaiter?.();
+            if (o.autoPong !== false) void client.request("pong", { pingId: p.pingId }).catch(() => {});
+            return;
+          }
           if (p.push !== "deliver") return;
           deliveries.push(p);
           waiter?.();
           if (o.autoAck !== false) void client.request("ack", { msgId: p.msg.id, ok: true }).catch(() => {});
         },
       }));
-      const r: Reply = await client.request("register", { harness, key, name, cwd: o.cwd ?? "/work" });
+      const r: Reply = await client.request("register", {
+        harness, key, name, cwd: o.cwd ?? "/work", ...(o.pingSupport !== false ? { caps: ["ping"] } : {}),
+      });
       let seen = 0;
+      let pingsSeen = 0;
       return {
         client, session: r.session as { id: string; name: string }, deliveries,
+        pings,
+        async nextPing() {
+          if (pings.length <= pingsSeen) {
+            const { promise, resolve } = Promise.withResolvers<void>();
+            pingWaiter = resolve;
+            await promise;
+            pingWaiter = undefined;
+          }
+          return pings[pingsSeen++];
+        },
         async nextDelivery() {
           if (deliveries.length <= seen) {
             const { promise, resolve } = Promise.withResolvers<void>();

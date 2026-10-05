@@ -7,10 +7,9 @@ import {
   ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, NAME_RE, PROBE_MS,
   PROTOCOL, RESERVED, RETRY_MS, slug,
   type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
-  type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type TailEvent,
+  type PingStatus, type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type SessionIdentity, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
-import { DEFAULT_STALE_HOURS } from "../shared/sessions.js";
 import type { Db } from "../shared/sqlite.js";
 import { version } from "../shared/version.js";
 import { claudeFrame, parseEnvelopeReply, probe, replyAddr, writeLine } from "./claude.js";
@@ -32,7 +31,7 @@ export type DaemonOpts = {
   envelope?: boolean;
   historyDays?: number;
   defaultNameWords?: DefaultNameWords;
-  staleHours?: number;
+  pingTimeoutMs?: number;
   log?: (line: string) => void;
 };
 
@@ -45,6 +44,10 @@ type Sender = { kind: "agent"; session: SessionRow } | { kind: "human" } | { kin
 type Ack = { ok: boolean; reason?: string };
 type LineageDecision = { identityId?: string; reason?: string };
 type Inflight = { conn: Conn; timer: NodeJS.Timeout; settle(a: Ack): void };
+type PendingPing = {
+  sessionId: string; requester: Conn; conn?: Conn; deadline: number; timer?: NodeJS.Timeout;
+  settle(ping: PingStatus): void;
+};
 
 const DUP_WINDOW_MS = 30_000;
 const BUCKET_SIZE = 30;
@@ -58,6 +61,7 @@ class Conn {
   buf = "";
   /** Sessions whose delivery channel is this connection (OpenCode/omp; several per OpenCode plugin). */
   bound = new Set<string>();
+  pingSupport = new Set<string>();
   /** Claude MCP connection: sender identity only, never a delivery channel. */
   attached?: string;
   tail = false;
@@ -153,6 +157,8 @@ export class Daemon {
   private dupSeen = new Map<string, number>();
   private buckets = new Map<string, { tokens: number; at: number }>();
   private lastSeen = new Map<string, number>();
+  private pendingPings = new Map<string, PendingPing>();
+  private latestPing = new Map<string, string>();
   private replyServers = new Map<string, net.Server>();
   private envelopeIds = new Map<string, string>();
   private intervals: NodeJS.Timeout[] = [];
@@ -160,6 +166,7 @@ export class Daemon {
   private readonly now: () => number;
   private readonly ackTimeoutMs: number;
   private readonly graceMs: number;
+  private readonly pingTimeoutMs: number;
   private readonly startedAt: number;
 
   constructor(private opts: DaemonOpts) {
@@ -167,6 +174,7 @@ export class Daemon {
     this.now = opts.now ?? Date.now;
     this.ackTimeoutMs = opts.ackTimeoutMs ?? ACK_TIMEOUT_MS;
     this.graceMs = opts.graceMs ?? GRACE_MS;
+    this.pingTimeoutMs = opts.pingTimeoutMs ?? 3000;
     this.startedAt = this.now();
     // Adapters get the grace window to reconnect after a daemon restart; Claude rows are probed instead.
     for (const row of this.store.db.all<SessionRow>(
@@ -202,6 +210,8 @@ export class Daemon {
   async close(): Promise<void> {
     this.closing = true;
     for (const t of this.intervals) clearInterval(t);
+    for (const pending of this.pendingPings.values()) pending.settle("unknown");
+    this.latestPing.clear();
     for (const f of this.inflight.values()) clearTimeout(f.timer);
     for (const s of this.replyServers.values()) s.close();
     for (const c of this.conns) c.sock.destroy();
@@ -243,6 +253,11 @@ export class Daemon {
 
   private dropConn(c: Conn): void {
     this.conns.delete(c);
+    for (const [pingId, pending] of this.pendingPings) {
+      if (pending.conn !== c && pending.requester !== c) continue;
+      if (this.latestPing.get(pending.sessionId) === pingId) this.latestPing.delete(pending.sessionId);
+      pending.settle("unknown");
+    }
     if (this.closing) return; // sessions stay as they are; the next daemon start marks them gone
     for (const [msgId, f] of this.inflight) if (f.conn === c) f.settle({ ok: false, reason: "connection closed" });
     for (const id of c.bound) {
@@ -332,6 +347,11 @@ export class Daemon {
       case "purge":
         this.requireHuman(this.sender(c, p), "purge archived conversations");
         return this.opPurge(p);
+      case "ping":
+        this.requireHuman(this.sender(c, p), "ping sessions");
+        return this.opPing(c, p);
+      case "pong":
+        return this.opPong(c, p);
       case "set_inbound": {
         this.requireHuman(this.sender(c, p), "change inbound policy");
         const mode = str(p, "mode", true) as Inbound;
@@ -635,7 +655,7 @@ export class Daemon {
       readStates: this.store.readStates(),
       sessionLastOrders: this.store.sessionLastOrders(),
       sessionLastActivity: this.store.sessionLastActivity(),
-      staleHours: this.opts.staleHours ?? DEFAULT_STALE_HOURS,
+      sessionPings: this.store.sessionPings(),
     };
   }
 
@@ -758,6 +778,10 @@ export class Daemon {
     const pending = this.store.db.all<MsgRow>(
       "SELECT * FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY ord", id,
     );
+    const channels = this.store.db.all<{ channel: string }>(
+      "SELECT channel FROM channel_members WHERE session_id=? ORDER BY channel", id,
+    );
+    this.cancelPings(id);
     const session = this.store.closeIdentity(id, this.now());
     this.delivery.delete(id);
     this.lastSeen.delete(id);
@@ -773,6 +797,9 @@ export class Daemon {
       type: "session", action: "removed", name: session.name, harness: session.harness,
       ...(session.cwd ? { cwd: session.cwd } : {}), session,
     });
+    for (const channel of channels) {
+      this.emit({ type: "channel", action: "updated", channel: this.store.channelSummary(channel.channel) });
+    }
     for (const message of pending) {
       this.setStatus(message.id, "expired", "target session closed by user");
       this.inflight.get(message.id)?.settle({ ok: false, reason: "target session closed by user" });
@@ -794,6 +821,13 @@ export class Daemon {
       }
     }
     const purged = identities.map((identity) => identity!.id);
+    const channels = new Set<string>();
+    for (const id of purged) {
+      for (const row of this.store.db.all<{ channel: string }>(
+        "SELECT channel FROM channel_members WHERE session_id=?", id,
+      )) channels.add(row.channel);
+      this.cancelPings(id);
+    }
     this.store.purgeIdentities(purged);
     for (const [msgId, inflight] of this.inflight) {
       if (!this.store.msg(msgId)) inflight.settle({ ok: false, reason: "conversation purged" });
@@ -802,6 +836,9 @@ export class Daemon {
       if (!this.store.msg(msgId)) this.envelopeIds.delete(envelopeId);
     }
     if (purged.length > 0) this.emit({ type: "retention" });
+    for (const channel of channels) {
+      this.emit({ type: "channel", action: "updated", channel: this.store.channelSummary(channel) });
+    }
     return { purged };
   }
 
@@ -892,13 +929,101 @@ export class Daemon {
     return row;
   }
 
+  private async opPing(c: Conn, p: Params): Promise<Result> {
+    const name = str(p, "name");
+    const sessionId = str(p, "sessionId");
+    if (name !== undefined && sessionId !== undefined) {
+      throw new AsenqError("bad_request", "supply either name or sessionId");
+    }
+    const targets = name !== undefined
+      ? [this.store.sessions().find((session) => session.name === name)]
+      : sessionId !== undefined ? [this.store.session(sessionId)] : this.store.live();
+    if (targets.some((session) => session === undefined)) throw this.unknownTarget(name ?? sessionId!);
+    const sessions = targets.filter((session): session is SessionRow => session !== undefined);
+    sessions.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    return { results: await Promise.all(sessions.map(async (session) => ({
+      sessionId: session.id, name: session.name, ping: await this.pingSession(session, c),
+    }))) };
+  }
+
+  private pingSession(session: SessionRow, requester: Conn): Promise<PingStatus> {
+    if (session.state !== "live") return Promise.resolve("unknown");
+    const pingId = randomUUID();
+    const conn = this.delivery.get(session.id);
+    const { promise, resolve } = Promise.withResolvers<PingStatus>();
+    this.latestPing.set(session.id, pingId);
+    const pending: PendingPing = {
+      sessionId: session.id, requester, conn: session.harness === "claude" ? undefined : conn,
+      deadline: this.now() + this.pingTimeoutMs,
+      settle: (ping) => {
+        if (!this.pendingPings.delete(pingId)) return;
+        clearTimeout(pending.timer);
+        if (!this.closing && this.latestPing.get(session.id) === pingId
+          && this.store.session(session.id)?.state === "live") {
+          this.store.setSessionPing(session.id, ping);
+          this.emit({ type: "ping", sessionId: session.id, ping });
+        }
+        resolve(ping);
+      },
+    };
+    this.pendingPings.set(pingId, pending);
+    if (session.harness === "claude" && !session.claude_socket) pending.settle("unknown");
+    else if (session.harness !== "claude" && (!conn || !conn.pingSupport.has(session.id))) pending.settle("unknown");
+    else {
+      if (this.opts.timers !== false) {
+        pending.timer = setTimeout(() => this.expirePings(), this.pingTimeoutMs);
+      }
+      if (session.harness === "claude") {
+        void probe(session.claude_socket!).then((result) => pending.settle(
+          this.now() >= pending.deadline ? "not_responding"
+            : result === "ok" ? "responding" : result === "dead" ? "not_responding" : "unknown",
+        ));
+      } else conn!.write({ push: "ping", pingId } satisfies Push);
+    }
+    return promise;
+  }
+
+  private opPong(c: Conn, p: Params): Result {
+    const pingId = str(p, "pingId", true);
+    const pending = this.pendingPings.get(pingId);
+    if (!pending || pending.conn !== c || !c.bound.has(pending.sessionId)
+      || this.delivery.get(pending.sessionId) !== c) return {};
+    if (this.now() >= pending.deadline) {
+      pending.settle("not_responding");
+      return {};
+    }
+    this.lastSeen.set(pending.sessionId, this.now());
+    pending.settle("responding");
+    return {};
+  }
+
+  private expirePings(): void {
+    const now = this.now();
+    for (const pending of this.pendingPings.values()) {
+      if (now >= pending.deadline) pending.settle("not_responding");
+    }
+  }
+
+  private cancelPings(sessionId: string): void {
+    this.latestPing.delete(sessionId);
+    for (const pending of this.pendingPings.values()) {
+      if (pending.sessionId === sessionId) pending.settle("unknown");
+    }
+    for (const conn of this.conns) conn.pingSupport.delete(sessionId);
+  }
+
   private opRegister(c: Conn, p: Params): Result {
     const harness = str(p, "harness", true) as Harness;
     if (!HARNESSES.includes(harness)) throw new AsenqError("bad_request", `unknown harness "${harness}"`);
+    if (p.caps !== undefined && (!Array.isArray(p.caps) || p.caps.some((cap) => typeof cap !== "string"))) {
+      throw new AsenqError("bad_request", "caps must be an array of strings");
+    }
     const row = this.upsertSession(harness, str(p, "key", true), str(p, "name"), str(p, "cwd"));
     const previous = this.delivery.get(row.id);
+    this.cancelPings(row.id);
     if (previous && previous !== c) previous.bound.delete(row.id);
     c.bound.add(row.id);
+    if (Array.isArray(p.caps) && p.caps.includes("ping")) c.pingSupport.add(row.id);
     this.delivery.set(row.id, c);
     // After the response is written, so the adapter knows the binding before pushes arrive.
     setImmediate(() => void this.flush(row.id));
@@ -906,6 +1031,7 @@ export class Daemon {
   }
 
   private markGone(row: SessionRow): void {
+    this.cancelPings(row.id);
     const goneAt = this.now();
     this.store.db.run("UPDATE sessions SET state='gone', gone_at=? WHERE id=?", goneAt, row.id);
     const gone = { ...row, state: "gone" as const, gone_at: goneAt };
@@ -916,6 +1042,7 @@ export class Daemon {
 
   /** Removes the transport while retaining identity and pending delivery for a later resume. */
   private removeSession(row: SessionRow): void {
+    this.cancelPings(row.id);
     this.store.setIdentityState(row.id, "removed", this.now());
     this.store.db.run("DELETE FROM sessions WHERE id=?", row.id);
     this.delivery.delete(row.id);
@@ -980,6 +1107,8 @@ export class Daemon {
     const decision: LineageDecision = row.claude_lineage_state === 0
       ? this.classifyClaudeLineage(fingerprints, row.id) : {};
     if (decision.identityId) {
+      this.cancelPings(row.id);
+      this.cancelPings(decision.identityId);
       const provisional = this.store.identity(row.id)!;
       const delivery = this.delivery.get(row.id);
       if (delivery) {
@@ -1039,6 +1168,7 @@ export class Daemon {
       const row = this.upsertSession(
         "claude", key, str(p, "name"), str(p, "cwd"), sessionId, decision.identityId, decision.reason,
       );
+      this.cancelPings(row.id);
       const ids = JSON.parse(row.claude_session_ids) as string[];
       if (!ids.includes(sessionId)) ids.push(sessionId);
       const state = fingerprints.length === 0 ? (known ? 1 : 0) : 2;
@@ -1205,7 +1335,7 @@ export class Daemon {
     return Promise.all(targets.map((t) => this.routeOne(s, t, { ...base, id: newId("m_"), to_name: t.name, to_session: t.id })));
   }
 
-  private routeOne(s: Sender, target: SessionRow, row: MsgRow): Promise<SendResult> | SendResult {
+  private routeOne(s: Sender, target: Pick<SessionIdentity, "id" | "name" | "inbound" | "state">, row: MsgRow): Promise<SendResult> | SendResult {
     const now = row.created_at;
     const finish = (status: MsgStatus, reason?: string): SendResult => {
       this.insert({ ...row, status, reason: reason ?? null });
@@ -1279,11 +1409,12 @@ export class Daemon {
     if (notify && (status === "failed" || status === "expired")) this.notifyFailure(row, reason ?? status);
   }
 
-  /** Tells a live agent sender that its message will never arrive. */
+  /** Retains delivery notices for non-terminal senders, including while they are offline. */
   private notifyFailure(row: MsgRow, reason: string): void {
     if (!row.from_session) return;
-    const sender = this.store.session(row.from_session);
-    if (!sender || sender.state !== "live") return;
+    const identity = this.store.identity(row.from_session);
+    if (!identity || identity.closedAt !== undefined) return;
+    const sender = this.store.session(row.from_session) ?? identity;
     const notice: MsgRow = {
       id: newId("m_"), from_name: "asenq", from_session: null, to_name: sender.name, to_session: sender.id, channel: null,
       text: `Message ${row.id} to ${row.to_name} was not delivered: ${reason}.`, kind: "status", thread: null,
@@ -1400,6 +1531,7 @@ export class Daemon {
 
   sweep(): void {
     const now = this.now();
+    this.expirePings();
     for (const s of this.store.db.all<SessionRow>("SELECT * FROM sessions WHERE state='gone' AND gone_at<=?", now - this.graceMs)) {
       this.removeSession(s);
     }

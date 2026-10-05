@@ -1,6 +1,6 @@
 import type {
   ChannelSummary, ControlAction, Harness, Inbound, InboxSummary, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
-  Role, SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
+  PingStatus, Role, SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
 } from "../shared/protocol.js";
 import type { Db } from "../shared/sqlite.js";
 
@@ -132,6 +132,10 @@ export class Store {
     this.migrateIdentityRole();
     this.migrateChannels();
     this.initializeDirectActivity();
+    const identityColumns = this.db.all<{ name: string }>("PRAGMA table_info(session_identities)");
+    if (!identityColumns.some((column) => column.name === "ping")) {
+      this.db.exec("ALTER TABLE session_identities ADD COLUMN ping TEXT");
+    }
   }
 
   transaction<T>(fn: () => T): T {
@@ -193,6 +197,18 @@ export class Store {
       "SELECT id,last_direct_at FROM session_identities WHERE last_direct_at IS NOT NULL",
     )) activity[row.id] = row.last_direct_at;
     return activity;
+  }
+
+  sessionPings(): Record<string, PingStatus> {
+    const pings: Record<string, PingStatus> = {};
+    for (const row of this.db.all<{ id: string; ping: PingStatus }>(
+      "SELECT id,ping FROM session_identities WHERE state='live' AND ping IS NOT NULL",
+    )) pings[row.id] = row.ping;
+    return pings;
+  }
+
+  setSessionPing(id: string, ping: PingStatus): void {
+    this.db.run("UPDATE session_identities SET ping=? WHERE id=? AND state='live'", ping, id);
   }
 
   private migrateMessageAction(): void {
@@ -541,6 +557,7 @@ export class Store {
       row.id, row.harness, row.name, row.cwd, row.inbound, row.state, row.created_at, this.deliveryWatermark(),
     );
     this.syncHarnessIds(row);
+    if (row.state !== "live") this.db.run("UPDATE session_identities SET ping=NULL WHERE id=?", row.id);
     this.ensureRead({ scope: "session", sessionId: row.id });
     return this.identity(row.id)!;
   }
@@ -558,6 +575,7 @@ export class Store {
       "UPDATE session_identities SET state=?,removed_at=? WHERE id=?",
       state, removedAt ?? null, id,
     );
+    if (state !== "live") this.db.run("UPDATE session_identities SET ping=NULL WHERE id=?", id);
     return this.identity(id)!;
   }
 
@@ -581,6 +599,8 @@ export class Store {
       this.db.run("DELETE FROM sessions WHERE id=?", id);
       this.db.run("DELETE FROM session_harness_ids WHERE identity_id=?", id);
       this.db.run("DELETE FROM claude_lineage WHERE identity_id=?", id);
+      this.db.run("DELETE FROM channel_members WHERE session_id=?", id);
+      this.db.run("UPDATE session_identities SET ping=NULL WHERE id=?", id);
       return this.identity(id)!;
     });
   }
@@ -597,6 +617,7 @@ export class Store {
           const event = JSON.parse(row.event_json) as TailEvent;
           const belongs = event.type === "session" ? event.session.id === id
             : event.type === "read" ? event.state.scope.scope === "session" && event.state.scope.sessionId === id
+            : event.type === "ping" ? event.sessionId === id
             : event.type === "message" ? event.msg.channel === undefined && (
               messages.has(event.msg.id) || event.msg.fromSessionId === id || event.msg.toSessionId === id
             ) : false;
@@ -606,6 +627,7 @@ export class Store {
         this.db.run("DELETE FROM human_read_positions WHERE scope='session' AND stream_key=?", id);
         this.db.run("DELETE FROM session_harness_ids WHERE identity_id=?", id);
         this.db.run("DELETE FROM claude_lineage WHERE identity_id=?", id);
+        this.db.run("DELETE FROM channel_members WHERE session_id=?", id);
         this.db.run("DELETE FROM session_identities WHERE id=?", id);
       }
     });

@@ -1,12 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { configPath } from "./paths.js";
-import { DEFAULT_STALE_HOURS } from "./sessions.js";
 
 export type Config = {
   runtime: string;
   cli: string;
   historyDays: number;
-  staleHours: number;
   claude: { envelope: boolean };
 };
 
@@ -18,7 +16,6 @@ export function readConfig(): Config | undefined {
     runtime: raw.runtime ?? "",
     cli: raw.cli ?? "",
     historyDays: raw.historyDays ?? 7,
-    staleHours: raw.staleHours ?? DEFAULT_STALE_HOURS,
     claude: { envelope: raw.claude?.envelope ?? false },
   };
 }
