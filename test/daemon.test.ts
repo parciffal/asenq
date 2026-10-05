@@ -5258,6 +5258,7 @@ test("every role alias wins over member names, deduplicates identities and exclu
   assert.equal(poster.deliveries.length, 0);
   assert.equal(coordinator.deliveries.length, 4);
   assert.equal(builder.deliveries.length, 4);
+  assert.deepEqual((await human.request("inbox", { unread_only: false })).messages, [], "agent @all never sends a direct message to the human");
 });
 
 test("former member names resolve only within the roster with current-name precedence and ambiguity is atomic", async () => {
