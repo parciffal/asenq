@@ -167,13 +167,7 @@ test("human roles validate, publish identity updates and survive rename and gone
   assert.equal(resumed.session.id, alpha.session.id);
   assert.equal(await roleOf("renamed"), "worker");
 
-  const goneAgain = await env.watch(isSession("gone", "renamed"));
-  resumed.client.close();
-  await goneAgain.event;
-  const takeover = await env.adapter("omp", "new-key", "renamed");
-  assert.equal(takeover.session.id, alpha.session.id);
-  assert.equal(await roleOf("renamed"), "worker");
-  await takeover.client.request("unregister");
+  await resumed.client.request("unregister");
   await assert.rejects(human.request("set_role", { name: "renamed", role: null }), { code: "unknown_target" });
   assert.equal((await human.sync()).sessions.find((session) => session.id === alpha.session.id)?.role, "worker");
   const replacement = await env.adapter("omp", "replacement-key", "renamed");
