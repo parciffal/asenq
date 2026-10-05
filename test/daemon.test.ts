@@ -9,7 +9,7 @@ import { claudeFrame, parseEnvelopeReply, replyAddr } from "../src/daemon/claude
 import { Daemon } from "../src/daemon/daemon.js";
 import { AsenqClient } from "../src/shared/client.js";
 import { socketPath } from "../src/shared/paths.js";
-import { GRACE_MS, type SendResult, type StoredMessage } from "../src/shared/protocol.js";
+import { GRACE_MS, type SendResult, type StoredMessage, type TailEvent } from "../src/shared/protocol.js";
 import { renderInbound } from "../src/shared/render.js";
 import { openDb } from "../src/shared/sqlite.js";
 import { isSession, isStatus, logOf, startEnv, type Delivery, type TestEnv } from "./helpers.js";
@@ -142,9 +142,9 @@ test("human roles validate, publish identity updates and survive rename and gone
   assert.equal((await human.sync()).sessions.find((session) => session.id === alpha.session.id)?.role, null);
 
   for (const role of ["orchestrator", "worker", null]) {
-    const updated = await env.watch(isSession("updated", "alpha"));
+    const updated: { event: Promise<TailEvent> } = await env.watch(isSession("updated", "alpha"));
     await human.request("set_role", { name: "alpha", role });
-    const event = await updated.event;
+    const event: TailEvent = await updated.event;
     assert.equal(event.type === "session" && event.session.role, role);
     assert.equal(await roleOf("alpha"), role);
   }
