@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import type { AsenqClient } from "../src/shared/client.js";
 import type { SendResult } from "../src/shared/protocol.js";
-import { callTool } from "../src/shared/tools.js";
+import { z } from "zod";
+import { zodShape } from "../src/shared/schema.js";
+import { callTool, TOOLS } from "../src/shared/tools.js";
 import { startEnv, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
@@ -289,4 +293,124 @@ test("clipped control metadata retains its action and full recovery preserves th
     assert.ok(recovered.includes(`kind=control · action=cancel · thread=${thread}`));
     assert.ok(recovered.endsWith("Keep this control body"));
   }
+});
+
+test("file-only tools accept nested input and expose references in inbox and thread reads", async () => {
+  env = await startEnv();
+  const shared = await env.adapter("opencode", "alpha", "alpha");
+  const receiver = await env.adapter("omp", "receiver", "receiver");
+  const beta = (await shared.client.request("register", { harness: "opencode", key: "beta", name: "beta", cwd: "/work" }))
+    .session as { id: string };
+  const path = join(env.home, "report.txt");
+  writeFileSync(path, "hello");
+  const schema = z.object(zodShape(z, TOOLS.find((tool) => tool.name === "asenq_send")!.params));
+  const args = schema.parse({ to: "receiver", file: { path, summary: "Review evidence" }, thread: "file-review" });
+  assert.equal(schema.safeParse({ to: "receiver", file: { path } }).success, false);
+  assert.equal(schema.safeParse({ to: "receiver", file: { path: 123, summary: "Review evidence" } }).success, false);
+
+  const result = await callTool(shared.client, "asenq_send", args, beta.id);
+  assert.match(result, /^receiver m_[0-9a-f]{12} delivered$/);
+  const delivery = await receiver.nextDelivery();
+  assert.equal(delivery.msg.from, "beta");
+  assert.equal(delivery.msg.text, "");
+  assert.deepEqual(delivery.msg.file, {
+    path, summary: "Review evidence",
+    sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", size: 5,
+  });
+  for (const output of [
+    await callTool(receiver.client, "asenq_inbox", {}),
+    await callTool(receiver.client, "asenq_inbox", { id: delivery.msg.id }),
+    await callTool(shared.client, "asenq_thread_read", { thread: "file-review" }, beta.id),
+  ]) {
+    assert.ok(output.includes("Review evidence"));
+    assert.ok(output.includes(path));
+    assert.ok(output.includes("2cf24dba5fb0"));
+    assert.match(output, /\b5 bytes\b/);
+    assert.ok(output.includes(`read the file; verify with asenq_file_check id=${delivery.msg.id}`));
+    assert.ok(!output.includes("hello"), "reads expose the reference, not the file contents");
+  }
+  assert.equal(await callTool(shared.client, "asenq_thread_read", { thread: "file-review" }, shared.session.id), "no messages");
+});
+
+test("text-plus-file tools keep caller isolation for sender and human file checks", async () => {
+  env = await startEnv();
+  const shared = await env.adapter("opencode", "alpha", "alpha");
+  const beta = (await shared.client.request("register", { harness: "opencode", key: "beta", name: "beta", cwd: "/work" }))
+    .session as { id: string };
+  const path = join(env.home, "report.txt");
+  writeFileSync(path, "hello");
+  const result = await callTool(shared.client, "asenq_send", {
+    to: "human", text: "Please review before continuing", file: { path, summary: "Review evidence" }, thread: "review",
+  }, beta.id);
+  const id = result.match(/\bm_[0-9a-f]{12}\b/)?.[0];
+  assert.ok(id, result);
+  const human = env.human();
+  const output = await callTool(human, "asenq_inbox", { id });
+  assert.ok(output.includes("Please review before continuing"));
+  assert.ok(output.includes("Review evidence"));
+  assert.ok(output.indexOf("Please review before continuing") < output.indexOf("Review evidence"));
+  assert.ok(output.includes(path));
+  assert.equal(await callTool(shared.client, "asenq_file_check", { id }, beta.id), "match");
+  assert.equal(await callTool(human, "asenq_file_check", { id }), "match");
+  assert.match(await callTool(shared.client, "asenq_file_check", { id }, shared.session.id), /^asenq error \([^)]+\): /);
+  assert.match(await callTool(human, "asenq_file_check", { id: "m_000000000000" }), /^asenq error \([^)]+\): /);
+  assert.match(await callTool(human, "asenq_file_check", {}), /^asenq error \(bad_request\): /);
+  const plainId = await send(human, "alpha", "No reference");
+  assert.match(await callTool(shared.client, "asenq_file_check", { id: plainId }, shared.session.id), /^asenq error \([^)]+\): /);
+});
+
+test("file checks report snapshot changes and missing files through real tool calls", async () => {
+  env = await startEnv();
+  const receiver = await env.adapter("omp", "receiver", "receiver");
+  const path = join(env.home, "report.txt");
+  writeFileSync(path, "hello");
+  const result = await callTool(env.human(), "asenq_send", { to: "receiver", file: { path, summary: "Review evidence" } });
+  assert.match(result, /^receiver m_[0-9a-f]{12} delivered$/);
+  const { msg } = await receiver.nextDelivery();
+  assert.equal(await callTool(receiver.client, "asenq_file_check", { id: msg.id }), "match");
+  writeFileSync(path, "HELLO");
+  assert.equal(await callTool(receiver.client, "asenq_file_check", { id: msg.id }), "changed");
+  unlinkSync(path);
+  assert.equal(await callTool(receiver.client, "asenq_file_check", { id: msg.id }), "missing");
+  const recovered = await callTool(receiver.client, "asenq_inbox", { id: msg.id });
+  assert.ok(recovered.includes("2cf24dba5fb0"), "the send-time snapshot remains after the source is gone");
+});
+
+test("file tool validation errors propagate without admitting messages", async () => {
+  env = await startEnv();
+  const receiver = await env.adapter("omp", "receiver", "receiver");
+  const path = join(env.home, "report.txt");
+  writeFileSync(path, "hello");
+  const directory = join(env.home, "directory");
+  mkdirSync(directory);
+  for (const args of [
+    {},
+    { file: { path: "report.txt", summary: "Relative path" } },
+    { file: { path: join(env.home, "missing.txt"), summary: "Missing file" } },
+    { file: { path: directory, summary: "Not a regular file" } },
+    { file: { path } },
+    { file: { path, summary: "x".repeat(501) } },
+  ]) {
+    assert.match(await callTool(env.human(), "asenq_send", { to: "receiver", ...args }), /^asenq error \([^)]+\): /);
+  }
+  assert.equal(await callTool(receiver.client, "asenq_inbox", { unread_only: false }), "no messages");
+});
+
+test("capped inbox preserves file metadata when oversized thread metadata is omitted", async () => {
+  env = await startEnv();
+  const receiver = await env.adapter("omp", "receiver", "receiver");
+  const path = join(env.home, "report.txt");
+  writeFileSync(path, "hello");
+  const result = await callTool(env.human(), "asenq_send", {
+    to: "receiver", file: { path, summary: "Review evidence" }, thread: "t".repeat(20_000),
+  });
+  assert.match(result, /^receiver m_[0-9a-f]{12} delivered$/);
+  const { msg } = await receiver.nextDelivery();
+  const output = await callTool(receiver.client, "asenq_inbox", { unread_only: false });
+  assert.ok(output.length <= 16_000);
+  assert.deepEqual(messageIds(output), [msg.id]);
+  assert.ok(output.includes("Review evidence"));
+  assert.ok(output.includes(path));
+  assert.ok(output.includes("2cf24dba5fb0"));
+  assert.ok(output.includes(`asenq_inbox id=${msg.id}`));
 });

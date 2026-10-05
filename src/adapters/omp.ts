@@ -43,7 +43,7 @@ export default function asenq(pi: ExtensionAPI): void {
     client.request("ack", { msgId: p.msg.id, ok, reason }).catch((e: unknown) => warn(`ack failed: ${String(e)}`));
   };
 
-  // omp's zod facade implements the string/number/boolean/enum subset zodShape uses.
+  // omp's zod facade implements the string/number/boolean/enum/object subset zodShape uses.
   const z = pi.zod.z as unknown as Zod;
   for (const t of TOOLS) {
     pi.registerTool({
