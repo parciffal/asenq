@@ -1,4 +1,4 @@
-export const PROTOCOL = 14;
+export const PROTOCOL = 15;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -78,6 +78,26 @@ export type SessionIdentity = {
   createdAt: number;
   removedAt?: number;
   closedAt?: number;
+};
+
+/** Current registered session, including harness-reported availability and resume metadata. */
+export type ListedSession = {
+  id: string;
+  name: string;
+  previousNames: string[];
+  harness: Harness;
+  cwd: string | null;
+  state: "live" | "gone" | "stale";
+  stale: boolean;
+  ping: PingStatus | null;
+  inbound: Inbound;
+  role: Role | null;
+  channels: string[];
+  lastSeen: number | null;
+  busy: boolean | null;
+  harnessSessionId: string | null;
+  resumeCommand?: string;
+  you: boolean;
 };
 
 export type ChannelSummary = {

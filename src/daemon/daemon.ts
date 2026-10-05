@@ -6,10 +6,12 @@ import { isAbsolute, join } from "node:path";
 import {
   ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, MENTION_KEYWORDS, NAME_RE, PROBE_MS,
   PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, hasMentionOpening, slug,
-  type ChannelSendResult, type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
+  type ChannelSendResult, type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type ListedSession, type MsgStatus, type PositionedEvent,
   type PingStatus, type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type SessionIdentity, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
+import { resumeCommand } from "../shared/resume.js";
+import { isStaleSession } from "../shared/sessions.js";
 import type { Db } from "../shared/sqlite.js";
 import { version } from "../shared/version.js";
 import { claudeFrame, parseEnvelopeReply, probe, replyAddr, writeLine } from "./claude.js";
@@ -180,6 +182,7 @@ export class Daemon {
     this.pingTimeoutMs = opts.pingTimeoutMs ?? 3000;
     this.queueTtlMs = opts.queueTtlMs ?? QUEUE_TTL_MS;
     this.startedAt = this.now();
+    this.store.db.run("UPDATE sessions SET busy=NULL");
     // Adapters get the grace window to reconnect after a daemon restart; Claude rows are probed instead.
     for (const row of this.store.db.all<SessionRow>(
       "SELECT * FROM sessions WHERE harness!='claude' AND state='live'",
@@ -265,6 +268,7 @@ export class Daemon {
     }
     if (this.closing) return; // sessions stay as they are; the next daemon start marks them gone
     for (const [msgId, f] of this.inflight) if (f.conn === c) f.settle({ ok: false, reason: "connection closed" });
+    if (c.attached) this.store.setSessionBusy(c.attached, null);
     for (const id of c.bound) {
       if (this.delivery.get(id) !== c) continue;
       this.delivery.delete(id);
@@ -283,6 +287,7 @@ export class Daemon {
       return c.write({ id: 0, ok: false, error: { code: "bad_request", message: "invalid request line" } });
     }
     try {
+      this.recordRequestContact(c, req);
       const result = await this.handle(c, req);
       c.write({ ...result, id: req.id, ok: true });
     } catch (e) {
@@ -290,6 +295,30 @@ export class Daemon {
       this.log(`internal error in ${req.op}: ${e instanceof Error ? e.stack : String(e)}`);
       c.write({ id: req.id, ok: false, error: { code: "internal", message: e instanceof Error ? e.message : String(e) } });
     }
+  }
+
+  /** Contact observes existing bindings without adding authorization to operations that never used sender(). */
+  private recordRequestContact(c: Conn, p: Req): void {
+    if (p.op === "register" || p.op === "claude_hook" || p.op === "claude_attach" || p.op === "pong") return;
+    let id: string | undefined;
+    if (p.as !== undefined && p.as !== null) {
+      if (typeof p.as !== "string" || !c.bound.has(p.as)) return;
+      id = p.as;
+    } else if (p.op === "ack") {
+      const recipient = typeof p.msgId === "string" ? this.store.msg(p.msgId)?.to_session : undefined;
+      if (recipient && (c.bound.has(recipient) || c.attached === recipient)) id = recipient;
+    } else if (c.bound.size === 1) {
+      id = [...c.bound][0];
+    } else if (c.bound.size === 0) {
+      id = c.attached;
+    }
+    if (id && this.store.session(id)) this.touchContact(id);
+  }
+
+  private touchContact(sessionId: string, claudeSessionId?: string): void {
+    const at = this.now();
+    this.lastSeen.set(sessionId, at);
+    this.store.recordContact(sessionId, at, claudeSessionId);
   }
 
   /** Sender identity comes from the connection binding, never from request fields. */
@@ -331,11 +360,22 @@ export class Daemon {
       case "claude_hook":
         return this.opClaudeHook(p);
       case "claude_attach": {
-        let row = this.store.sessionByClaudeId(str(p, "sessionId", true));
+        const sessionId = str(p, "sessionId", true);
+        let row = this.store.sessionByClaudeId(sessionId);
         if (!row) throw new AsenqError("no_session", "this Claude session is not registered yet (SessionStart hook missing? run: asenq doctor)");
-        row = this.reconcileClaudeLineage(row, str(p, "transcriptPath"));
+        this.touchContact(row.id, sessionId);
+        row = this.reconcileClaudeLineage(this.store.session(row.id)!, str(p, "transcriptPath"));
         c.attached = row.id;
         return { session: { id: row.id, name: row.name } };
+      }
+      case "session_status": {
+        const s = this.sender(c, p);
+        if (s.kind !== "agent") throw new AsenqError("not_registered", "no session bound to this connection");
+        if (p.busy !== null && typeof p.busy !== "boolean") {
+          throw new AsenqError("bad_request", "busy must be true, false or null");
+        }
+        this.store.setSessionBusy(s.session.id, p.busy);
+        return {};
       }
       case "unregister": {
         const s = this.sender(c, p);
@@ -426,16 +466,8 @@ export class Daemon {
         return this.opInbox(this.sender(c, p), p);
       case "thread_read":
         return this.opThreadRead(this.sender(c, p), p);
-      case "list": {
-        const s = this.sender(c, p);
-        const me = s.kind === "agent" ? s.session.id : undefined;
-        return {
-          sessions: this.store.sessions().map((r) => ({
-            name: r.name, harness: r.harness, cwd: r.cwd, state: r.state, inbound: r.inbound, you: r.id === me,
-            role: this.store.identity(r.id)?.role ?? null,
-          })),
-        };
-      }
+      case "list":
+        return this.opList(this.sender(c, p), p);
       case "channel_create": {
         const actor = this.sender(c, p);
         this.requireHumanOrOrchestrator(actor, "only the human or an orchestrator can create channels");
@@ -489,6 +521,37 @@ export class Daemon {
       default:
         throw new AsenqError("bad_request", `unknown op "${p.op}"`);
     }
+  }
+
+  private opList(s: Sender, p: Params): Result {
+    const cwd = str(p, "cwd");
+    const harness = str(p, "harness");
+    const channel = str(p, "channel");
+    if (harness !== undefined && !HARNESSES.includes(harness as Harness)) {
+      throw new AsenqError("bad_request", `unknown harness "${harness}"`);
+    }
+    const channels = this.store.sessionChannels();
+    const pings = this.store.sessionPings();
+    const sessions: ListedSession[] = [];
+    for (const row of this.store.sessionListRows()) {
+      const membership = channels[row.id] ?? [];
+      if (cwd !== undefined && (row.cwd === null || !row.cwd.startsWith(cwd))) continue;
+      if (harness !== undefined && row.harness !== harness) continue;
+      if (channel !== undefined && !membership.includes(channel)) continue;
+      const ping = pings[row.id] ?? null;
+      const stale = isStaleSession(row, ping);
+      const harnessSessionId = row.harness === "claude" ? row.claude_current_session_id : row.key;
+      const command = resumeCommand(row.harness, harnessSessionId);
+      sessions.push({
+        id: row.id, name: row.name, previousNames: JSON.parse(row.previous_names) as string[],
+        harness: row.harness, cwd: row.cwd, state: row.state === "gone" ? "gone" : stale ? "stale" : "live",
+        stale, ping, inbound: row.inbound, role: row.role, channels: membership,
+        lastSeen: row.last_seen_at, busy: row.busy === null ? null : row.busy === 1,
+        harnessSessionId, ...(command === undefined ? {} : { resumeCommand: command }),
+        you: s.kind === "agent" && row.id === s.session.id,
+      });
+    }
+    return { sessions };
   }
 
   private directScope(s: Sender): { sql: string; params: (string | number)[] } {
@@ -1001,7 +1064,7 @@ export class Daemon {
       pending.settle("not_responding");
       return {};
     }
-    this.lastSeen.set(pending.sessionId, this.now());
+    this.touchContact(pending.sessionId);
     pending.settle("responding");
     return {};
   }
@@ -1028,6 +1091,8 @@ export class Daemon {
       throw new AsenqError("bad_request", "caps must be an array of strings");
     }
     const row = this.upsertSession(harness, str(p, "key", true), str(p, "name"), str(p, "cwd"));
+    this.touchContact(row.id);
+    this.store.setSessionBusy(row.id, null);
     const previous = this.delivery.get(row.id);
     this.cancelPings(row.id);
     if (previous && previous !== c) previous.bound.delete(row.id);
@@ -1042,7 +1107,7 @@ export class Daemon {
   private markGone(row: SessionRow): void {
     this.cancelPings(row.id);
     const goneAt = this.now();
-    this.store.db.run("UPDATE sessions SET state='gone', gone_at=? WHERE id=?", goneAt, row.id);
+    this.store.db.run("UPDATE sessions SET state='gone', gone_at=?, busy=NULL WHERE id=?", goneAt, row.id);
     const gone = { ...row, state: "gone" as const, gone_at: goneAt };
     this.store.syncIdentity(gone);
     this.delivery.delete(row.id);
@@ -1131,12 +1196,14 @@ export class Daemon {
       const transfer = this.store.mergeClaudeIdentity(row.id, decision.identityId);
       const ancestor = this.upsertSession("claude", row.key, undefined, row.cwd ?? undefined, row.key, decision.identityId);
       this.store.db.run(
-        `UPDATE sessions SET claude_socket=?,claude_session_ids=?,claude_transcript_path=?,claude_source=?,claude_lineage_state=2 WHERE id=?`,
-        row.claude_socket, JSON.stringify(this.store.claudeIds(ancestor.id)), path, row.claude_source, ancestor.id,
+        `UPDATE sessions SET claude_socket=?,claude_session_ids=?,claude_transcript_path=?,claude_source=?,claude_lineage_state=2,
+         busy=?,claude_current_session_id=? WHERE id=?`,
+        row.claude_socket, JSON.stringify(this.store.claudeIds(ancestor.id)), path, row.claude_source,
+        row.busy, row.claude_current_session_id, ancestor.id,
       );
       this.store.recordClaudeLineage(ancestor.id, fingerprints);
       this.lastSeen.delete(row.id);
-      this.lastSeen.set(ancestor.id, this.now());
+      this.touchContact(ancestor.id);
       const replyServer = this.replyServers.get(row.id);
       if (replyServer) {
         replyServer.close();
@@ -1165,6 +1232,9 @@ export class Daemon {
   private async opClaudeHook(p: Params): Promise<Result> {
     const event = str(p, "event", true);
     const sessionId = str(p, "sessionId", true);
+    if (p.busy !== undefined && p.busy !== null && typeof p.busy !== "boolean") {
+      throw new AsenqError("bad_request", "busy must be true, false or null");
+    }
     if (event === "start") {
       const socket = str(p, "socket") ?? null;
       const key = str(p, "key", true);
@@ -1189,26 +1259,29 @@ export class Daemon {
         this.store.recordClaudeLineage(row.id, fingerprints);
         this.store.syncIdentity({ ...row, claude_socket: socket, claude_session_ids: JSON.stringify(ids) });
       });
-      this.lastSeen.set(row.id, this.now());
+      this.touchContact(row.id, sessionId);
+      this.store.setSessionBusy(row.id, p.busy === undefined ? null : p.busy as boolean | null);
       setImmediate(() => void this.flush(row.id));
       return { session: { id: row.id, name: row.name } };
     }
     let row = this.store.sessionByClaudeId(sessionId);
     if (event === "end") {
+      if (row) this.touchContact(row.id, sessionId);
       if (row) this.removeSession(row);
       return {};
     }
     if (event === "poll" || event === "reconcile") {
       if (row) {
+        this.touchContact(row.id, sessionId);
+        if (p.busy !== undefined) this.store.setSessionBusy(row.id, p.busy as boolean | null);
+        row = this.store.session(row.id)!;
         row = this.reconcileClaudeLineage(row, str(p, "transcriptPath"));
-        this.lastSeen.set(row.id, this.now());
       }
       if (event === "reconcile") return row ? { session: { id: row.id, name: row.name } } : {};
     }
     if (event === "poll") {
       if (!row) return { texts: [] };
       if (row.claude_socket) return { texts: [] };
-      this.lastSeen.set(row.id, this.now());
       const texts: string[] = [];
       let total = 0;
       const role = this.store.identity(row.id)?.role ?? undefined;

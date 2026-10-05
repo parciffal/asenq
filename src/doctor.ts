@@ -113,8 +113,8 @@ export async function doctor(): Promise<number> {
   } else line("ok", "omp: not installed, skipped");
 
   if (sessions) {
-    const live = sessions.filter((s) => s.state === "live");
-    line("ok", `${live.length} live session(s)${live.length ? ": " + live.map((s) => `${s.name} (${s.harness})`).join(", ") : ""}`);
+    const live = sessions.filter((s) => s.state === "live" || s.state === "stale");
+    line("ok", `${live.length} live session(s)${live.length ? ": " + live.map((s) => `${s.name} (${s.harness})${s.state === "stale" ? " [stale]" : ""}`).join(", ") : ""}`);
   }
   return failed ? 1 : 0;
 }

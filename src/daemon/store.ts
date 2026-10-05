@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
   gone_at INTEGER, claude_socket TEXT, claude_session_ids TEXT NOT NULL DEFAULT '[]',
   claude_transcript_path TEXT, claude_source TEXT, claude_lineage_state INTEGER NOT NULL DEFAULT 1,
+  busy INTEGER, claude_current_session_id TEXT,
   created_at INTEGER NOT NULL, UNIQUE(harness, key));
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
@@ -21,7 +22,7 @@ CREATE TABLE IF NOT EXISTS session_identities(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
   cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL, role TEXT,
   created_at INTEGER NOT NULL, removed_at INTEGER, closed_at INTEGER, last_direct_at INTEGER,
-  inbox_position INTEGER NOT NULL DEFAULT 0);
+  inbox_position INTEGER NOT NULL DEFAULT 0, last_seen_at INTEGER);
 CREATE TABLE IF NOT EXISTS session_harness_ids(
   harness TEXT NOT NULL, kind TEXT NOT NULL, harness_id TEXT NOT NULL, identity_id TEXT NOT NULL,
   PRIMARY KEY(harness,kind,harness_id));
@@ -48,6 +49,7 @@ export type SessionRow = {
   inbound: Inbound; state: "live" | "gone"; gone_at: number | null;
   claude_socket: string | null; claude_session_ids: string; created_at: number;
   claude_transcript_path: string | null; claude_source: string | null; claude_lineage_state: number;
+  busy: number | null; claude_current_session_id: string | null;
 };
 
 export type MsgRow = {
@@ -121,6 +123,7 @@ export class Store {
     for (const [name, type] of [
       ["claude_transcript_path", "TEXT"], ["claude_source", "TEXT"],
       ["claude_lineage_state", "INTEGER NOT NULL DEFAULT 1"],
+      ["busy", "INTEGER"], ["claude_current_session_id", "TEXT"],
     ]) {
       if (!sessionColumns.some((column) => column.name === name)) this.db.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}`);
     }
@@ -132,6 +135,7 @@ export class Store {
     this.initializeReadPositions();
     this.initializeInboxPositions();
     this.migrateIdentityRole();
+    this.migrateIdentityContact();
     this.migrateChannels();
     this.initializeDirectActivity();
     const identityColumns = this.db.all<{ name: string }>("PRAGMA table_info(session_identities)");
@@ -401,6 +405,13 @@ export class Store {
     if (!columns.some((column) => column.name === "role")) this.db.exec("ALTER TABLE session_identities ADD COLUMN role TEXT");
   }
 
+  private migrateIdentityContact(): void {
+    const columns = this.db.all<{ name: string }>("PRAGMA table_info(session_identities)");
+    if (!columns.some((column) => column.name === "last_seen_at")) {
+      this.db.exec("ALTER TABLE session_identities ADD COLUMN last_seen_at INTEGER");
+    }
+  }
+
   private migrateChannels(): void {
     if (this.meta("channel_roster_rollout") !== undefined) return;
     this.transaction(() => {
@@ -487,6 +498,13 @@ export class Store {
       const channels = this.db.all<{ channel: string }>("SELECT channel FROM channel_members WHERE session_id=?", provisionalId);
       this.db.run("UPDATE session_identities SET role=COALESCE(role,?) WHERE id=?", provisional.role ?? null, ancestorId);
       this.db.run(
+        `UPDATE session_identities SET last_seen_at=CASE
+         WHEN last_seen_at IS NULL THEN (SELECT last_seen_at FROM session_identities WHERE id=?)
+         ELSE max(last_seen_at,COALESCE((SELECT last_seen_at FROM session_identities WHERE id=?),last_seen_at))
+         END WHERE id=?`,
+        provisionalId, provisionalId, ancestorId,
+      );
+      this.db.run(
         "INSERT OR IGNORE INTO channel_members(channel,session_id) SELECT channel,? FROM channel_members WHERE session_id=?",
         ancestorId, provisionalId,
       );
@@ -541,6 +559,32 @@ export class Store {
 
   sessions(): SessionRow[] {
     return this.db.all<SessionRow>("SELECT * FROM sessions ORDER BY created_at");
+  }
+
+  sessionListRows(): (SessionRow & { last_seen_at: number | null; previous_names: string; role: Role | null })[] {
+    return this.db.all(
+      `SELECT sessions.*,session_identities.last_seen_at,session_identities.previous_names,session_identities.role
+       FROM sessions JOIN session_identities ON session_identities.id=sessions.id ORDER BY sessions.created_at`,
+    );
+  }
+
+  sessionChannels(): Record<string, string[]> {
+    const channels: Record<string, string[]> = {};
+    for (const row of this.db.all<{ session_id: string; channel: string }>(
+      "SELECT session_id,channel FROM channel_members ORDER BY channel",
+    )) (channels[row.session_id] ??= []).push(row.channel);
+    return channels;
+  }
+
+  recordContact(id: string, at: number, claudeSessionId?: string): void {
+    this.db.run("UPDATE session_identities SET last_seen_at=? WHERE id=?", at, id);
+    if (claudeSessionId !== undefined) {
+      this.db.run("UPDATE sessions SET claude_current_session_id=? WHERE id=?", claudeSessionId, id);
+    }
+  }
+
+  setSessionBusy(id: string, busy: boolean | null): void {
+    this.db.run("UPDATE sessions SET busy=? WHERE id=?", busy === null ? null : Number(busy), id);
   }
 
   live(): SessionRow[] {

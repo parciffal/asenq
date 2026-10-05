@@ -32,7 +32,7 @@ async function run(): Promise<number> {
       await client.request("claude_hook", {
         event: "start", key: socket ?? "sid:" + sessionId, sessionId, socket,
         name: process.env.ASENQ_NAME || input.session_title || undefined, cwd: input.cwd,
-        transcriptPath: input.transcript_path, source: input.source,
+        transcriptPath: input.transcript_path, source: input.source, busy: null,
       });
     } finally {
       client.close();
@@ -58,8 +58,18 @@ async function run(): Promise<number> {
       const r = await client.request("claude_hook", {
         event: socket || (event === "Stop" && input.stop_hook_active) ? "reconcile" : "poll",
         sessionId, transcriptPath: input.transcript_path,
+        ...(event === "UserPromptSubmit" ? { busy: true } : {}),
       });
       texts = (r.texts as string[] | undefined) ?? [];
+      if (event === "Stop") {
+        try {
+          await client.request("claude_hook", {
+            event: "reconcile", sessionId, transcriptPath: input.transcript_path, busy: texts.length > 0,
+          });
+        } catch {
+          // A status failure must not discard texts already polled or prevent their continuation.
+        }
+      }
     } finally {
       client.close();
     }

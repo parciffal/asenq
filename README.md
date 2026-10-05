@@ -93,7 +93,7 @@ Explicit closure ends forwarding through every former name and the current name:
 |---|---|
 | `asenq_send` | Send `text`, a `file: { path, summary }` reference, or both to a session name, to `"*"` (live co-members of your channels; machine-wide if you belong to none) or to `"human"`. Text may be omitted only with a file reference. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
 | `asenq_file_check` | Check a retained direct message's referenced file against its send-time snapshot. Required: `id`; returns `match`, `changed` or `missing`. |
-| `asenq_list` | List sessions and their roles; the caller's own row is marked `[you]`. |
+| `asenq_list` | Rich session metadata, availability and resume commands; the caller's own row is marked `[you]`. Optional filters: `cwd` (literal prefix), `harness` (`claude`, `opencode`, `omp`), `channel` (exact membership). Combined filters use AND. |
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
 | `asenq_rename` | Rename this session; former names keep forwarding. Another live/reconnecting identity's current or former name returns `name_taken`. |
@@ -109,6 +109,20 @@ asenq send worker-oc "Pause after the current check" --kind control --action pau
 ```
 
 Agents can send the same message with `asenq_send { to: "worker-oc", text: "Pause after the current check", kind: "control", action: "pause" }`. The TUI displays control actions; use the CLI or agent tool to send them, not the TUI editor.
+
+### Session list
+
+`asenq ls` and `asenq_list` show current and former names, stable identity, harness, working directory, role, channels, inbound policy, state, latest ping, busy status, last contact and the actual harness session ID. Filters select a literal working-directory prefix, an exact harness or current channel membership; all supplied filters must match.
+
+```sh
+asenq ls --cwd /work/project --harness opencode --channel backend
+```
+
+`lastSeen` is durable harness contact (registration, hooks, bound requests, acknowledgments and matched pongs), not direct-message activity. Legacy sessions without recorded contact show `unknown`. A disconnected row is `gone`; a connected row whose latest ping is `not_responding` is `stale`. Both have `stale=yes`. Never-pinged rows show `ping=never`; unsupported checks show `unknown (unavailable)`. New contact or messages do not clear a failed ping; an answered ping does.
+
+Busy is informational: omp reports agent start/end, OpenCode reports session status, and Claude uses the existing UserPromptSubmit/Stop hooks. Scheduled omp continuations and Claude Stop hooks that return polled messages stay busy. Unknown or unsupported status is not idle; disconnect, registration and daemon restart reset it to unknown. Busy never changes delivery policy.
+
+When the actual harness session ID is known, the list includes a shell-quoted resume command: `claude -r <id>`, `omp -r <id>` or `opencode -s <id>`. Unknown IDs omit the command rather than inventing one.
 
 ### Human-assigned roles
 
@@ -198,6 +212,7 @@ Recover it with `asenq_inbox { id: "m_…" }`: this explicit lookup returns exac
 
 ```sh
 asenq ls                              # sessions
+asenq ls --cwd /work --harness omp --channel backend
 asenq send orch "status?"             # send as the user ("human")
 asenq send '*' "stop and commit"      # broadcast
 asenq inbox                           # messages agents sent to "human"
