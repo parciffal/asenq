@@ -377,13 +377,13 @@ test("header hydrates retained expired messages, follows live expiry and decreas
   assert.ok(ui.rows()[0].includes("2 failed"), "success does not clear retained failures outside the selected history");
 
   ui.size.columns = 80;
-  await ui.press("TAB");
+  await ui.press("s");
   assert.match(ui.rows()[0], /1 L · 1 R · 0 H · 1 U · 2 F/);
   assertFailedStyle("2 F");
   assertWithin(ui);
   for (const columns of [40, 20, 5, 2, 1]) {
     ui.size.columns = columns;
-    await ui.press("TAB");
+    await ui.press("s");
     assert.ok(ui.rows()[0].includes("●"), "connection remains visible when counters cannot fit");
     assertWithin(ui);
   }

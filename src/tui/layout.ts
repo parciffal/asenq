@@ -30,7 +30,7 @@ export const theme = {
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 export function statusStyle(status: MsgStatus | string): TerminalStyle {
-  if (status === "delivered" || status === "posted") return theme.ok;
+  if (status === "delivered" || status === "posted" || status === "replied") return theme.ok;
   if (status === "queued" || status === "held") return theme.warn;
   return theme.bad;
 }

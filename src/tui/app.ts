@@ -161,6 +161,7 @@ export class ConsoleApp {
   private shownHeldId?: string;
   private heldActionPending = false;
   private heldDirty = false;
+  private failedCount = 0;
   private streams = new Map<string, Stream>();
   private activity: PositionedEvent[] = [];
   private activityFilter: ActivityFilter = "important";
@@ -384,6 +385,7 @@ export class ConsoleApp {
     this.sessionPings = { ...s.sessionPings };
     this.channels = s.channels;
     this.readStates = new Map(s.readStates.map((r) => [keyOf(r.scope), r]));
+    this.failedCount = s.failedCount;
     this.watermark = s.watermark;
   }
 
@@ -438,6 +440,7 @@ export class ConsoleApp {
     }
     const e = item.event;
     if (e.type === "message") {
+      if (e.failedCount !== undefined) this.failedCount = e.failedCount;
       if (e.status === "held" || this.heldMessages.has(e.msg.id)) this.heldDirty = true;
       const m: StoredMessage = { ...e.msg, status: e.status, ...(e.reason ? { reason: e.reason } : {}) };
       if (!e.reason) delete m.reason;
@@ -938,6 +941,7 @@ export class ConsoleApp {
       { count: this.sessions.filter((s) => s.state === "gone").length, label: "reconnecting", short: "R", style: theme.warn },
       { count: this.heldMessages.size, label: "held", short: "H", style: theme.warn },
       { count: inboxUnread + channelUnread, label: "unread", short: "U", style: theme.unread },
+      { count: this.failedCount, label: "failed", short: "F", style: theme.bad },
     ];
     const connection: TerminalSpan = this.connection === "connected"
       ? { text: "● connected", style: theme.ok }
@@ -948,6 +952,7 @@ export class ConsoleApp {
     // tab hit regions and a connection symbol even at physically constrained widths.
     const fits: Fit[] = [
       { labels: "full", brand: true, badges: true, counters: "full", status: true },
+      { labels: "active", brand: true, badges: false, counters: "full", status: true },
       { labels: "full", brand: true, badges: true, counters: "short", status: true },
       { labels: "active", brand: true, badges: false, counters: "short", status: false },
       { labels: "short", brand: false, badges: false, counters: "short", status: true },
