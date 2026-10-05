@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>asenq ops console</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.t{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:13px;line-height:18px;color:#c9ccd3}
+.r{white-space:pre;height:18px;overflow:hidden}
+.dim{color:#8a909c}.b{font-weight:700}
+.cy{color:#5ccfe6}.bcy{color:#8be9fd;font-weight:700}
+.mg{color:#d58bf0;font-weight:700}.hb{color:#82aaff;font-weight:700}
+.gr{color:#8bd5a0}.ye{color:#e6c07b}.yeb{color:#e6c07b;font-weight:700}.rd{color:#f07178;font-weight:700}
+.box{position:relative;border:1px solid #303643;border-radius:4px}
+.lbl{position:absolute;top:-10px;left:10px;padding:0 6px;background:#15171c;white-space:pre;line-height:18px}
+.g{display:grid;grid-template-columns:22px 130px 92px 132px 96px 70px minmax(0,1fr);white-space:pre;height:18px;overflow:hidden;padding:0 10px}
+.key{background:#2a303c;color:#e6e8ec;padding:0 4px;border-radius:3px}
+a{color:#5ccfe6}a:hover{color:#8be9fd}
+</style>
+</helmet>
+<div class="t" style="width: 1000px; height: 640px; box-sizing: border-box; padding: 14px 16px; background: #15171c; display: flex; flex-direction: column; gap: 12px">
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="bcy">asenq</span><span class="dim"> console   </span><span class="gr">4 live</span><span class="dim">  ·  </span><span class="ye">1 reconnecting</span><span class="dim">  ·  </span><span class="yeb">1 held</span><span class="dim">  ·  </span><span class="bcy">2 unread</span><span class="dim">  ·  </span><span class="rd">0 failed</span></span><span><span class="gr">●</span> connected</span></div>
+<div class="box" style="padding: 10px 0 6px">
+<div class="lbl"><span class="b">Sessions</span></div>
+<div class="g dim"><span></span><span>NAME</span><span>HARNESS</span><span>STATE</span><span>POLICY</span><span>UNREAD</span><span>LAST MESSAGE</span></div>
+<div class="g" style="background: #222836"><span class="cy">›</span><span class="bcy">orch</span><span>claude</span><span class="gr">● live</span><span>accept</span><span class="bcy">1</span><span class="dim">13:40  Sent to reviewer. One message to worker-omp is…</span></div>
+<div class="g"><span></span><span class="b">reviewer</span><span>omp</span><span class="gr">● live</span><span>accept</span><span class="bcy">1</span><span class="dim">13:38  Standing by for a review pass on the PR…</span></div>
+<div class="g"><span></span><span>worker-oc</span><span>opencode</span><span class="gr">● live</span><span>accept</span><span class="dim">–</span><span class="dim">13:36  38 passed, 2 failed in daemon.test.ts</span></div>
+<div class="g"><span></span><span>worker-omp</span><span>omp</span><span class="gr">● live</span><span class="ye">hold</span><span class="dim">–</span><span class="dim">13:02  Ready.</span></div>
+<div class="g"><span></span><span>api-tests</span><span>claude</span><span class="ye">◌ reconnect</span><span>accept</span><span class="dim">–</span><span class="dim">12:51  Picking up the fixture refresh.</span></div>
+</div>
+<div style="flex: 1; display: flex; gap: 12px; min-height: 0">
+<div class="box" style="flex: 1.35; padding: 12px 12px 6px; display: flex; flex-direction: column; min-width: 0">
+<div class="lbl"><span class="bcy">orch</span><span class="dim"> conversation</span></div>
+<div class="r"><span class="dim">13:22 </span><span class="mg">orch</span><span class="dim"> → worker-oc  task</span></div>
+<div class="r dim">      Run the API tests and report back.</div>
+<div class="r"><span class="dim">13:37 </span><span class="mg">orch</span><span class="dim"> → you  status</span></div>
+<div class="r">      2 failures in retention. Hand them to reviewer?</div>
+<div class="r"><span class="dim">13:38 </span><span class="hb">you</span><span class="dim"> → orch  </span><span class="gr">✓</span></div>
+<div class="r">      Yes. Hold anything that touches setup.</div>
+<div class="r"><span class="dim">13:40 </span><span class="mg">orch</span><span class="dim"> → you  </span><span class="bcy">new</span></div>
+<div class="r">      Sent to reviewer. One message to worker-omp is…</div>
+<div style="flex: 1"></div>
+<div class="r" style="border-top: 1px solid #303643; padding-top: 4px; height: 22px"><span class="cy">› </span><span class="dim">c to write to orch</span></div>
+</div>
+<div style="flex: 1; display: flex; flex-direction: column; gap: 12px; min-width: 0">
+<div class="box" style="padding: 12px 12px 6px; border-color: #e6c07b">
+<div class="lbl"><span class="yeb">Held 1</span></div>
+<div class="r"><span class="b">orch</span><span class="dim"> → </span><span class="b">worker-omp</span><span class="dim">  13:39</span></div>
+<div class="r">"Re-run asenq setup --remove, then…"</div>
+<div class="r"><span class="key">r</span><span class="dim"> release   </span><span class="key">x</span><span class="dim"> drop   </span><span class="key">⏎</span><span class="dim"> read</span></div>
+</div>
+<div class="box" style="flex: 1; padding: 12px 12px 6px; min-height: 0">
+<div class="lbl"><span class="b">Activity</span><span class="dim"> · important</span></div>
+<div class="r"><span class="dim">13:40 </span><span class="gr">deliv </span>orch → you</div>
+<div class="r"><span class="dim">13:39 </span><span class="ye">held  </span>orch → worker-omp</div>
+<div class="r"><span class="dim">13:39 </span><span class="gr">deliv </span>orch → reviewer</div>
+<div class="r"><span class="dim">13:39 </span><span class="ye">gone  </span>api-tests</div>
+<div class="r"><span class="dim">13:38 </span><span class="gr">deliv </span>you → orch</div>
+<div class="r"><span class="dim">13:36 </span><span class="gr">deliv </span>worker-oc → orch</div>
+<div class="r"><span class="dim">13:12 </span><span class="cy">join  </span>reviewer · omp</div>
+</div>
+</div>
+</div>
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="key">↑↓</span> <span class="dim">session</span>   <span class="key">⏎</span> <span class="dim">open</span>   <span class="key">c</span> <span class="dim">write</span>   <span class="key">b</span> <span class="dim">broadcast</span>   <span class="key">p</span> <span class="dim">policy</span>   <span class="key">h</span> <span class="dim">held</span>   <span class="key">#</span> <span class="dim">channels</span></span><span><span class="key">?</span> <span class="dim">commands</span>   <span class="key">q</span> <span class="dim">quit</span></span></div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1000,"height":640}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

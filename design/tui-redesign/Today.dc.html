@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>asenq TUI today</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.t{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:13px;line-height:18px;color:#d6d6d0}
+.r{white-space:pre;height:18px;overflow:hidden}
+.dim{color:#8f908a}.b{font-weight:700}
+.inv{background:#e8e8e3;color:#272822;font-weight:700}
+.gr{color:#a6e22e}
+a{color:#66d9ef}a:hover{color:#a1efe4}
+</style>
+</helmet>
+<div class="t" style="width: 1000px; height: 640px; box-sizing: border-box; padding: 16px; background: #272822; display: flex; flex-direction: column">
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="inv"> asenq </span>  <span class="b" style="text-decoration: underline"> Sessions </span>  <span class="dim">Inbox 2</span>  <span class="dim">Channels</span>  <span class="dim">Activity</span></span><span>● connected</span></div>
+<div style="flex: 1; display: flex; min-height: 0">
+<div style="width: 236px; border-right: 1px solid #d6d6d0; display: flex; flex-direction: column">
+<div class="r">Live 3</div>
+<div class="r inv" style="display: flex; justify-content: space-between; margin-right: 4px"><span>› reviewer</span><span>+1 · live</span></div>
+<div class="r b" style="display: flex; justify-content: space-between; margin-right: 4px"><span>  orch</span><span>+1 · live</span></div>
+<div class="r" style="display: flex; justify-content: space-between; margin-right: 4px"><span>  worker-oc</span><span>live</span></div>
+</div>
+<div style="flex: 1; padding-left: 4px; display: flex; flex-direction: column">
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="b">reviewer</span><span class="dim"> · omp</span></span><span class="b">1 unread · live</span></div>
+<div class="r dim">Beginning of retained history</div>
+<div class="r"> </div>
+<div class="r" style="display: flex; gap: 8px; align-items: center"><span>──</span><span class="b">new</span><span style="flex: 1; border-top: 1px solid #d6d6d0; height: 0"></span></div>
+<div class="r"><span class="b">● reviewer</span>  posted  <span class="dim">01:38 PM</span></div>
+<div class="r">  Standing by for a review pass on the PR when you are ready.</div>
+<div style="flex: 1"></div>
+<div class="r" style="display: flex; gap: 8px; align-items: center"><span>──</span><span class="b">to reviewer</span><span style="flex: 1; border-top: 1px solid #d6d6d0; height: 0"></span><span class="dim">c write</span></div>
+<div class="r dim">› Write to reviewer — press c</div>
+</div>
+</div>
+<div class="r" style="display: flex; justify-content: space-between"><span class="dim">3 live · 3 sessions</span><span class="dim">↑↓ move · Enter open · Tab focus · ? menu</span></div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1000,"height":640}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>

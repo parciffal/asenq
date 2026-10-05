@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>asenq chat-first</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+.t{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:13px;line-height:18px;color:#c9ccd3}
+.r{white-space:pre;height:18px;overflow:hidden}
+.dim{color:#8a909c}.b{font-weight:700}
+.cy{color:#5ccfe6}.bcy{color:#8be9fd;font-weight:700}
+.mg{color:#d58bf0;font-weight:700}.hb{color:#82aaff;font-weight:700}
+.gr{color:#8bd5a0}.ye{color:#e6c07b}.yeb{color:#e6c07b;font-weight:700}
+.side{padding:0 14px}
+.chip{color:#8a909c;border:1px solid #303643;padding:0 4px;border-radius:3px}
+.key{background:#2a303c;color:#e6e8ec;padding:0 4px;border-radius:3px}
+a{color:#5ccfe6}a:hover{color:#8be9fd}
+</style>
+</helmet>
+<div class="t" style="width: 1000px; height: 640px; box-sizing: border-box; background: #15171c; display: flex">
+<div style="width: 250px; background: #1b1e25; display: flex; flex-direction: column; padding: 14px 0">
+<div class="r side" style="display: flex; justify-content: space-between"><span class="bcy">asenq</span><span><span class="gr">●</span><span class="dim"> local</span></span></div>
+<div class="r"> </div>
+<div class="r side" style="display: flex; justify-content: space-between"><span class="b">✉ Inbox</span><span class="bcy">2</span></div>
+<div class="r"> </div>
+<div class="r side dim">SESSIONS</div>
+<div class="r side" style="display: flex; justify-content: space-between; background: #262b36"><span><span class="gr">●</span> <span class="bcy">orch</span></span><span class="bcy">1</span></div>
+<div class="r side" style="display: flex; justify-content: space-between"><span><span class="gr">●</span> <span class="b">reviewer</span></span><span class="bcy">1</span></div>
+<div class="r side"><span class="gr">●</span> worker-oc</div>
+<div class="r side" style="display: flex; justify-content: space-between"><span><span class="gr">●</span> worker-omp</span><span class="ye">⏸ held</span></div>
+<div class="r side"><span class="ye">◌</span> <span class="dim">api-tests</span></div>
+<div class="r"> </div>
+<div class="r side dim">CHANNELS</div>
+<div class="r side" style="display: flex; justify-content: space-between"><span><span class="dim">#</span> <span class="b">deploy</span></span><span class="bcy">3</span></div>
+<div class="r side"><span class="dim">#</span> reviews</div>
+<div style="flex: 1"></div>
+<div class="r side dim">ACTIVITY</div>
+<div class="r side dim">13:40 worker-oc → orch</div>
+<div class="r side dim">13:39 api-tests gone</div>
+<div class="r side dim">13:38 reviewer → you</div>
+</div>
+<div style="flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 14px 18px 12px">
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="bcy">orch</span><span class="dim">  claude code · live · accepting</span></span><span><span class="key">^K</span><span class="dim"> jump</span></span></div>
+<div style="border-top: 1px solid #303643; margin: 8px 0 10px"></div>
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="dim">orch → worker-oc  </span><span class="chip">task</span></span><span class="dim">13:22</span></div>
+<div class="r dim">  Run the API tests and report back.</div>
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="dim">worker-oc → orch  </span><span class="chip">result</span> <span class="chip">✓ done</span></span><span class="dim">13:36</span></div>
+<div class="r dim">  38 passed, 2 failed in daemon.test.ts (retention).</div>
+<div class="r"> </div>
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="mg">orch</span>  <span class="chip">status</span></span><span class="dim">13:37</span></div>
+<div class="r">  worker-oc finished the API run: 2 failures in retention.</div>
+<div class="r">  Want me to hand them to reviewer?</div>
+<div class="r"> </div>
+<div style="display: flex; justify-content: flex-end"><div style="max-width: 560px; background: #1f2a3a; border-radius: 6px; padding: 4px 10px"><div class="r" style="display: flex; justify-content: space-between; gap: 24px"><span class="hb">you</span><span class="dim">13:38 ✓</span></div><div class="r">Yes, send both to reviewer. Hold anything</div><div class="r">that touches setup until I look.</div></div></div>
+<div class="r"> </div>
+<div class="r" style="display: flex; justify-content: space-between"><span><span class="mg">orch</span>  <span class="bcy">● new</span></span><span class="dim">13:40</span></div>
+<div class="r">  Sent to reviewer. One message to worker-omp is waiting on you.</div>
+<div style="flex: 1"></div>
+<div style="border: 1px solid #e6c07b; border-radius: 6px; padding: 4px 10px; margin-bottom: 10px; display: flex; justify-content: space-between"><span class="r"><span class="yeb">⏸ held</span><span class="dim">  orch → worker-omp · </span>"Re-run asenq setup --remove, then…"</span><span class="r"><span class="key">r</span><span class="dim"> release  </span><span class="key">x</span><span class="dim"> drop</span></span></div>
+<div style="background: #1b1e25; border-radius: 6px; padding: 6px 10px; display: flex; justify-content: space-between"><span class="r"><span class="cy">@orch</span> <span class="dim">Message orch…   / for commands</span></span><span class="r dim">⏎ send</span></div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1000,"height":640}}'>
+class Component extends DCLogic {
+renderVals() {
+return {};
+}
+}
+</script>
+</body>
+</html>
