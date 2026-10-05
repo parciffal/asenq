@@ -106,12 +106,11 @@ A role belongs to the session identity, not its name: renaming and reconnecting 
 
 Channels have durable names and rosters of session identities. A session may belong to several channels, with any mix of roles. Membership survives rename, temporary disconnection, archival and revival; another identity reusing a name does not inherit it. Late Claude lineage recognition unions provisional memberships into the ancestor, preserves an existing ancestor role or inherits the provisional role when unset, and leaves the ancestor's inbound policy unchanged.
 
-The human can create channels and edit any roster through the CLI or **? → Create channel / Add channel member / Remove channel member** in the TUI. An orchestrator can create a new channel with itself as first member, or add itself to any existing channel; it can edit other members only in channels it belongs to. Workers and unset-role sessions cannot create channels or edit rosters. Adding requires a live target. Removal resolves current names before former names within that roster and refuses ambiguous matches; the human can instead pass `--id` to remove a specific identity, including an archived member. The TUI always removes by identity.
+The human can create channels and edit any roster through the CLI or **? → Create channel / Add channel member / Remove channel member** in the TUI. An orchestrator can create a new channel with itself as first member, or add itself to any existing channel; it can edit other members only in channels it belongs to. Workers and unset-role sessions cannot create channels or edit rosters. Adding requires a live target. Removal resolves current names before former names within that roster and refuses ambiguous matches; the human can instead pass `--session-id` to remove a specific identity, including an archived member. The TUI always removes by identity.
 
 Posting to an unknown channel still creates it, with an empty roster and no automatic membership. Existing post-only channels migrate with empty rosters. Add/remove/member queries require an existing channel. Channel reads remain unrestricted and posts stay on demand: membership alone does not push messages or scope broadcasts. Mention delivery and broadcast scoping are separate changes.
 
-The Channels tab lists each roster under its channel with role and lifecycle state. Selecting a member keeps the channel conversation and composer in channel scope, not a direct message. Purging retained posts keeps the channel; deleting an identity through retention or human close removes its memberships.
-
+The Channels tab lists each roster under its channel with role and lifecycle state. Selecting a member keeps the channel conversation and composer in channel scope, not a direct message. Purging retained posts keeps the channel; deleting an identity through retention removes its memberships.
 
 ### File references
 
@@ -171,7 +170,7 @@ asenq channels · asenq channel read <ch> · asenq channel send <ch> <text…>
 asenq channel create <ch>
 asenq channel add <ch> <live-name>
 asenq channel remove <ch> <member-name>
-asenq channel remove <ch> --id <session-id>
+asenq channel remove <ch> --session-id <session-id>
 asenq channel members <ch>
 asenq daemon start|stop|status
 asenq setup [--remove]
