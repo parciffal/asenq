@@ -1967,9 +1967,10 @@ export class ConsoleApp {
           break;
         case "Remove channel member": {
           const channel = scope?.scope === "channel" ? scope.channel : this.selectedChannel() ?? "";
-          const members = channel
-            ? (await this.client.request("channel_members", { channel })).members as SessionIdentity[]
-            : [];
+          const members = (this.channels.find((item) => item.name === channel)?.memberIds ?? []).flatMap((id) => {
+            const member = this.session(id);
+            return member ? [member] : [];
+          });
           const id = this.selectedChannelMember() ?? members[0]?.id ?? "";
           this.ask("Remove channel member", ["Channel", "Session identity ID"], async ([channel, sessionId]) => {
             await this.client.request("channel_remove", { channel, sessionId });

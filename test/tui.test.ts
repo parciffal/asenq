@@ -28,6 +28,7 @@ type Console = {
   rows(): string[];
   frame(): TerminalFrame;
   press(name: string): Promise<void>;
+  burst(keys: string[]): Promise<void>;
   click(column: number, row?: number): Promise<void>;
   paste(text: string): Promise<void>;
   resize(columns: number, rows: number): Promise<void>;
@@ -60,6 +61,13 @@ async function startConsole(columns: number, rows: number, client?: ConsoleDeps[
     async press(name) {
       const text = [...name].length === 1 ? name : undefined;
       handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: name.startsWith("CTRL_"), alt: false, shift: name.startsWith("SHIFT_") });
+      await app.idle();
+    },
+    async burst(keys) {
+      for (const name of keys) {
+        const text = [...name].length === 1 ? name : undefined;
+        handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: name.startsWith("CTRL_"), alt: false, shift: name.startsWith("SHIFT_") });
+      }
       await app.idle();
     },
     async click(column, row = 0) {
@@ -739,6 +747,22 @@ test("channel palette edits and member hit targets keep delivery in channel scop
   const members = (await human.request("channel_members", { channel: "empty" })).members as SessionIdentity[];
   assert.deepEqual(members.map((member) => member.id), [replacement.session.id], "removal follows selected identity through rename, archive and name reuse");
   assertWithin(ui);
+});
+
+test("rapid removal palette input stays in its identity form instead of sending a direct message", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "rapid-remove-alpha", "alpha");
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "alpha" });
+  const ui = await startConsole(80, 22);
+  await ui.press("#");
+  await ui.press("?");
+  await ui.type("Remove channel member");
+  await ui.burst(["ENTER", "TAB", "CTRL_U", ...alpha.session.id, "CTRL_D"]);
+  const members = (await human.request("channel_members", { channel: "work" })).members as SessionIdentity[];
+  assert.deepEqual(members, []);
+  assert.deepEqual(alpha.deliveries, [], "form input must never leak into a session composer");
 });
 
 test("rounded panes resize at the wide boundary without overflowing or moving mouse and cursor targets onto borders", async () => {
