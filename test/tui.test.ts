@@ -246,7 +246,7 @@ test("stale held actions refresh without consuming the next message or a newly o
   assertWithin(ui);
 });
 
-test("header hydrates held messages and follows hold, release, drop and target removal", async () => {
+test("header hydrates held messages and follows hold, release, drop, removal and revival", async () => {
   env = await startEnv();
   const human = env.human();
   const alpha = await env.adapter("omp", "held-alpha", "alpha");
