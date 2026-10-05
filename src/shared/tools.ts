@@ -1,5 +1,5 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, CONTROL_ACTIONS, KINDS, type ControlAction, type Role, type SendResult, type WireMsg } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
 import { renderMessageBody } from "./render.js";
 
 export type ParamSpec = {
@@ -55,7 +55,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_list",
     label: "Asenq List",
-    description: "List agent sessions registered on asenq (name, harness, working directory, human-assigned role). Roles are informational, never enforced. Your own session is marked [you].",
+    description: "List agent sessions registered on asenq (name, harness, working directory, role). The human can edit any role; an orchestrator can edit roles only for sessions sharing a channel. Roles are informational for message delivery; asenq does not coordinate work. Your own session is marked [you].",
     params: {},
   },
   {
@@ -88,6 +88,52 @@ export const TOOLS: ToolSpec[] = [
     params: { name: { type: "string", description: "New name: lowercase letters, digits, - and _" } },
   },
   {
+    name: "asenq_set_role",
+    label: "Asenq Set Role",
+    description:
+      "Set a session's role or unset it. Only the human or an orchestrator sharing a channel with the target may edit its role. " +
+      "The human must first create a channel and add its orchestrator. Workers and sessions with an unset role cannot edit roles. " +
+      "Roles are informational for message delivery; asenq is a messenger, not a coordinator.",
+    params: {
+      name: { type: "string", description: `Target session name. ${NAMES_HINT}` },
+      role: { type: "string", enum: ["orchestrator", "worker", "unset"], description: "Role to assign, or unset to clear it" },
+    },
+  },
+  {
+    name: "asenq_channel_add",
+    label: "Asenq Channel Add",
+    description:
+      "Add a live session to an existing channel's roster. Only the human or an orchestrator who is a member of that channel may edit it. " +
+      "The human must first create the channel and add its orchestrator; posting to an unknown channel creates an empty roster, without joining it. " +
+      "Roles are informational for message delivery; roster editing permissions do not make asenq a coordinator.",
+    params: {
+      channel: { type: "string", description: "Existing channel name" },
+      name: { type: "string", description: `Live target session name. ${NAMES_HINT}` },
+    },
+  },
+  {
+    name: "asenq_channel_remove",
+    label: "Asenq Channel Remove",
+    description:
+      "Remove a member from an existing channel's roster by its current or former name. Only the human or an orchestrator who is a member of that channel may edit it. " +
+      "The human must first create the channel and add its orchestrator. Current member names take precedence over former names; ambiguous names are refused. " +
+      "Use asenq_channel_members to inspect candidate identities; only the human can remove by identity id. " +
+      "Roles are informational for message delivery; asenq is not a coordinator.",
+    params: {
+      channel: { type: "string", description: "Existing channel name" },
+      name: { type: "string", description: "Member's current or former session name" },
+    },
+  },
+  {
+    name: "asenq_channel_members",
+    label: "Asenq Channel Members",
+    description:
+      "Read an existing channel's members with their full name, role or unset, raw state and identity id. Reads are unrestricted. " +
+      "Only the human or an orchestrator belonging to the channel may edit its roster; the human creates the channel and adds its first orchestrator. " +
+      "Roles are informational for message delivery; asenq does not coordinate work.",
+    params: { channel: { type: "string", description: "Existing channel name" } },
+  },
+  {
     name: "asenq_channel_send",
     label: "Asenq Channel Send",
     description: "Post a message to a named asenq channel. Channels are read on demand and never pushed into sessions.",
@@ -108,7 +154,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_channel_list",
     label: "Asenq Channel List",
-    description: "List asenq channels with message counts.",
+    description: "List asenq channels with message counts, including channels with no posts.",
     params: {},
   },
 ];
@@ -216,6 +262,24 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
         const r = await client.request("rename", { ...who, name: args.name });
         return `renamed to ${String(r.name)}`;
       }
+      case "asenq_set_role": {
+        await client.request("set_role", { ...who, name: args.name, role: args.role === "unset" ? null : args.role });
+        return `${String(args.name)} role ${String(args.role)}`;
+      }
+      case "asenq_channel_add": {
+        const r = await client.request("channel_add", { ...who, channel: args.channel, name: args.name });
+        return `added ${String(args.name)} to #${(r.channel as ChannelSummary).name}`;
+      }
+      case "asenq_channel_remove": {
+        const r = await client.request("channel_remove", { ...who, channel: args.channel, name: args.name });
+        return `removed ${String(args.name)} from #${(r.channel as ChannelSummary).name}`;
+      }
+      case "asenq_channel_members": {
+        const r = await client.request("channel_members", { ...who, channel: args.channel });
+        const members = r.members as SessionIdentity[];
+        if (members.length === 0) return `#${String(args.channel)} has no members`;
+        return members.map((s) => `${s.name} · role=${s.role ?? "unset"} · state=${s.state} · id=${s.id}`).join("\n");
+      }
       case "asenq_channel_send": {
         const r = await client.request("channel_send", { ...who, channel: args.channel, text: args.text });
         return `posted ${String(r.msgId)} to #${String(args.channel)}`;
@@ -226,9 +290,9 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
       }
       case "asenq_channel_list": {
         const r = await client.request("channel_list", who);
-        const rows = r.channels as { name: string; count: number; lastAt: number }[];
+        const rows = r.channels as ChannelSummary[];
         if (rows.length === 0) return "no channels";
-        return rows.map((c) => `#${c.name} ${c.count} messages, last ${new Date(c.lastAt).toISOString()}`).join("\n");
+        return rows.map((c) => `#${c.name} ${c.count} messages, ${c.lastAt === 0 ? "no posts" : `last ${new Date(c.lastAt).toISOString()}`}`).join("\n");
       }
       default:
         return `asenq error (bad_request): unknown tool ${name}`;

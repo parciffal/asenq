@@ -7,7 +7,7 @@ import type { SendResult } from "../src/shared/protocol.js";
 import { z } from "zod";
 import { zodShape } from "../src/shared/schema.js";
 import { callTool, TOOLS } from "../src/shared/tools.js";
-import { startEnv, type TestEnv } from "./helpers.js";
+import { isSession, startEnv, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 afterEach(async () => {
@@ -47,6 +47,183 @@ test("list identifies human-assigned roles without transferring them across reus
   await env.adapter("opencode", "replacement-key", "renamed");
   const reused = await callTool(orchestrator.client, "asenq_list", {});
   assert.doesNotMatch(reused.split("\n").find((line) => line.startsWith("renamed "))!, /role=/);
+});
+
+test("orchestrator tools edit only their channels and shared members' roles", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha", "alpha");
+  const beta = await env.adapter("omp", "beta", "beta");
+  const worker = await env.adapter("omp", "worker", "worker");
+  const outside = await env.adapter("omp", "outside", "outside");
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await human.request("set_role", { name: "beta", role: "orchestrator" });
+  for (const name of ["red", "blue"]) await human.request("channel_create", { channel: name });
+  await human.request("channel_add", { channel: "red", name: "alpha" });
+  await human.request("channel_add", { channel: "blue", name: "beta" });
+
+  await callTool(alpha.client, "asenq_channel_add", { channel: "red", name: "worker" });
+  await callTool(beta.client, "asenq_channel_add", { channel: "blue", name: "worker" });
+  await callTool(alpha.client, "asenq_set_role", { name: "worker", role: "worker" });
+  for (const channel of ["red", "blue"]) {
+    const members = await callTool(outside.client, "asenq_channel_members", { channel });
+    const line = members.split("\n").find((row) => row.startsWith("worker "))!;
+    assert.ok(line.includes("role=worker"));
+    assert.ok(line.includes("state=live"));
+    assert.ok(line.includes(`id=${worker.session.id}`));
+  }
+  assert.match(await callTool(alpha.client, "asenq_set_role", { name: "outside", role: "worker" }), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(alpha.client, "asenq_channel_add", { channel: "blue", name: "outside" }), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(alpha.client, "asenq_channel_remove", { channel: "blue", name: "worker" }), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(worker.client, "asenq_set_role", { name: "alpha", role: "worker" }), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(worker.client, "asenq_channel_add", { channel: "red", name: "outside" }), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(worker.client, "asenq_channel_remove", { channel: "red", name: "alpha" }), /^asenq error \(not_permitted\): /);
+  const identities = (await human.sync()).sessions;
+  assert.equal(identities.find((s) => s.id === outside.session.id)?.role, null);
+  assert.equal(identities.find((s) => s.id === alpha.session.id)?.role, "orchestrator");
+  const blue = await callTool(alpha.client, "asenq_channel_members", { channel: "blue" });
+  assert.ok(blue.includes(`id=${beta.session.id}`));
+  assert.ok(blue.includes(`id=${worker.session.id}`));
+  assert.ok(!blue.includes(`id=${outside.session.id}`));
+
+  await callTool(beta.client, "asenq_set_role", { name: "worker", role: "unset" });
+  assert.equal((await human.sync()).sessions.find((s) => s.id === worker.session.id)?.role, null);
+  assert.match(await callTool(worker.client, "asenq_channel_remove", { channel: "red", name: "alpha" }), /^asenq error \(not_permitted\): /);
+  await callTool(alpha.client, "asenq_channel_remove", { channel: "red", name: "worker" });
+  const red = await callTool(beta.client, "asenq_channel_members", { channel: "red" });
+  assert.ok(red.includes(`id=${alpha.session.id}`));
+  assert.ok(!red.includes(`id=${worker.session.id}`));
+  const retained = await callTool(alpha.client, "asenq_channel_members", { channel: "blue" });
+  assert.ok(retained.includes(`id=${worker.session.id}`));
+  assert.match(retained.split("\n").find((row) => row.startsWith("worker "))!, /role=unset/);
+});
+
+test("channel tools distinguish empty rosters and channels without posts", async () => {
+  env = await startEnv();
+  const reader = await env.adapter("omp", "reader", "reader");
+  await env.human().request("channel_create", { channel: "empty" });
+  const members = await callTool(reader.client, "asenq_channel_members", { channel: "empty" });
+  assert.match(members, /no members/);
+  assert.ok(!members.includes("role="));
+  const channels = await callTool(reader.client, "asenq_channel_list", {});
+  const empty = channels.split("\n").find((row) => row.startsWith("#empty "))!;
+  assert.ok(empty.includes("0 messages"));
+  assert.ok(empty.includes("no posts"));
+  assert.ok(!empty.includes("1970"));
+  await callTool(reader.client, "asenq_channel_send", { channel: "posted", text: "Read on demand" });
+  assert.match(await callTool(reader.client, "asenq_channel_members", { channel: "posted" }), /no members/);
+  const posted = (await callTool(reader.client, "asenq_channel_list", {})).split("\n").find((row) => row.startsWith("#posted "))!;
+  assert.ok(posted.includes("1 messages"));
+  assert.ok(posted.includes(new Date(env.clock.now()).toISOString()));
+  assert.match(await callTool(reader.client, "asenq_channel_members", { channel: "missing" }), /^asenq error \(unknown_channel\): /);
+});
+
+test("member output follows durable identity names, full roles and raw lifecycle states", async () => {
+  env = await startEnv({ graceMs: 100 });
+  const human = env.human();
+  const orchestrator = await env.adapter("omp", "orchestrator", "orchestrator");
+  const member = await env.adapter("omp", "member", "member");
+  await human.request("set_role", { name: "orchestrator", role: "orchestrator" });
+  await human.request("set_role", { name: "member", role: "worker" });
+  await human.request("channel_create", { channel: "roster" });
+  for (const name of ["orchestrator", "member"]) await human.request("channel_add", { channel: "roster", name });
+  const renamed = "member-with-a-long-name-that-must-stay";
+  await member.client.request("rename", { name: renamed });
+  const live = await callTool(orchestrator.client, "asenq_channel_members", { channel: "roster" });
+  assert.match(live.split("\n").find((row) => row.startsWith("orchestrator "))!, /role=orchestrator/);
+  const assertMember = (output: string, state: string): void => {
+    const row = output.split("\n").find((line) => line.includes(`id=${member.session.id}`))!;
+    assert.ok(row.startsWith(`${renamed} `));
+    assert.ok(row.includes("role=worker"));
+    assert.ok(row.includes(`state=${state}`));
+  };
+  assertMember(live, "live");
+  assert.ok(!live.split("\n").some((row) => row.startsWith("member ")));
+  const gone = await env.watch(isSession("gone", renamed));
+  member.client.close();
+  await gone.event;
+  assertMember(await callTool(orchestrator.client, "asenq_channel_members", { channel: "roster" }), "gone");
+  assert.match(await callTool(orchestrator.client, "asenq_channel_add", { channel: "roster", name: renamed }), /^asenq error \(not_live\): /);
+  env.clock.advance(101);
+  env.daemon.sweep();
+  assertMember(await callTool(orchestrator.client, "asenq_channel_members", { channel: "roster" }), "removed");
+  await callTool(orchestrator.client, "asenq_channel_remove", { channel: "roster", name: "member" });
+  const removed = await callTool(orchestrator.client, "asenq_channel_members", { channel: "roster" });
+  assert.ok(!removed.includes(`id=${member.session.id}`));
+  assert.ok(removed.includes(`id=${orchestrator.session.id}`));
+});
+
+test("multi-bound tool edits authorize the selected session, never another orchestrator", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const shared = await env.adapter("opencode", "alpha", "alpha");
+  const beta = (await shared.client.request("register", { harness: "opencode", key: "beta", name: "beta" }))
+    .session as { id: string; name: string };
+  const worker = await env.adapter("omp", "worker", "worker");
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await human.request("set_role", { name: "beta", role: "orchestrator" });
+  for (const channel of ["red", "blue"]) await human.request("channel_create", { channel });
+  await human.request("channel_add", { channel: "red", name: "alpha" });
+  await human.request("channel_add", { channel: "blue", name: "beta" });
+  await callTool(shared.client, "asenq_channel_add", { channel: "red", name: "worker" }, shared.session.id);
+  await callTool(shared.client, "asenq_set_role", { name: "worker", role: "worker" }, shared.session.id);
+  assert.match(await callTool(shared.client, "asenq_set_role", { name: "worker", role: "orchestrator" }, beta.id), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(shared.client, "asenq_channel_remove", { channel: "red", name: "worker" }, beta.id), /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(shared.client, "asenq_channel_add", { channel: "red", name: "beta" }, beta.id), /^asenq error \(not_permitted\): /);
+  for (const [tool, args] of [
+    ["asenq_channel_add", { channel: "red", name: "beta" }],
+    ["asenq_channel_remove", { channel: "red", name: "worker" }],
+    ["asenq_set_role", { name: "worker", role: "orchestrator" }],
+  ] as const) {
+    assert.match(await callTool(shared.client, tool, args), /^asenq error \(bad_request\): /);
+  }
+  const red = await callTool(shared.client, "asenq_channel_members", { channel: "red" }, beta.id);
+  assert.ok(red.includes(`id=${worker.session.id}`));
+  assert.ok(!red.includes(`id=${beta.id}`));
+  assert.match(red.split("\n").find((row) => row.startsWith("worker "))!, /role=worker/);
+  await callTool(shared.client, "asenq_channel_add", { channel: "blue", name: "worker" }, beta.id);
+  await callTool(shared.client, "asenq_set_role", { name: "worker", role: "unset" }, beta.id);
+  await callTool(shared.client, "asenq_channel_remove", { channel: "red", name: "worker" }, shared.session.id);
+  const after = await callTool(shared.client, "asenq_channel_members", { channel: "red" }, shared.session.id);
+  assert.ok(!after.includes(`id=${worker.session.id}`));
+  assert.ok(after.includes(`id=${shared.session.id}`));
+  const blue = await callTool(shared.client, "asenq_channel_members", { channel: "blue" }, shared.session.id);
+  assert.ok(blue.includes(`id=${worker.session.id}`));
+  assert.match(blue.split("\n").find((row) => row.startsWith("worker "))!, /role=unset/);
+  assert.equal((await human.sync()).sessions.find((s) => s.id === worker.session.id)?.role, null);
+});
+
+test("ambiguous member removal exposes identities for human remediation without changing the roster", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const orchestrator = await env.adapter("omp", "orchestrator", "orchestrator");
+  await human.request("set_role", { name: "orchestrator", role: "orchestrator" });
+  await human.request("channel_create", { channel: "roster" });
+  await human.request("channel_add", { channel: "roster", name: "orchestrator" });
+  const first = await env.adapter("omp", "first", "duplicate");
+  await callTool(orchestrator.client, "asenq_channel_add", { channel: "roster", name: "duplicate" });
+  await first.client.request("unregister");
+  const second = await env.adapter("omp", "second", "duplicate");
+  await callTool(orchestrator.client, "asenq_channel_add", { channel: "roster", name: "duplicate" });
+  await second.client.request("unregister");
+  const refused = await callTool(orchestrator.client, "asenq_channel_remove", { channel: "roster", name: "duplicate" });
+  assert.match(refused, /^asenq error \(ambiguous_target\): /);
+  for (const id of [first.session.id, second.session.id]) assert.ok(refused.includes(id));
+  assert.ok(refused.includes("duplicate"));
+  assert.ok(refused.includes("removed"));
+  const members = await callTool(orchestrator.client, "asenq_channel_members", { channel: "roster" });
+  for (const id of [first.session.id, second.session.id]) {
+    const row = members.split("\n").find((line) => line.includes(`id=${id}`))!;
+    assert.ok(row.startsWith("duplicate "));
+    assert.ok(row.includes("role=unset"));
+    assert.ok(row.includes("state=removed"));
+  }
+  await human.request("channel_remove", { channel: "roster", sessionId: first.session.id });
+  await callTool(orchestrator.client, "asenq_channel_remove", { channel: "roster", name: "duplicate" });
+  const after = await callTool(orchestrator.client, "asenq_channel_members", { channel: "roster" });
+  assert.ok(!after.includes(`id=${first.session.id}`));
+  assert.ok(!after.includes(`id=${second.session.id}`));
+  assert.ok(after.includes(`id=${orchestrator.session.id}`));
 });
 
 test("inbox clips an oversized body within the total cap and identifies full-text recovery", async () => {
