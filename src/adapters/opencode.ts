@@ -166,13 +166,17 @@ export const server = async (ctx: PluginInput): Promise<Hooks> => {
     // The daemon may attach the compaction flag to a deliver push; the base protocol type does not model it yet.
     const d = p as DeliveryPush;
     if (d.reset === "compact") {
-      // Acknowledge receipt before joining the queue: a slow compaction must not delay acceptance.
-      const receipt = client
-        .request("ack", { as: d.session, msgId: d.msg.id, ok: true, reset: "pending" })
-        .catch((e: unknown) => log("warn", `ack ${d.msg.id} failed: ${e instanceof Error ? e.message : String(e)}`));
+      // Receipt is acknowledged before joining the queue: a slow compaction must not delay acceptance.
+      // The queued task waits for that ack and gives up if the daemon did not accept the message.
+      const receipt = client.request("ack", { as: d.session, msgId: d.msg.id, ok: true, reset: "pending" }).then(
+        () => true,
+        (e: unknown) => {
+          log("warn", `ack ${d.msg.id} rejected: ${e instanceof Error ? e.message : String(e)}`);
+          return false;
+        },
+      );
       await serialize(d.key, async () => {
-        await receipt;
-        await deliverCompact(d);
+        if (await receipt) await deliverCompact(d);
       });
       return;
     }
