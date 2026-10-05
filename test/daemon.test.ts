@@ -4032,7 +4032,7 @@ test("new sends after grace removal queue by current name and stable id and revi
   const [byName] = await send(human, "offline", "sent after removal by name");
   const byId = await human.sendToSession(original.session.id, "sent after removal by id");
   assert.deepEqual([byName.status, byId.status], ["queued", "queued"]);
-  assert.deepEqual((await send(human, "never-registered", "unknown"))[0].status, "unknown_target");
+  await assert.rejects(send(human, "never-registered", "unknown"), { code: "unknown_target" });
   await env.restart();
   human = env.human();
   const holder = await env.adapter("omp", "new-holder", "offline");
