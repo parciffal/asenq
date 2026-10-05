@@ -571,9 +571,10 @@ export class ConsoleApp {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
           const archived = s.state === "removed";
+          const failedPing = s.state === "live" && this.sessionPings[s.id] === "not_responding";
           const left: TerminalLine = [
             this.marker(selected, true),
-            { text: archived ? "  " : s.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : s.state === "live" ? theme.ok : theme.warn },
+            { text: archived ? "  " : s.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || s.state === "gone" ? theme.warn : theme.ok },
             { text: s.name, style: selected ? theme.brand : archived ? theme.dim : unread ? theme.bold : {} },
             ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : []),
           ];
@@ -586,10 +587,11 @@ export class ConsoleApp {
           const detailWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
           const fill = pick(selected);
           // Keep complete metadata and a readable name even at the narrow split boundary.
-          if (width < 4 + Math.min(3, terminalTextWidth(s.name)) + 1 + detailWidth) {
-            return [padSpans(left, width, fill), justify([], right, width, fill)];
-          }
-          return [justify(left, right, width, fill)];
+          const rows = width < 4 + Math.min(3, terminalTextWidth(s.name)) + 1 + detailWidth
+            ? [padSpans(left, width, fill), justify([], right, width, fill)]
+            : [justify(left, right, width, fill)];
+          if (failedPing) rows.push(justify([], [this.stateLabel(s)], width, fill));
+          return rows;
         },
       });
       const live = matching.filter((s) => s.state === "live");
@@ -648,6 +650,7 @@ export class ConsoleApp {
             key: `m:${channel.name}:${id}`,
             rows: (width, selected) => {
               const archived = member.state === "removed";
+              const failedPing = member.state === "live" && this.sessionPings[member.id] === "not_responding";
               const role = member.role === "orchestrator" ? "orch" : member.role === "worker" ? "wrk" : "unset";
               const detail: TerminalSpan[] = [
                 { text: harnessShortName(member.harness).padEnd(3), style: theme.dim },
@@ -657,15 +660,16 @@ export class ConsoleApp {
               if (member.inbound !== "accept") detail.push({ text: " " }, { text: member.inbound === "hold" ? "⏸" : "refuse", style: member.inbound === "hold" ? theme.warn : theme.bad });
               const label: TerminalLine = [
                 this.marker(selected, true), { text: "  " },
-                { text: archived ? "  " : member.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : member.state === "live" ? theme.ok : theme.warn },
+                { text: archived ? "  " : member.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || member.state === "gone" ? theme.warn : theme.ok },
                 { text: member.name, style: selected ? theme.brand : archived ? theme.dim : theme.agent },
               ];
               const detailWidth = detail.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
               const fill = pick(selected);
-              if (width < 6 + Math.min(3, terminalTextWidth(member.name)) + 1 + detailWidth) {
-                return [padSpans(label, width, fill), justify([], detail, width, fill)];
-              }
-              return [justify(label, detail, width, fill)];
+              const rows = width < 6 + Math.min(3, terminalTextWidth(member.name)) + 1 + detailWidth
+                ? [padSpans(label, width, fill), justify([], detail, width, fill)]
+                : [justify(label, detail, width, fill)];
+              if (failedPing) rows.push(justify([], [this.stateLabel(member)], width, fill));
+              return rows;
             },
           }];
         }),

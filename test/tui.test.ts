@@ -1578,7 +1578,7 @@ test("Ctrl+X closes only a selected session row after one-key confirmation and l
   await ui.press("ESCAPE");
   await ui.press("END");
   await ui.press("ENTER");
-  assert.ok(ui.rows().some((row) => row.includes("renamed") && row.includes("archived")), "closed conversation is reachable in the archive");
+  assert.ok(ui.rows().some((row) => truncateTerminalText(row, paneWidths(120)!.list).includes("renamed")), "closed conversation is reachable in the archive");
   assertWithin(ui);
 });
 
@@ -1692,7 +1692,10 @@ test("Ping sessions refreshes rows and external pongs and disconnection update a
   env = await startEnv({ pingTimeoutMs });
   const human = env.human();
   const hung = await env.adapter("omp", "ping-status-key", "worker", { autoPong: false });
+  await human.request("set_role", { name: "worker", role: "worker" });
+  await human.request("set_inbound", { name: "worker", mode: "hold" });
   const ui = await startConsole(120, 24);
+  const list = (): string[] => ui.rows().map((row) => truncateTerminalText(row, paneWidths(ui.size.columns)!.list));
   await ui.press("?");
   await ui.type("Ping sessions");
   const action = ui.press("ENTER");
@@ -1700,7 +1703,14 @@ test("Ping sessions refreshes rows and external pongs and disconnection update a
   env.clock.advance(pingTimeoutMs);
   env.daemon.sweep();
   await action;
-  assert.ok(ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "failed ping renders on the live session row");
+  await ui.resize(80, 24);
+  const failedRow = list().findIndex((row) => row.includes("not_responding"));
+  assert.ok(failedRow >= 0 && list().some((row) => row.includes("worker") && row.includes("●")), "failed ping stays visible with the live identity at 80 columns");
+  assert.ok(list().some((row) => row.includes("omp") && row.includes("wrk") && row.includes("⏸")), "ping metadata never displaces harness, role or inbound policy");
+  await ui.click(5, failedRow);
+  await ui.press("CTRL_X");
+  assert.ok(ui.rows().some((row) => row.includes(hung.session.id)), "ping detail row targets its stable identity");
+  await ui.press("n");
   assert.equal((await human.sync()).sessions.find((session) => session.id === hung.session.id)!.state, "live", "ping failure does not disconnect or close the session");
   assert.ok(!ui.rows().some((row) => row.includes("y confirm")), "Ping sessions never opens a destructive confirmation");
 
@@ -1708,21 +1718,21 @@ test("Ping sessions refreshes rows and external pongs and disconnection update a
   const probe = await hung.nextPing();
   await hung.client.request("pong", { pingId: probe.pingId });
   await external;
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "external response replaces cached failed status");
+  await ui.until(() => list().some((row) => row.includes("worker") && row.includes("●")) && !list().some((row) => row.includes("not_responding")), "external response replaces cached failed status");
 
   const failedAgain = human.request("ping", { sessionId: hung.session.id });
   await hung.nextPing();
   env.clock.advance(pingTimeoutMs);
   env.daemon.sweep();
   await failedAgain;
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("not_responding")), "external failed ping updates the connected console");
+  await ui.until(() => list().some((row) => row.includes("not_responding")), "external failed ping updates the connected console");
   const gone = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === hung.session.id);
   hung.client.close();
   await gone.event;
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("gone") && !row.includes("not_responding")), "disconnection clears cached ping");
+  await ui.until(() => list().some((row) => row.includes("worker") && row.includes("◌")) && !list().some((row) => row.includes("not_responding")), "disconnection clears cached ping");
   const revived = await env.adapter("omp", "ping-status-key", "worker");
   assert.equal(revived.session.id, hung.session.id);
-  await ui.until(() => ui.rows().some((row) => row.includes("worker") && row.includes("live") && !row.includes("not_responding")), "revival does not inherit a failed ping");
+  await ui.until(() => list().some((row) => row.includes("worker") && row.includes("●")) && !list().some((row) => row.includes("not_responding")), "revival does not inherit a failed ping");
   assertWithin(ui);
 });
 
@@ -1797,7 +1807,7 @@ test("purge all archives cancels safely and never enlarges the confirmed archive
   }, "confirmed archives purged");
   assert.ok(snapshot.sessions.some((s) => s.id === later.session.id && s.state === "removed"), "archive created after preview is not deleted");
   await ui.press("ENTER");
-  assert.ok(ui.rows().some((row) => row.includes("later") && row.includes("archived")), "unconfirmed archive remains visible");
+  assert.ok(ui.rows().some((row) => truncateTerminalText(row, paneWidths(120)!.list).includes("later")), "unconfirmed archive remains visible");
   assert.ok(!ui.rows().some((row) => /\b(alpha|beta)\b/.test(row)), "confirmed archive rows disappear");
   assertWithin(ui);
 });
@@ -1844,17 +1854,17 @@ test("Home and End reach list boundaries after a selected archive is hidden", as
   await ui.type("alpha");
   await ui.press("ENTER");
   await alpha.client.request("unregister");
-  await ui.until(() => list().some((row) => row.includes("alpha") && row.includes("archived")), "selected identity archived");
+  await ui.until(() => list().some((row) => row.includes("alpha") && !row.includes("●") && !row.includes("◌") && !row.includes("/ alpha")), "selected identity archived");
   await ui.press("ESCAPE");
   await ui.press("END");
   await ui.press("ENTER");
-  assert.ok(list().some((row) => row.includes("alpha") && row.includes("archived")), "End reaches the collapsed Archive heading");
+  assert.ok(list().some((row) => row.includes("alpha") && !row.includes("/ alpha")), "End reaches the collapsed archive heading");
 
   await ui.press("DOWN");
   await ui.press("?");
   await ui.type("Toggle archive");
   await ui.press("ENTER");
-  assert.ok(!list().some((row) => row.includes("alpha") && row.includes("archived")), "selected archive is hidden again");
+  assert.ok(!list().some((row) => row.includes("alpha")), "selected archive is hidden again");
   await ui.press("HOME");
   await ui.press("ENTER");
   await ui.until(() => ui.rows().some((row) => row.includes("Live boundary conversation")), "Home opens the first live session");
