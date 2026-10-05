@@ -28,8 +28,6 @@ type Sdk = {
   calls: string[];
   summarizeCalls: SummarizeCall[];
   prompts: { id: string; text: string }[];
-  /** Messages the plugin sent through the SDK log boundary. */
-  logs: string[];
   setMessages(next: OpencodeMessage[]): void;
   setSummarize(next: ((call: SummarizeCall) => Promise<SummarizeOutcome>) | undefined): void;
   /** Resolves once the named call has happened at least `n` times; the deterministic alternative to polling. */
@@ -104,7 +102,6 @@ function fakeSdk(withMethods = true): Sdk {
     calls,
     summarizeCalls,
     prompts,
-    logs,
     setMessages(next) {
       messages = next;
     },
