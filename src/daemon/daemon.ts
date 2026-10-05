@@ -10,6 +10,7 @@ import {
   type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
+import { DEFAULT_STALE_HOURS } from "../shared/sessions.js";
 import type { Db } from "../shared/sqlite.js";
 import { version } from "../shared/version.js";
 import { claudeFrame, parseEnvelopeReply, probe, replyAddr, writeLine } from "./claude.js";
@@ -31,6 +32,7 @@ export type DaemonOpts = {
   envelope?: boolean;
   historyDays?: number;
   defaultNameWords?: DefaultNameWords;
+  staleHours?: number;
   log?: (line: string) => void;
 };
 
@@ -324,6 +326,12 @@ export class Daemon {
       }
       case "rename":
         return this.opRename(c, p);
+      case "close":
+        this.requireHuman(this.sender(c, p), "close sessions");
+        return this.opClose(p);
+      case "purge":
+        this.requireHuman(this.sender(c, p), "purge archived conversations");
+        return this.opPurge(p);
       case "set_inbound": {
         this.requireHuman(this.sender(c, p), "change inbound policy");
         const mode = str(p, "mode", true) as Inbound;
@@ -428,12 +436,16 @@ export class Daemon {
       case "channel_list":
         return { channels: this.store.channelSummaries() };
       case "held": {
-        this.requireHuman(this.sender(c, p), "read held messages");
+        const sender = this.sender(c, p);
+        this.requireHuman(sender, "read held messages");
         const name = str(p, "name");
         const rows = name
           ? this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' AND to_name=? ORDER BY ord", name)
           : this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' ORDER BY ord");
-        return { messages: rows.map(toStored) };
+        return { messages: rows.map((row) => ({
+          ...this.store.withReplyState(toWire(row)),
+          status: row.status,
+        })) };
       }
       case "release": {
         this.requireHuman(this.sender(c, p), "release held messages");
@@ -451,7 +463,7 @@ export class Daemon {
         c.tail = true;
         return {};
       case "log":
-        return this.opLog(p);
+        return this.opLog(this.sender(c, p), p);
       default:
         throw new AsenqError("bad_request", `unknown op "${p.op}"`);
     }
@@ -511,7 +523,7 @@ export class Daemon {
       `SELECT * FROM messages WHERE ${scope.sql} AND thread=?${since.sql} ORDER BY ord`,
       ...scope.params, thread, ...since.params,
     );
-    return { messages: rows.map(toStored) };
+    return { messages: rows.map((row) => this.store.withReplyState(toStored(row), s.kind === "agent" ? s.session.id : undefined)) };
   }
   private unreadInbox(s: Sender): { sql: string; params: (string | number)[] } {
     if (s.kind === "agent") {
@@ -536,7 +548,7 @@ export class Daemon {
         `SELECT * FROM messages WHERE id=? AND ${scope.sql}`, id, ...scope.params,
       );
       if (!row) throw new AsenqError("bad_request", '"msgId" must be a retained direct message id for the caller');
-      return { messages: [toStored(row)], hasMore: false };
+      return { messages: [this.store.withReplyState(toStored(row), s.kind === "agent" ? s.session.id : undefined)], hasMore: false };
     }
     const limit = limitParam(p, 20, 200);
     const budget = integerParam(p, "max_chars");
@@ -579,7 +591,7 @@ export class Daemon {
     let chars = 0;
     for (const row of rows) {
       if (messages.length === limit) break;
-      const message = toStored(row);
+      const message = this.store.withReplyState(toStored(row), s.kind === "agent" ? s.session.id : undefined);
       if (budget !== undefined) {
         const size = JSON.stringify(message).length + 2;
         if (messages.length > 0 && chars + size > budget) break;
@@ -622,6 +634,8 @@ export class Daemon {
       channels,
       readStates: this.store.readStates(),
       sessionLastOrders: this.store.sessionLastOrders(),
+      sessionLastActivity: this.store.sessionLastActivity(),
+      staleHours: this.opts.staleHours ?? DEFAULT_STALE_HOURS,
     };
   }
 
@@ -671,7 +685,7 @@ export class Daemon {
     const hasMore = rows.length > limit;
     if (hasMore) rows.length = limit;
     rows.reverse();
-    return { messages: rows.map(toStored), hasMore };
+    return { messages: rows.map((row) => this.store.withReplyState(toStored(row))), hasMore };
   }
 
   private opReadState(p: Params): Result {
@@ -736,6 +750,61 @@ export class Daemon {
 
   // ---------------------------------------------------------------- sessions
 
+  private opClose(p: Params): Result {
+    const id = str(p, "identity", true);
+    const identity = this.store.identity(id);
+    if (!identity) throw new AsenqError("no_session", `no retained session ${id}`);
+    if (identity.closedAt !== undefined) return { session: identity };
+    const pending = this.store.db.all<MsgRow>(
+      "SELECT * FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY ord", id,
+    );
+    const session = this.store.closeIdentity(id, this.now());
+    this.delivery.delete(id);
+    this.lastSeen.delete(id);
+    const replyServer = this.replyServers.get(id);
+    if (replyServer) {
+      replyServer.close();
+      this.replyServers.delete(id);
+      rmSync(join(this.opts.replyDir, id + ".sock"), { force: true });
+    }
+    // Keep connection bindings: a closed agent connection must not become a human connection.
+    if (session.harness === "unknown") this.emit({ type: "retention" });
+    else this.emit({
+      type: "session", action: "removed", name: session.name, harness: session.harness,
+      ...(session.cwd ? { cwd: session.cwd } : {}), session,
+    });
+    for (const message of pending) {
+      this.setStatus(message.id, "expired", "target session closed by user");
+      this.inflight.get(message.id)?.settle({ ok: false, reason: "target session closed by user" });
+    }
+    return { session };
+  }
+
+  private opPurge(p: Params): Result {
+    if ((p.identity !== undefined) === (p.all !== undefined) || (p.all !== undefined && p.all !== true)) {
+      throw new AsenqError("bad_request", 'specify exactly one of "identity" or "all": true');
+    }
+    const identities = p.all === true
+      ? this.store.identities().filter((session) => session.state === "removed")
+      : [this.store.identity(str(p, "identity", true))];
+    for (const identity of identities) {
+      if (!identity) throw new AsenqError("no_session", `no retained session ${String(p.identity)}`);
+      if (identity.state !== "removed" || this.store.session(identity.id)) {
+        throw new AsenqError("bad_request", `session ${identity.id} is not archived`);
+      }
+    }
+    const purged = identities.map((identity) => identity!.id);
+    this.store.purgeIdentities(purged);
+    for (const [msgId, inflight] of this.inflight) {
+      if (!this.store.msg(msgId)) inflight.settle({ ok: false, reason: "conversation purged" });
+    }
+    for (const [envelopeId, msgId] of this.envelopeIds) {
+      if (!this.store.msg(msgId)) this.envelopeIds.delete(envelopeId);
+    }
+    if (purged.length > 0) this.emit({ type: "retention" });
+    return { purged };
+  }
+
   private publish(positioned: PositionedEvent): void {
     const push: Push = { push: "event", ...positioned };
     for (const c of this.conns) if (c.tail) c.write(push);
@@ -774,8 +843,9 @@ export class Daemon {
     harness: Harness, key: string, name: string | undefined, cwd: string | undefined, seed = key, identityId?: string,
     reason?: string,
   ): SessionRow {
-    const identity = identityId ? this.store.identity(identityId)
+    const candidate = identityId ? this.store.identity(identityId)
       : harness === "claude" ? undefined : this.store.identityByHarnessId(harness, key);
+    const identity = candidate?.closedAt === undefined ? candidate : undefined;
     const existing = identity && this.store.session(identity.id);
     if (existing) {
       const row = this.store.transaction(() => {
@@ -1004,7 +1074,7 @@ export class Daemon {
       let total = 0;
       const role = this.store.identity(row.id)?.role ?? undefined;
       for (const m of this.store.queuedFor(row.id)) {
-        const msg = toWire(m);
+        const msg = this.store.withReplyState(toWire(m), row.id);
         let text = renderInbound(msg, role);
         if (texts.length === 0 && text.length > POLL_BUDGET) {
           if (msg.file) text = renderInbound({ ...msg, thread: undefined, replyTo: undefined }, role);
@@ -1187,6 +1257,9 @@ export class Daemon {
   }
 
   private setStatus(msgId: string, status: MsgStatus, reason?: string, notify = true): void {
+    const current = this.store.msg(msgId);
+    if (!current || current.status === "expired"
+      || (current.status === status && (status === "delivered" || current.reason === (reason ?? null)))) return;
     const positioned = this.store.transaction(() => {
       this.store.db.run("UPDATE messages SET status=?, reason=?, updated_at=? WHERE id=?", status, reason ?? null, this.now(), msgId);
       const row = this.store.msg(msgId);
@@ -1220,6 +1293,8 @@ export class Daemon {
   }
 
   private failAttempt(row: MsgRow, reason: string): MsgStatus {
+    const current = this.store.msg(row.id);
+    if (!current || current.status !== "queued") return current?.status ?? "expired";
     const attempts = row.attempts + 1;
     this.store.db.run("UPDATE messages SET attempts=?, reason=?, updated_at=? WHERE id=?", attempts, reason, this.now(), row.id);
     if (attempts >= MAX_ATTEMPTS) {
@@ -1245,7 +1320,8 @@ export class Daemon {
     if (!row || row.status !== "queued") return row?.status ?? "failed";
     const target = row.to_session ? this.store.session(row.to_session) : undefined;
     if (!target || target.state !== "live") return "queued";
-    const text = renderInbound(toWire(row), this.store.identity(target.id)?.role ?? undefined);
+    const message = this.store.withReplyState(toWire(row), target.id);
+    const text = renderInbound(message, this.store.identity(target.id)?.role ?? undefined);
 
     if (target.harness === "claude") {
       if (!target.claude_socket) return "queued"; // picked up by the hook poll
@@ -1258,6 +1334,8 @@ export class Daemon {
         if (this.envelopeIds.size > 1000) this.envelopeIds.delete(this.envelopeIds.keys().next().value!);
       }
       const r = await writeLine(target.claude_socket, claudeFrame(text, envelope));
+      const current = this.store.msg(row.id);
+      if (!current || current.status !== "queued") return current?.status ?? "expired";
       if (r === "ok") {
         if (this.store.msg(row.id)?.status === "queued") this.setStatus(row.id, "delivered");
         return this.store.msg(row.id)?.status ?? "failed";
@@ -1282,10 +1360,11 @@ export class Daemon {
     };
     const timer = setTimeout(() => settle({ ok: false, reason: "ack timeout" }), this.ackTimeoutMs);
     this.inflight.set(row.id, { conn, timer, settle });
-    const push: Push = { push: "deliver", msg: toWire(row), text, session: target.id, key: target.key };
+    const push: Push = { push: "deliver", msg: message, text, session: target.id, key: target.key };
     conn.write(push);
     const ack = await promise;
-    if (this.store.msg(row.id)?.status !== "queued") return this.store.msg(row.id)!.status;
+    const current = this.store.msg(row.id);
+    if (!current || current.status !== "queued") return current?.status ?? "expired";
     if (ack.ok) {
       this.setStatus(row.id, "delivered");
       return "delivered";
@@ -1440,7 +1519,7 @@ export class Daemon {
     return { msgId: row.id };
   }
 
-  private opLog(p: Params): Result {
+  private opLog(s: Sender, p: Params): Result {
     const id = str(p, "msgId");
     const name = str(p, "name");
     const limit = limitParam(p, 50, 1000);
@@ -1457,6 +1536,9 @@ export class Daemon {
       rows = this.store.db.all<MsgRow>(
         "SELECT * FROM (SELECT * FROM messages ORDER BY ord DESC LIMIT ?) ORDER BY ord", limit);
     }
-    return { messages: rows.map((r) => ({ ...toWire(r), status: r.status, ...(r.reason ? { reason: r.reason } : {}) })) };
+    return { messages: rows.map((row) => ({
+      ...this.store.withReplyState(toWire(row), s.kind === "agent" ? s.session.id : undefined),
+      status: row.status, ...(row.reason ? { reason: row.reason } : {}),
+    })) };
   }
 }

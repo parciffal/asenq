@@ -33,6 +33,8 @@ export type FileReference = { path: string; summary: string; sha256: string; siz
 export type WireMsg = {
   id: string; from: string; to: string;
   kind?: Kind; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean;
+  /** The reply target is no longer retained or is not readable by this caller. */
+  replyToMissing?: boolean;
   text: string; file?: FileReference; createdAt: number;
 };
 
@@ -65,6 +67,7 @@ export type SessionIdentity = {
   role?: Role | null;
   createdAt: number;
   removedAt?: number;
+  closedAt?: number;
 };
 
 export type ChannelSummary = {
@@ -110,6 +113,9 @@ export type SyncResult = {
   readStates: ReadState[];
   /** Latest retained non-channel message order per stable session identity; absent means zero. */
   sessionLastOrders: Record<string, number>;
+  /** Durable direct activity: outgoing creation or first incoming delivery, excluding channel posts. */
+  sessionLastActivity: Record<string, number>;
+  staleHours: number;
 };
 
 /** Latest incoming human-inbox message from one sender; `sessionId` is absent for legacy name-only senders. */

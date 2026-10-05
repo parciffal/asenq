@@ -10,8 +10,9 @@ import { claudeFrame, parseEnvelopeReply, replyAddr } from "../src/daemon/claude
 import { Daemon } from "../src/daemon/daemon.js";
 import { AsenqClient } from "../src/shared/client.js";
 import { socketPath } from "../src/shared/paths.js";
-import { GRACE_MS, type SendResult, type StoredMessage, type TailEvent } from "../src/shared/protocol.js";
+import { GRACE_MS, type SendResult, type SessionIdentity, type StoredMessage, type TailEvent } from "../src/shared/protocol.js";
 import { renderInbound } from "../src/shared/render.js";
+import { isStaleSession } from "../src/shared/sessions.js";
 import { openDb } from "../src/shared/sqlite.js";
 import { isSession, isStatus, logOf, startEnv, type Delivery, type TestEnv } from "./helpers.js";
 
@@ -3276,4 +3277,413 @@ test("file references persist across database reopen and queued delivery never r
     if (previousHome === undefined) delete process.env.ASENQ_HOME;
     else process.env.ASENQ_HOME = previousHome;
   }
+});
+
+test("only the human can close stable identities; close expires held and in-flight messages exactly once", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "close-sender", "alpha");
+  const beta = await env.adapter("omp", "close-target", "beta", { autoAck: false });
+  await assert.rejects(alpha.client.request("close", { identity: beta.session.id }), { code: "bad_request" });
+  await assert.rejects(alpha.client.request("purge", { all: true }), { code: "bad_request" });
+  await assert.rejects(human.request("close", { identity: "beta" }), { code: "no_session" });
+  await assert.rejects(human.request("close", { identity: "s_unknown" }), { code: "no_session" });
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  const [held] = await send(alpha.client, "beta", "held until a human decides");
+  await human.request("set_inbound", { name: "beta", mode: "accept" });
+  const sending = send(alpha.client, "beta", "already in flight");
+  const delivery = await beta.nextDelivery();
+  const heldNotice = await env.watch((event) => event.type === "message"
+    && event.msg.from === "asenq" && event.msg.replyTo === held.msgId && event.status === "delivered");
+  const flightNotice = await env.watch((event) => event.type === "message"
+    && event.msg.from === "asenq" && event.msg.replyTo === delivery.msg.id && event.status === "delivered");
+  const closed = (await human.request("close", { identity: beta.session.id })).session as SessionIdentity;
+  assert.deepEqual([closed.id, closed.state, closed.closedAt], [beta.session.id, "removed", env.clock.now()]);
+  assert.equal((await sending)[0].status, "expired");
+  await heldNotice.event;
+  await flightNotice.event;
+  assert.equal((await logOf(human, held.msgId!)).status, "expired");
+  assert.equal((await logOf(human, delivery.msg.id)).status, "expired");
+  await beta.client.request("ack", { msgId: delivery.msg.id, ok: true });
+  await assert.rejects(human.request("release", { msgId: held.msgId }), { code: "bad_request" });
+  await assert.rejects(send(human, "beta", "closed name"), { code: "unknown_target" });
+  await assert.rejects(human.sendToSession(beta.session.id, "closed identity"), { code: "unknown_target" });
+  // The old transport stays agent-bound even though its registration has been removed.
+  await assert.rejects(beta.client.request("purge", { all: true }), { code: "not_registered" });
+  const beforeRepeat = await human.sync();
+  assert.deepEqual((await human.request("close", { identity: beta.session.id })).session, closed);
+  assert.equal((await human.sync()).watermark, beforeRepeat.watermark);
+  await env.daemon.retry();
+  assert.deepEqual(beta.deliveries.map((item) => item.msg.id), [delivery.msg.id]);
+  const notices = (await alpha.client.request("inbox")).messages as StoredMessage[];
+  assert.deepEqual(notices.map((message) => message.replyTo).sort(), [held.msgId, delivery.msg.id].sort());
+  assert.ok(notices.every((message) => message.from === "asenq" && message.status === "delivered"));
+});
+
+test("close of a non-terminal archive expires its retained queue and never revives its former names", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "archive-sender", "alpha");
+  const beta = await env.adapter("omp", "archive-target", "beta");
+  await beta.client.request("rename", { name: "renamed" });
+  const gone = await env.watch(isSession("gone", "renamed"));
+  beta.client.close();
+  await gone.event;
+  const [queued] = await send(alpha.client, "renamed", "waiting through automatic removal");
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const archived = (await human.sync()).sessions.find((session) => session.id === beta.session.id)!;
+  assert.equal(archived.state, "removed");
+  assert.equal(archived.closedAt, undefined);
+  const noticed = await env.watch((event) => event.type === "message"
+    && event.msg.from === "asenq" && event.msg.replyTo === queued.msgId && event.status === "delivered");
+  await human.request("close", { identity: beta.session.id });
+  await noticed.event;
+  assert.equal((await logOf(human, queued.msgId!)).status, "expired");
+  for (const name of ["beta", "renamed"]) {
+    await assert.rejects(send(human, name, "must not resolve terminal identity"), { code: "unknown_target" });
+  }
+  const replacement = await env.adapter("omp", "archive-target", "replacement");
+  assert.notEqual(replacement.session.id, beta.session.id);
+  assert.deepEqual(replacement.deliveries, []);
+});
+
+test("purge deletes only archived direct history and markers, retaining channel posts, activity and sender notices", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "purge-sender", "alpha");
+  const beta = await env.adapter("omp", "purge-archive", "beta", { autoAck: false });
+  const live = await env.adapter("omp", "purge-live", "live");
+  const [betaHuman] = await send(beta.client, "human", "archive human inbox");
+  const [unrelated] = await send(live.client, "human", "preserve this human inbox");
+  const channel = await beta.client.request("channel_send", { channel: "work", text: "keep this channel post" });
+  const betaScope = { scope: "session" as const, sessionId: beta.session.id };
+  await human.markUnread(betaScope);
+  const liveScope = { scope: "session" as const, sessionId: live.session.id };
+  await human.markUnread(liveScope);
+  const liveRead = await human.readState(liveScope);
+  const channelScope = { scope: "channel" as const, channel: "work" };
+  await human.markUnread(channelScope);
+  const channelRead = await human.readState(channelScope);
+  const sending = send(alpha.client, "beta", "expire then purge");
+  const delivery = await beta.nextDelivery();
+  const noticed = await env.watch((event) => event.type === "message"
+    && event.msg.from === "asenq" && event.msg.replyTo === delivery.msg.id && event.status === "delivered");
+  await human.request("close", { identity: beta.session.id });
+  assert.equal((await sending)[0].status, "expired");
+  await noticed.event;
+  const notice = ((await alpha.client.request("inbox")).messages as StoredMessage[])[0];
+  assert.equal(notice.replyTo, delivery.msg.id);
+  assert.equal(notice.replyToMissing, undefined);
+  const [reply] = await send(alpha.client, "human", "retained reply to the original", {
+    replyTo: delivery.msg.id, thread: "purged-reply",
+  });
+  const before = await human.sync();
+  const reset = await env.watch((event) => event.type === "retention");
+  assert.deepEqual((await human.request("purge", { identity: beta.session.id })).purged, [beta.session.id]);
+  await reset.event;
+  await beta.client.request("ack", { msgId: delivery.msg.id, ok: true });
+  await assert.rejects(logOf(human, betaHuman.msgId!), { code: "bad_request" });
+  await assert.rejects(logOf(human, delivery.msg.id), { code: "bad_request" });
+  await assert.rejects(human.historyPage(betaScope), { code: "no_session" });
+  await assert.rejects(human.readState(betaScope), { code: "no_session" });
+  const after = await human.sync();
+  assert.ok(!after.sessions.some((session) => session.id === beta.session.id));
+  assert.equal(after.sessionLastOrders[beta.session.id], undefined);
+  assert.equal(after.sessionLastActivity[beta.session.id], undefined);
+  assert.ok(!after.readStates.some((state) => state.scope.scope === "session" && state.scope.sessionId === beta.session.id));
+  assert.deepEqual(await human.readState(liveScope), liveRead);
+  assert.deepEqual(await human.readState(channelScope), channelRead);
+  assert.deepEqual((await human.inboxSummaries()).map((summary) => summary.latest.id), [reply.msgId, unrelated.msgId]);
+  assert.deepEqual((await human.historyPage(channelScope)).messages.map((message) => [message.id, message.from]),
+    [[channel.msgId, "beta"]]);
+  const retainedNotice = ((await alpha.client.request("inbox")).messages as StoredMessage[])[0];
+  assert.deepEqual([retainedNotice.id, retainedNotice.replyTo, retainedNotice.replyToMissing],
+    [notice.id, delivery.msg.id, true]);
+  const retainedReply = (await human.historyPage({ scope: "inbox" })).messages.find((message) => message.id === reply.msgId)!;
+  assert.deepEqual([retainedReply.replyTo, retainedReply.replyToMissing], [delivery.msg.id, true]);
+  const thread = (await human.request("thread_read", { thread: "purged-reply" })).messages as StoredMessage[];
+  assert.deepEqual(thread.map((message) => [message.id, message.replyToMissing]), [[reply.msgId, true]]);
+  for (const events of [await human.recentEvents(200), (await human.replay(0)).events]) {
+    assert.ok(!events.some(({ event }) => event.type === "session" && event.session.id === beta.session.id));
+    assert.ok(!events.some(({ event }) => event.type === "read"
+      && event.state.scope.scope === "session" && event.state.scope.sessionId === beta.session.id));
+    assert.ok(!events.some(({ event }) => event.type === "message" && event.msg.channel === undefined
+      && (event.msg.fromSessionId === beta.session.id || event.msg.toSessionId === beta.session.id)));
+    assert.ok(events.some(({ event }) => event.type === "message" && event.msg.id === channel.msgId));
+    assert.ok(events.some(({ event }) => event.type === "message" && event.msg.id === unrelated.msgId));
+    assert.ok(events.filter(({ event }) => event.type === "message" && event.msg.id === notice.id)
+      .every(({ event }) => event.type === "message" && event.msg.replyToMissing === true));
+  }
+  assert.ok(after.watermark > before.watermark);
+  const replay = await human.replay(before.watermark);
+  assert.deepEqual(replay.events.map((entry) => [entry.position, entry.event.type]), [[before.watermark + 1, "retention"]]);
+  await env.daemon.retry();
+  assert.deepEqual(beta.deliveries.map((item) => item.msg.id), [delivery.msg.id]);
+});
+
+test("purge validates exclusive parameters and never deletes live or gone identities", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const live = await env.adapter("omp", "purge-still-live", "live");
+  const gone = await env.adapter("omp", "purge-gone", "gone");
+  const archive = await env.adapter("omp", "purge-removed", "archive");
+  const closed = await env.adapter("omp", "purge-closed", "closed");
+  await archive.client.request("unregister");
+  await human.request("close", { identity: closed.session.id });
+  const disappeared = await env.watch(isSession("gone", "gone"));
+  gone.client.close();
+  await disappeared.event;
+  for (const params of [{}, { all: false }, { all: "true" }, { identity: archive.session.id, all: true }]) {
+    await assert.rejects(human.request("purge", params), { code: "bad_request" });
+  }
+  for (const identity of [live.session.id, gone.session.id]) {
+    await assert.rejects(human.request("purge", { identity }), { code: "bad_request" });
+  }
+  await assert.rejects(human.request("purge", { identity: "archive" }), { code: "no_session" });
+  assert.deepEqual(((await human.request("purge", { all: true })).purged as string[]).sort(),
+    [archive.session.id, closed.session.id].sort());
+  assert.deepEqual((await human.sync()).sessions.map((session) => [session.id, session.state]).sort(),
+    [[live.session.id, "live"], [gone.session.id, "gone"]].sort());
+  assert.deepEqual((await human.request("purge", { all: true })).purged, []);
+  await assert.rejects(human.request("purge", { identity: closed.session.id }), { code: "no_session" });
+});
+
+test("terminal omp close clears the harness association once, then the replacement identity revives normally", async () => {
+  env = await startEnv();
+  let human = env.human();
+  const original = await env.adapter("omp", "same-harness-id", "original");
+  await original.client.request("rename", { name: "old-role" });
+  await human.request("close", { identity: original.session.id });
+  const fresh = await env.adapter("omp", "same-harness-id", "fresh");
+  assert.notEqual(fresh.session.id, original.session.id);
+  assert.equal(fresh.session.name, "fresh");
+  await fresh.client.request("rename", { name: "new-role" });
+  await fresh.client.request("unregister");
+  assert.deepEqual((await env.adapter("omp", "same-harness-id", "ignored")).session,
+    { id: fresh.session.id, name: "new-role" });
+  // Re-closing the old archive must not delete the new association for the reused harness id.
+  await human.request("close", { identity: original.session.id });
+  await env.restart();
+  human = env.human();
+  const resumed = await env.adapter("omp", "same-harness-id", "ignored-after-restart");
+  assert.deepEqual(resumed.session, { id: fresh.session.id, name: "new-role" });
+  assert.equal((await human.sync()).sessions.find((session) => session.id === original.session.id)?.closedAt,
+    1_700_000_000_000);
+});
+
+test("Claude terminal close forgets both recorded session ids and transcript lineage, without breaking later revival", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const path = join(env.home, "terminal-lineage.jsonl");
+  writeFileSync(path, '{"type":"user","uuid":"terminal-lineage-message"}\n' + "{}\n".repeat(7));
+  const original = (await human.request("claude_hook", {
+    event: "start", key: "old-process", sessionId: "old-claude", name: "original",
+    transcriptPath: path, source: "startup",
+  })).session as { id: string; name: string };
+  const attached = env.human();
+  await attached.request("claude_attach", { sessionId: "old-claude" });
+  await assert.rejects(attached.request("close", { identity: original.id }), { code: "bad_request" });
+  await human.request("close", { identity: original.id });
+  await assert.rejects(attached.request("purge", { all: true }), { code: "not_registered" });
+  const fresh = (await human.request("claude_hook", {
+    event: "start", key: "new-process", sessionId: "new-claude", name: "fresh",
+    transcriptPath: path, source: "resume",
+  })).session as { id: string; name: string };
+  assert.notEqual(fresh.id, original.id);
+  assert.equal(fresh.name, "fresh");
+  await assert.rejects(env.human().request("claude_attach", { sessionId: "old-claude" }), { code: "no_session" });
+  await human.request("close", { identity: original.id });
+  await human.request("claude_hook", { event: "end", sessionId: "new-claude" });
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "start", key: "third-process", sessionId: "third-claude", name: "ignored",
+    transcriptPath: path, source: "resume",
+  })).session, fresh);
+  await human.request("claude_hook", { event: "end", sessionId: "third-claude" });
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "start", key: "fourth-process", sessionId: "new-claude", name: "ignored-again",
+  })).session, fresh);
+});
+
+test("stale boundaries use direct outgoing creation and first incoming delivery, ignoring held messages and channel posts", async () => {
+  env = await startEnv({ staleHours: 2 });
+  const human = env.human();
+  const alpha = await env.adapter("omp", "stale-sender", "alpha");
+  const beta = await env.adapter("omp", "stale-target", "beta");
+  const idle = await env.adapter("omp", "stale-idle", "idle");
+  const created = env.clock.now();
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  env.clock.advance(3600_000);
+  const [held] = await send(alpha.client, "beta", "not incoming activity until delivered");
+  await beta.client.request("channel_send", { channel: "work", text: "not direct activity" });
+  let synced = await human.sync();
+  assert.equal(synced.staleHours, 2);
+  assert.equal(synced.sessionLastActivity[alpha.session.id], created + 3600_000);
+  assert.equal(synced.sessionLastActivity[beta.session.id], undefined);
+  assert.equal(synced.sessionLastActivity[idle.session.id], undefined);
+  env.clock.advance(3600_000 - 1);
+  const betaIdentity = synced.sessions.find((session) => session.id === beta.session.id)!;
+  assert.equal(isStaleSession(betaIdentity, undefined, env.clock.now(), synced.staleHours), false);
+  env.clock.advance(1);
+  assert.equal(isStaleSession(betaIdentity, undefined, env.clock.now(), synced.staleHours), true);
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+  const deliveredAt = env.clock.now();
+  synced = await human.sync();
+  assert.equal(synced.sessionLastActivity[beta.session.id], deliveredAt);
+  env.clock.advance(3600_000);
+  await beta.client.request("ack", { msgId: held.msgId, ok: true });
+  assert.equal((await human.sync()).sessionLastActivity[beta.session.id], deliveredAt);
+  env.clock.advance(3600_000 - 1);
+  assert.equal(isStaleSession(betaIdentity, deliveredAt, env.clock.now(), 2), false);
+  env.clock.advance(1);
+  assert.equal(isStaleSession(betaIdentity, deliveredAt, env.clock.now(), 2), true);
+  const goneEvent = await env.watch(isSession("gone", "idle"));
+  idle.client.close();
+  await goneEvent.event;
+  const goneIdentity = (await human.sync()).sessions.find((session) => session.id === idle.session.id)!;
+  assert.equal(isStaleSession(goneIdentity, env.clock.now(), env.clock.now(), 100), true);
+  await human.request("close", { identity: idle.session.id });
+  const removedIdentity = (await human.sync()).sessions.find((session) => session.id === idle.session.id)!;
+  assert.equal(isStaleSession(removedIdentity, undefined, env.clock.now(), 0), false);
+});
+
+test("offline incoming activity starts at late delivery, never queue creation", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const beta = await env.adapter("omp", "late-delivery", "beta");
+  const gone = await env.watch(isSession("gone", "beta"));
+  beta.client.close();
+  await gone.event;
+  env.clock.advance(3600_000);
+  const [queued] = await send(human, "beta", "late activity");
+  assert.equal(queued.status, "queued");
+  assert.equal((await human.sync()).sessionLastActivity[beta.session.id], undefined);
+  env.clock.advance(12 * 3600_000);
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const resumed = await env.adapter("omp", "late-delivery", "ignored");
+  assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
+  await delivered.event;
+  const synced = await human.sync();
+  assert.equal(synced.sessionLastActivity[beta.session.id], env.clock.now());
+  assert.equal(isStaleSession(synced.sessions.find((session) => session.id === beta.session.id)!,
+    synced.sessionLastActivity[beta.session.id], env.clock.now(), synced.staleHours), false);
+});
+
+test("direct activity survives message retention and database reopen with a threshold longer than history retention", async () => {
+  env = await startEnv({ historyDays: 1, staleHours: 96 });
+  let human = env.human();
+  const alpha = await env.adapter("omp", "durable-activity", "alpha");
+  const created = env.clock.now();
+  env.clock.advance(3 * 86_400_000);
+  await send(alpha.client, "human", "direct activity at day three");
+  const activeAt = env.clock.now();
+  env.clock.advance(2 * 86_400_000);
+  env.daemon.prune();
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: alpha.session.id })).messages, []);
+  await env.restart();
+  human = env.human();
+  const resumed = await env.adapter("omp", "durable-activity", "ignored");
+  assert.equal(resumed.session.id, alpha.session.id);
+  const synced = await human.sync();
+  const session = synced.sessions.find((identity) => identity.id === alpha.session.id)!;
+  assert.equal(synced.sessionLastActivity[session.id], activeAt);
+  assert.equal(session.createdAt, created);
+  assert.equal(isStaleSession(session, activeAt, env.clock.now(), synced.staleHours), false);
+  env.clock.advance(2 * 86_400_000 - 1);
+  assert.equal(isStaleSession(session, activeAt, env.clock.now(), synced.staleHours), false);
+  env.clock.advance(1);
+  assert.equal(isStaleSession(session, activeAt, env.clock.now(), synced.staleHours), true);
+});
+
+test("reply availability treats private and missing targets identically for agents, while human history is authoritative", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "reply-reader", "alpha");
+  const beta = await env.adapter("omp", "reply-private-sender", "beta");
+  const gamma = await env.adapter("omp", "reply-private-target", "gamma");
+  const [privateMessage] = await send(beta.client, "gamma", "private beta to gamma");
+  const [privateReply] = await send(alpha.client, "human", "reply to private id", {
+    replyTo: privateMessage.msgId, thread: "availability",
+  });
+  const [missingReply] = await send(alpha.client, "human", "reply to absent id", {
+    replyTo: "m_not_retained", thread: "availability",
+  });
+  const agentThread = (await alpha.client.request("thread_read", { thread: "availability" })).messages as StoredMessage[];
+  assert.deepEqual(agentThread.map((message) => [message.id, message.replyToMissing]),
+    [[privateReply.msgId, true], [missingReply.msgId, true]]);
+  const humanThread = (await human.request("thread_read", { thread: "availability" })).messages as StoredMessage[];
+  assert.deepEqual(humanThread.map((message) => [message.id, message.replyToMissing]),
+    [[privateReply.msgId, undefined], [missingReply.msgId, true]]);
+  const [incomingPrivate] = await send(human, "alpha", "incoming reply to inaccessible id", { replyTo: privateMessage.msgId });
+  const [incomingMissing] = await send(human, "alpha", "incoming reply to missing id", { replyTo: "m_not_retained" });
+  const inbox = (await alpha.client.request("inbox")).messages as StoredMessage[];
+  assert.deepEqual(inbox.map((message) => [message.id, message.replyToMissing]),
+    [[incomingMissing.msgId, true], [incomingPrivate.msgId, true]]);
+});
+
+test("purge settles delivery still waiting on a non-terminal removed transport without restoring its deleted message", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "purge-flight-sender", "alpha");
+  const beta = await env.adapter("omp", "purge-flight-target", "beta", { autoAck: false });
+  const sending = send(alpha.client, "beta", "purged while awaiting adapter ack");
+  const delivery = await beta.nextDelivery();
+  await beta.client.request("unregister");
+  assert.equal((await logOf(human, delivery.msg.id)).status, "queued");
+  assert.deepEqual((await human.request("purge", { identity: beta.session.id })).purged, [beta.session.id]);
+  assert.equal((await sending)[0].status, "expired");
+  await beta.client.request("ack", { msgId: delivery.msg.id, ok: true });
+  await env.daemon.retry();
+  await assert.rejects(logOf(human, delivery.msg.id), { code: "bad_request" });
+  assert.deepEqual(beta.deliveries.map((item) => item.msg.id), [delivery.msg.id]);
+  assert.deepEqual((await alpha.client.request("inbox")).messages, []);
+});
+
+test("purging an old terminal identity leaves the replacement harness association intact", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const old = await env.adapter("omp", "purged-reused-key", "old");
+  await human.request("close", { identity: old.session.id });
+  const replacement = await env.adapter("omp", "purged-reused-key", "replacement");
+  await human.request("purge", { identity: old.session.id });
+  await replacement.client.request("unregister");
+  assert.deepEqual((await env.adapter("omp", "purged-reused-key", "ignored")).session, replacement.session);
+  await assert.rejects(human.historyPage({ scope: "session", sessionId: old.session.id }), { code: "no_session" });
+});
+
+test("late Claude lineage carries durable provisional direct activity after its original messages were retained away", async () => {
+  env = await startEnv({ historyDays: 1, staleHours: 96 });
+  const human = env.human();
+  const originalPath = join(env.home, "activity-ancestor.jsonl");
+  const latePath = join(env.home, "activity-late.jsonl");
+  const head = '{"type":"user","uuid":"activity-lineage-message"}\n' + "{}\n".repeat(7);
+  writeFileSync(originalPath, head);
+  const ancestor = (await human.request("claude_hook", {
+    event: "start", key: "activity-original", sessionId: "activity-original", name: "ancestor",
+    transcriptPath: originalPath, source: "startup",
+  })).session as { id: string; name: string };
+  await send(human, ancestor.name, "retain the ancestor while lineage arrives");
+  await human.request("claude_hook", { event: "end", sessionId: "activity-original" });
+  const provisional = (await human.request("claude_hook", {
+    event: "start", key: "activity-provisional", sessionId: "activity-provisional", name: "provisional",
+    transcriptPath: latePath, source: "resume",
+  })).session as { id: string; name: string };
+  assert.notEqual(provisional.id, ancestor.id);
+  const attached = env.human();
+  await attached.request("claude_attach", { sessionId: "activity-provisional" });
+  env.clock.advance(3600_000);
+  await send(attached, "human", "provisional direct activity");
+  const activeAt = env.clock.now();
+  env.clock.advance(2 * 86_400_000);
+  env.daemon.prune();
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: provisional.id })).messages, []);
+  writeFileSync(latePath, head);
+  assert.deepEqual((await human.request("claude_hook", {
+    event: "reconcile", sessionId: "activity-provisional", transcriptPath: latePath,
+  })).session, ancestor);
+  const synced = await human.sync();
+  assert.equal(synced.sessionLastActivity[ancestor.id], activeAt);
+  assert.equal(synced.sessionLastActivity[provisional.id], undefined);
+  assert.equal(isStaleSession(synced.sessions.find((session) => session.id === ancestor.id)!,
+    activeAt, env.clock.now(), synced.staleHours), false);
 });

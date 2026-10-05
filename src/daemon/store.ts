@@ -20,7 +20,8 @@ CREATE INDEX IF NOT EXISTS messages_pending ON messages(to_session, status);
 CREATE TABLE IF NOT EXISTS session_identities(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
   cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL, role TEXT,
-  created_at INTEGER NOT NULL, removed_at INTEGER, inbox_position INTEGER NOT NULL DEFAULT 0);
+  created_at INTEGER NOT NULL, removed_at INTEGER, closed_at INTEGER, last_direct_at INTEGER,
+  inbox_position INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS session_harness_ids(
   harness TEXT NOT NULL, kind TEXT NOT NULL, harness_id TEXT NOT NULL, identity_id TEXT NOT NULL,
   PRIMARY KEY(harness,kind,harness_id));
@@ -60,6 +61,7 @@ export type MsgRow = {
 type IdentityRow = {
   id: string; harness: Harness | "unknown"; name: string; previous_names: string; cwd: string | null;
   inbound: Inbound; state: SessionState; role: Role | null; created_at: number; removed_at: number | null;
+  closed_at: number | null; last_direct_at: number | null;
 };
 
 type EndpointRow = {
@@ -106,6 +108,7 @@ function toIdentity(r: IdentityRow): SessionIdentity {
     role: r.role,
     createdAt: r.created_at,
     ...(r.removed_at === null ? {} : { removedAt: r.removed_at }),
+    ...(r.closed_at === null ? {} : { closedAt: r.closed_at }),
   };
 }
 
@@ -128,6 +131,7 @@ export class Store {
     this.initializeInboxPositions();
     this.migrateIdentityRole();
     this.migrateChannels();
+    this.initializeDirectActivity();
   }
 
   transaction<T>(fn: () => T): T {
@@ -151,6 +155,44 @@ export class Store {
       "INSERT INTO protocol_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
       key, value,
     );
+  }
+
+  private initializeDirectActivity(): void {
+    const columns = this.db.all<{ name: string }>("PRAGMA table_info(session_identities)");
+    for (const name of ["closed_at", "last_direct_at"]) {
+      if (!columns.some((column) => column.name === name)) {
+        this.db.exec(`ALTER TABLE session_identities ADD COLUMN ${name} INTEGER`);
+      }
+    }
+    if (this.meta("direct_activity_rollout") !== undefined) return;
+    this.transaction(() => {
+      this.db.run(
+        `UPDATE session_identities SET last_direct_at=(
+           SELECT max(at) FROM (
+             SELECT from_session AS id,created_at AS at FROM messages WHERE channel IS NULL
+             UNION ALL
+             SELECT to_session AS id,updated_at AS at FROM messages WHERE channel IS NULL AND status='delivered'
+           ) WHERE id=session_identities.id
+         )`,
+      );
+      this.setMeta("direct_activity_rollout", 1);
+    });
+  }
+
+  private recordDirectActivity(id: string | null, at: number): void {
+    if (id === null) return;
+    this.db.run(
+      "UPDATE session_identities SET last_direct_at=max(COALESCE(last_direct_at,?),?) WHERE id=?",
+      at, at, id,
+    );
+  }
+
+  sessionLastActivity(): Record<string, number> {
+    const activity: Record<string, number> = {};
+    for (const row of this.db.all<{ id: string; last_direct_at: number }>(
+      "SELECT id,last_direct_at FROM session_identities WHERE last_direct_at IS NOT NULL",
+    )) activity[row.id] = row.last_direct_at;
+    return activity;
   }
 
   private migrateMessageAction(): void {
@@ -358,6 +400,7 @@ export class Store {
     if (row.channel !== null || row.status !== "delivered" || row.delivery_seq != null) return;
     row.delivery_seq = this.nextDeliverySequence();
     this.db.run("UPDATE messages SET delivery_seq=? WHERE id=?", row.delivery_seq, row.id);
+    this.recordDirectActivity(row.to_session, row.updated_at);
   }
 
   session(id: string): SessionRow | undefined {
@@ -376,11 +419,12 @@ export class Store {
     const row = this.db.get<IdentityRow>(
       `SELECT session_identities.* FROM session_identities JOIN session_harness_ids
        ON session_harness_ids.identity_id=session_identities.id
-       WHERE session_harness_ids.harness=? AND kind=? AND harness_id=?`,
+       WHERE session_harness_ids.harness=? AND kind=? AND harness_id=? AND closed_at IS NULL`,
       harness, kind, harnessId,
     );
     return row && toIdentity(row);
   }
+
 
   sessionByClaudeId(sessionId: string): SessionRow | undefined {
     const identity = this.identityByHarnessId("claude", sessionId, "session");
@@ -404,7 +448,8 @@ export class Store {
     const ids = new Set<string>();
     for (const fingerprint of fingerprints) {
       for (const row of this.db.all<{ identity_id: string }>(
-        "SELECT identity_id FROM claude_lineage WHERE fingerprint=?", fingerprint,
+        `SELECT identity_id FROM claude_lineage JOIN session_identities ON session_identities.id=identity_id
+         WHERE fingerprint=? AND closed_at IS NULL`, fingerprint,
       )) if (row.identity_id !== exclude) ids.add(row.identity_id);
     }
     return [...ids].sort().map((id) => this.identity(id)!).filter((identity) => identity?.harness === "claude");
@@ -431,6 +476,11 @@ export class Store {
         `UPDATE session_identities SET inbox_position=max(inbox_position,
          (SELECT inbox_position FROM session_identities WHERE id=?)) WHERE id=?`,
         provisionalId, ancestorId,
+      );
+      this.db.run(
+        `UPDATE session_identities SET last_direct_at=(
+         SELECT max(last_direct_at) FROM session_identities WHERE id IN (?,?)) WHERE id=?`,
+        provisionalId, ancestorId, ancestorId,
       );
       this.db.run("UPDATE messages SET from_session=? WHERE from_session=?", ancestorId, provisionalId);
       this.db.run("UPDATE messages SET to_session=? WHERE to_session=?", ancestorId, provisionalId);
@@ -465,6 +515,14 @@ export class Store {
     });
   }
 
+  claudeIds(identityId: string): string[] {
+    return this.db.all<{ harness_id: string }>(
+      "SELECT harness_id FROM session_harness_ids WHERE identity_id=? AND harness='claude' AND kind='session' ORDER BY rowid",
+      identityId,
+    ).map((row) => row.harness_id);
+  }
+
+
   sessions(): SessionRow[] {
     return this.db.all<SessionRow>("SELECT * FROM sessions ORDER BY created_at");
   }
@@ -483,6 +541,7 @@ export class Store {
   }
 
   syncIdentity(row: SessionRow): SessionIdentity {
+    if (this.identity(row.id)?.closedAt !== undefined) throw new Error(`cannot revive closed session ${row.id}`);
     this.db.run(
       `INSERT INTO session_identities(id,harness,name,previous_names,cwd,inbound,state,created_at,removed_at,inbox_position)
        VALUES(?,?,?,'[]',?,?,?, ?,NULL,?)
@@ -520,8 +579,69 @@ export class Store {
     return this.identity(id)!;
   }
 
+  /** Terminal closure and identity-association deletion commit together. */
+  closeIdentity(id: string, at: number): SessionIdentity {
+    return this.transaction(() => {
+      this.db.run(
+        "UPDATE session_identities SET state='removed',removed_at=COALESCE(removed_at,?),closed_at=? WHERE id=? AND closed_at IS NULL",
+        at, at, id,
+      );
+      this.db.run("DELETE FROM sessions WHERE id=?", id);
+      this.db.run("DELETE FROM session_harness_ids WHERE identity_id=?", id);
+      this.db.run("DELETE FROM claude_lineage WHERE identity_id=?", id);
+      return this.identity(id)!;
+    });
+  }
+
+  purgeIdentities(ids: string[]): void {
+    this.transaction(() => {
+      for (const id of ids) {
+        const messages = new Set(this.db.all<{ id: string }>(
+          "SELECT id FROM messages WHERE channel IS NULL AND (from_session=? OR to_session=?)", id, id,
+        ).map((row) => row.id));
+        for (const row of this.db.all<{ position: number; event_json: string }>(
+          "SELECT position,event_json FROM protocol_events",
+        )) {
+          const event = JSON.parse(row.event_json) as TailEvent;
+          const belongs = event.type === "session" ? event.session.id === id
+            : event.type === "read" ? event.state.scope.scope === "session" && event.state.scope.sessionId === id
+            : event.type === "message" ? event.msg.channel === undefined && (
+              messages.has(event.msg.id) || event.msg.fromSessionId === id || event.msg.toSessionId === id
+            ) : false;
+          if (belongs) this.db.run("DELETE FROM protocol_events WHERE position=?", row.position);
+        }
+        this.db.run("DELETE FROM messages WHERE channel IS NULL AND (from_session=? OR to_session=?)", id, id);
+        this.db.run("DELETE FROM human_read_positions WHERE scope='session' AND stream_key=?", id);
+        this.db.run("DELETE FROM session_harness_ids WHERE identity_id=?", id);
+        this.db.run("DELETE FROM claude_lineage WHERE identity_id=?", id);
+        this.db.run("DELETE FROM session_identities WHERE id=?", id);
+      }
+    });
+  }
+
   msg(id: string): MsgRow | undefined {
     return this.db.get<MsgRow>("SELECT * FROM messages WHERE id=?", id);
+  }
+
+  withReplyState<T extends WireMsg>(message: T, sessionId?: string): T {
+    if (!message.replyTo) return message;
+    const target = sessionId === undefined
+      ? this.db.get<{ one: number }>("SELECT 1 AS one FROM messages WHERE id=? AND channel IS NULL", message.replyTo)
+      : this.db.get<{ one: number }>(
+        `SELECT 1 AS one FROM messages WHERE id=? AND channel IS NULL
+         AND (from_session=? OR (to_session=? AND status IN ('delivered','queued')))`,
+        message.replyTo, sessionId, sessionId,
+      );
+    const { replyToMissing: _previous, ...retained } = message;
+    return { ...retained, ...(target ? {} : { replyToMissing: true }) } as T;
+  }
+
+  private projectEvent(row: { position: number; event_json: string }): PositionedEvent {
+    const event = JSON.parse(row.event_json) as TailEvent;
+    return {
+      position: row.position,
+      event: event.type === "message" ? { ...event, msg: this.withReplyState(event.msg) } : event,
+    };
   }
 
   queuedFor(sessionId: string): MsgRow[] {
@@ -547,6 +667,10 @@ export class Store {
       row.id, row.from_name, row.from_session, row.to_name, row.to_session, row.channel, row.text, row.file ?? null, row.kind, row.action ?? null, row.thread, row.reply_to,
       row.done, row.status, row.reason, row.attempts, row.created_at, row.updated_at, row.ord, row.delivery_seq,
     );
+    if (row.channel === null) {
+      this.recordDirectActivity(row.from_session, row.created_at);
+      if (row.status === "delivered") this.recordDirectActivity(row.to_session, row.updated_at);
+    }
     return row;
   }
 
@@ -572,7 +696,7 @@ export class Store {
     return this.db.all<{ position: number; event_json: string }>(
       "SELECT position,event_json FROM protocol_events WHERE position>? ORDER BY position LIMIT ?",
       position, limit,
-    ).map((row) => ({ position: row.position, event: JSON.parse(row.event_json) as TailEvent }));
+    ).map((row) => this.projectEvent(row));
   }
 
   pruneEvents(cutoff: number): void {
@@ -671,7 +795,7 @@ export class Store {
       return {
         ...(identity ? { sessionId: identity.id } : {}),
         name: identity?.name ?? row.from_name,
-        latest: toStored(row),
+        latest: this.withReplyState(toStored(row)),
       };
     });
   }
@@ -681,7 +805,7 @@ export class Store {
     return this.db.all<{ position: number; event_json: string }>(
       "SELECT * FROM (SELECT position,event_json FROM protocol_events ORDER BY position DESC LIMIT ?) ORDER BY position",
       limit,
-    ).map((row) => ({ position: row.position, event: JSON.parse(row.event_json) as TailEvent }));
+    ).map((row) => this.projectEvent(row));
   }
 
   ensureRead(scope: ReadScope): ReadState {
