@@ -6,7 +6,7 @@ import type {
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
 import {
-  activitySpans, clipSpans, editorLayout, ellipsize, formatTime, isImportantEvent, justify, layoutTranscript,
+  activitySpans, clipSpans, editorLayout, ellipsize, formatTime, harnessShortName, isImportantEvent, justify, layoutTranscript,
   maxTop, padSpans, paneWidths, stepGrapheme, theme, viewportAt, viewportTop,
   type ActivityFilter, type TranscriptLayout, type Viewport,
 } from "./layout.js";
@@ -461,9 +461,13 @@ export class ConsoleApp {
         rows: (width, selected, focused) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
+          const right = [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)];
+          const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - 1);
+          const harness = ellipsize(harnessShortName(s.harness), harnessWidth);
+          if (harness) right.unshift({ text: `${harness} `, style: theme.dim });
           return [justify(
             [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])],
-            [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)],
+            right,
             width, pick(selected, focused),
           )];
         },
