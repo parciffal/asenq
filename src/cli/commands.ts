@@ -144,7 +144,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
     }
     case "inbox": {
       const r = await client.request("inbox", { name: "human" });
-      const msgs = r.messages as LoggedMsg[];
+      const msgs = (r.messages as LoggedMsg[]).reverse();
       if (msgs.length === 0) out("no messages");
       for (const m of msgs) {
         out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}` : ""}${m.done ? " · done" : ""}`);

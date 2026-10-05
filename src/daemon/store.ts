@@ -14,12 +14,12 @@ CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
   channel TEXT, text TEXT NOT NULL, kind TEXT, thread TEXT, reply_to TEXT,
   done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ord INTEGER);
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ord INTEGER, delivery_seq INTEGER);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(to_session, status);
 CREATE TABLE IF NOT EXISTS session_identities(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
   cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
-  created_at INTEGER NOT NULL, removed_at INTEGER);
+  created_at INTEGER NOT NULL, removed_at INTEGER, inbox_position INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS human_read_positions(
   scope TEXT NOT NULL, stream_key TEXT NOT NULL, position INTEGER NOT NULL,
   reminder INTEGER, version INTEGER NOT NULL DEFAULT 0,
@@ -40,7 +40,7 @@ export type MsgRow = {
   id: string; from_name: string; from_session: string | null; to_name: string; to_session: string | null;
   channel: string | null; text: string; kind: Kind | null; thread: string | null; reply_to: string | null;
   done: number; status: MsgStatus; reason: string | null; attempts: number;
-  created_at: number; updated_at: number; ord: number;
+  created_at: number; updated_at: number; ord: number; delivery_seq?: number | null;
 };
 
 type IdentityRow = {
@@ -98,6 +98,7 @@ export class Store {
     this.migrateMessageOrder();
     this.backfillIdentities();
     this.initializeReadPositions();
+    this.initializeInboxPositions();
   }
 
   transaction<T>(fn: () => T): T {
@@ -236,6 +237,48 @@ export class Store {
     });
   }
 
+  private initializeInboxPositions(): void {
+    const columns = this.db.all<{ name: string }>("PRAGMA table_info(session_identities)");
+    if (!columns.some((column) => column.name === "inbox_position")) {
+      this.db.exec("ALTER TABLE session_identities ADD COLUMN inbox_position INTEGER NOT NULL DEFAULT 0");
+    }
+    const messageColumns = this.db.all<{ name: string }>("PRAGMA table_info(messages)");
+    if (!messageColumns.some((column) => column.name === "delivery_seq")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN delivery_seq INTEGER");
+    }
+    this.transaction(() => {
+      const rollout = this.meta("delivery_sequence_rollout") === undefined;
+      if (rollout) {
+        this.db.run("UPDATE messages SET delivery_seq=ord WHERE channel IS NULL AND status='delivered' AND delivery_seq IS NULL");
+      }
+      const maximum = Number(this.db.get<{ n: number }>(
+        "SELECT COALESCE(max(delivery_seq),0) AS n FROM messages",
+      )?.n ?? 0);
+      const watermark = Math.max(this.deliveryWatermark(), maximum);
+      this.setMeta("delivery_sequence", watermark);
+      if (rollout) {
+        this.db.run("UPDATE session_identities SET inbox_position=?", watermark);
+        this.setMeta("delivery_sequence_rollout", 1);
+      }
+    });
+  }
+
+  deliveryWatermark(): number {
+    return this.meta("delivery_sequence") ?? 0;
+  }
+
+  private nextDeliverySequence(): number {
+    const sequence = this.deliveryWatermark() + 1;
+    this.setMeta("delivery_sequence", sequence);
+    return sequence;
+  }
+
+  stampDelivery(row: MsgRow): void {
+    if (row.channel !== null || row.status !== "delivered" || row.delivery_seq != null) return;
+    row.delivery_seq = this.nextDeliverySequence();
+    this.db.run("UPDATE messages SET delivery_seq=? WHERE id=?", row.delivery_seq, row.id);
+  }
+
   session(id: string): SessionRow | undefined {
     return this.db.get<SessionRow>("SELECT * FROM sessions WHERE id=?", id);
   }
@@ -273,10 +316,10 @@ export class Store {
 
   syncIdentity(row: SessionRow): SessionIdentity {
     this.db.run(
-      `INSERT INTO session_identities(id,harness,name,previous_names,cwd,inbound,state,created_at,removed_at)
-       VALUES(?,?,?,'[]',?,?,?, ?,NULL)
+      `INSERT INTO session_identities(id,harness,name,previous_names,cwd,inbound,state,created_at,removed_at,inbox_position)
+       VALUES(?,?,?,'[]',?,?,?, ?,NULL,?)
        ON CONFLICT(id) DO UPDATE SET name=excluded.name,cwd=excluded.cwd,inbound=excluded.inbound,state=excluded.state,removed_at=NULL`,
-      row.id, row.harness, row.name, row.cwd, row.inbound, row.state, row.created_at,
+      row.id, row.harness, row.name, row.cwd, row.inbound, row.state, row.created_at, this.deliveryWatermark(),
     );
     this.ensureRead({ scope: "session", sessionId: row.id });
     return this.identity(row.id)!;
@@ -323,11 +366,12 @@ export class Store {
     const order = (this.meta("message_order") ?? 0) + 1;
     this.setMeta("message_order", order);
     row.ord = order;
+    row.delivery_seq = row.channel === null && row.status === "delivered" ? this.nextDeliverySequence() : null;
     this.db.run(
-      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO messages(id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,done,status,reason,attempts,created_at,updated_at,ord,delivery_seq)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       row.id, row.from_name, row.from_session, row.to_name, row.to_session, row.channel, row.text, row.kind, row.thread, row.reply_to,
-      row.done, row.status, row.reason, row.attempts, row.created_at, row.updated_at, row.ord,
+      row.done, row.status, row.reason, row.attempts, row.created_at, row.updated_at, row.ord, row.delivery_seq,
     );
     return row;
   }

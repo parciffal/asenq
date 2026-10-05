@@ -40,8 +40,25 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_inbox",
     label: "Asenq Inbox",
-    description: "Show the most recent asenq messages sent to this session, including ones already shown to you.",
-    params: {},
+    description: "Read delivered unread direct messages oldest delivery first, exactly once through plain unread reads, and advance this session's durable inbox delivery position. Held or queued messages become unread only when delivered. Filtered or unread_only=false reads do not advance it. Output is capped at 16,000 characters except explicit full-text id lookup.",
+    params: {
+      id: { type: "string", optional: true, description: "Recover one full, uncapped sent or received message by id; overrides all other filters and never advances the inbox" },
+      limit: { type: "integer", optional: true, min: 1, max: 200, description: "Maximum messages (default 20)" },
+      since: { type: "string", optional: true, description: "Exclusive newer-than cursor: ISO timestamp, decimal Unix milliseconds, or retained message id" },
+      before: { type: "string", optional: true, description: "Exclusive older-than cursor: ISO timestamp, decimal Unix milliseconds, or retained message id" },
+      thread: { type: "string", optional: true, description: "Only messages with this exact thread label" },
+      from: { type: "string", optional: true, description: "Only messages from this sender name" },
+      unread_only: { type: "boolean", optional: true, description: "Only delivered unread messages (default true); false reads recent history newest creation first" },
+    },
+  },
+  {
+    name: "asenq_thread_read",
+    label: "Asenq Thread Read",
+    description: "Read the full retained direct-message thread involving this caller, sent and received, in durable oldest-first order. Does not advance the inbox position.",
+    params: {
+      thread: { type: "string", description: "Exact thread label" },
+      since: { type: "string", optional: true, description: "Exclusive newer-than cursor: ISO timestamp, decimal Unix milliseconds, or retained message id" },
+    },
   },
   {
     name: "asenq_rename",
@@ -89,6 +106,45 @@ function formatMsgs(msgs: Msg[], empty: string): string {
     .join("\n\n");
 }
 
+function formatInbox(msgs: Msg[], hasMore: boolean, advancing: boolean): string {
+  if (msgs.length === 0) return "no messages";
+  const more = (id: string): string => advancing
+    ? "[more available; call asenq_inbox again to read the next unread messages.]"
+    : `[more available; call asenq_inbox with before=${id} and the same filters for older messages.]`;
+  const parts: string[] = [];
+  let length = 0;
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    const text = formatMsgs([m], "");
+    const separator = parts.length ? 2 : 0;
+    const tail = hasMore || i < msgs.length - 1 ? 2 + more(m.id).length : 0;
+    if (length + separator + text.length + tail > 16_000) {
+      const compact = "[more available]";
+      if (length + separator + text.length + 2 + compact.length <= 16_000) {
+        parts.push(text, compact);
+        return parts.join("\n\n");
+      }
+      if (parts.length === 0) {
+        const recovery = `Full text: asenq_inbox id=${m.id}.`
+          + (m.thread ? " Or use asenq_thread_read with this message's thread." : "");
+        const marker = `\n\n[truncated message ${m.id}; more available. ${recovery}]`;
+        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}\n`;
+        const visible = text.length - m.text.length < 16_000 - marker.length ? text : header + m.text;
+        let end = Math.min(visible.length, 16_000 - marker.length);
+        if (end > 0 && visible.charCodeAt(end - 1) >= 0xD800 && visible.charCodeAt(end - 1) <= 0xDBFF
+          && visible.charCodeAt(end) >= 0xDC00 && visible.charCodeAt(end) <= 0xDFFF) end--;
+        return visible.slice(0, end) + marker;
+      }
+      hasMore = true;
+      break;
+    }
+    parts.push(text);
+    length += separator + text.length;
+  }
+  if (hasMore) parts.push(more(msgs[parts.length - 1].id));
+  return parts.join("\n\n");
+}
+
 /**
  * Runs one agent tool against the daemon and returns the text shown to the model.
  * `as` selects the caller when one connection hosts several sessions (OpenCode).
@@ -113,7 +169,21 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
           .join("\n");
       }
       case "asenq_inbox": {
-        const r = await client.request("inbox", who);
+        if (args.id !== undefined) {
+          const r = await client.request("inbox", { ...who, msgId: args.id });
+          return formatMsgs(r.messages as Msg[], "no messages");
+        }
+        const unreadOnly = args.unread_only ?? true;
+        const r = await client.request("inbox", {
+          ...who, limit: args.limit, since: args.since, before: args.before, thread: args.thread,
+          from: args.from, unread_only: unreadOnly, max_chars: 15_000,
+        });
+        const advancing = unreadOnly === true && args.since === undefined && args.before === undefined
+          && args.thread === undefined && args.from === undefined;
+        return formatInbox(r.messages as Msg[], r.hasMore === true, advancing);
+      }
+      case "asenq_thread_read": {
+        const r = await client.request("thread_read", { ...who, thread: args.thread, since: args.since });
         return formatMsgs(r.messages as Msg[], "no messages");
       }
       case "asenq_rename": {
