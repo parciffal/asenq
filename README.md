@@ -53,7 +53,9 @@ ASENQ_NAME=worker-oc opencode
 ASENQ_NAME=worker-omp omp
 ```
 
-If you don't set a name, asenq uses the Claude session title, or `{harness}-{6 chars of the session id}`. When the name is already taken, asenq adds a suffix (`-2`, `-3`, …).
+`ASENQ_NAME` or a usable Claude session title takes precedence. A new session with no usable name (missing, empty, invalid or reserved) gets a readable default such as `claude-arctic-fox`. The first word pair is derived from the full harness session id, not Claude's process socket, so it is stable on a fresh database.
+
+If that default is taken, asenq walks the bundled adjective/animal pairs in a deterministic order. Only after every pair is taken does it try `-2`, `-3`, … on the original pair. A resumed identity uses its retained name and the existing revival-clash rules; default-name selection applies only to new identities, and an explicit rename is not regenerated.
 
 Talk to them from the shell, or open the console:
 

@@ -290,11 +290,159 @@ test("Claude hook poll renders the current identity role for previously queued m
   assert.doesNotMatch(unset[0].split("\n")[0], /your-role=/);
 });
 
-test("fallback names come from the key when the requested name is reserved or empty", async () => {
+test("new nameless identities receive readable harness-prefixed word pairs", async () => {
   env = await startEnv();
-  assert.equal((await env.adapter("omp", "0199-ABCDEF12", "human")).session.name, "omp-cdef12");
-  assert.equal((await env.adapter("omp", "zz-9", "!!!")).session.name, "omp-zz9");
+  const human = env.human();
+  for (const harness of ["omp", "opencode", "claude"] as const) {
+    const session: { id: string; name: string } = harness === "claude"
+      ? (await human.request("claude_hook", {
+        event: "start", key: "process-key", socket: null, sessionId: "session-ABCDEF12",
+      })).session as { id: string; name: string }
+      : (await env.adapter(harness, "session-ABCDEF12")).session;
+    assert.match(session.name, new RegExp(`^${harness}-[a-z]+-[a-z]+$`));
+    assert.ok(session.name.length <= 40);
+    assert.equal((await human.sync()).sessions.find((row) => row.id === session.id)?.name, session.name);
+  }
 });
+
+for (const harness of ["omp", "opencode", "claude"] as const) {
+  test(`${harness} default names are exactly deterministic across fresh databases and Claude process keys`, async () => {
+    let firstName: string | undefined;
+    for (const processKey of ["first-process", "unrelated-process"]) {
+      env = await startEnv();
+      const human = env.human();
+      const session: { id: string; name: string } = harness === "claude"
+        ? (await human.request("claude_hook", {
+          event: "start", key: processKey, socket: null, sessionId: "stable-full-session-id",
+        })).session as { id: string; name: string }
+        : (await env.adapter(harness, "stable-full-session-id")).session;
+      if (firstName === undefined) firstName = session.name;
+      else assert.equal(session.name, firstName);
+      assert.match(session.name, new RegExp(`^${harness}-[a-z]+-[a-z]+$`));
+      assert.equal((await human.sync()).sessions.find((row) => row.id === session.id)?.name, session.name);
+      await env.close();
+      env = undefined;
+    }
+  });
+
+  test(`${harness} missing, empty, invalid and slugged reserved names all use the session default`, async () => {
+    let firstName: string | undefined;
+    for (const name of [undefined, "", "!!!", "_invalid", " HUMAN ", "asenq", "all", "daemon"]) {
+      env = await startEnv();
+      const session: { id: string; name: string } = harness === "claude"
+        ? (await env.human().request("claude_hook", {
+          event: "start", key: "process-key", socket: null, sessionId: "same-default-seed", name,
+        })).session as { id: string; name: string }
+        : (await env.adapter(harness, "same-default-seed", name)).session;
+      if (firstName === undefined) firstName = session.name;
+      else assert.equal(session.name, firstName);
+      assert.match(session.name, new RegExp(`^${harness}-[a-z]+-[a-z]+$`));
+      await env.close();
+      env = undefined;
+    }
+  });
+
+  test(`${harness} explicit names and rename history survive live resume and removed identity revival`, async () => {
+    env = await startEnv({ defaultNameWords: { adjectives: ["calm", "swift"], animals: ["fox", "owl"] } });
+    const human = env.human();
+    const adapter = harness === "claude" ? undefined : await env.adapter(harness, "explicit-seed", "Worker API");
+    const original: { id: string; name: string } = harness === "claude"
+      ? (await human.request("claude_hook", {
+        event: "start", key: "process1", socket: null, sessionId: "explicit-seed", name: "Worker API",
+      })).session as { id: string; name: string }
+      : adapter!.session;
+    assert.equal(original.name, "worker-api");
+    assert.equal((await human.request("rename", { from: original.name, name: "Niche Manager" })).name, "niche-manager");
+    const live: { id: string; name: string } = harness === "claude"
+      ? (await human.request("claude_hook", {
+        event: "start", key: "process2", socket: null, sessionId: "explicit-seed", name: "ignored-title",
+      })).session as { id: string; name: string }
+      : (await env.adapter(harness, "explicit-seed", "ignored-title")).session;
+    assert.deepEqual(live, { id: original.id, name: "niche-manager" });
+    if (harness === "claude") {
+      await human.request("claude_hook", { event: "end", sessionId: "explicit-seed" });
+    } else {
+      const current = await env.adapter(harness, "explicit-seed");
+      await current.client.request("unregister");
+    }
+    assert.equal((await human.sync()).sessions.find((row) => row.id === original.id)?.state, "removed");
+    const revived: { id: string; name: string } = harness === "claude"
+      ? (await human.request("claude_hook", {
+        event: "start", key: "process3", socket: null, sessionId: "explicit-seed", name: "human",
+      })).session as { id: string; name: string }
+      : (await env.adapter(harness, "explicit-seed", "human")).session;
+    assert.deepEqual(revived, live);
+    const row = (await human.sync()).sessions.find((session) => session.id === original.id)!;
+    assert.deepEqual([row.name, row.state, row.previousNames], ["niche-manager", "live", ["worker-api"]]);
+  });
+}
+
+const defaultNameFixtures = [
+  {
+    harness: "omp", otherSeed: "other-AAAAAA", fullNames: ["omp-calm-owl", "omp-swift-fox"],
+    collisionSeeds: ["collision-1", "collision-2", "collision-8", "fixture-AAAAAA"],
+    pairOrder: ["omp-calm-owl", "omp-swift-fox", "omp-swift-owl", "omp-calm-fox"],
+  },
+  {
+    harness: "opencode", otherSeed: "other-AAAAAA", fullNames: ["opencode-swift-owl", "opencode-calm-fox"],
+    collisionSeeds: ["collision-3", "collision-5", "collision-6", "fixture-AAAAAA"],
+    pairOrder: ["opencode-swift-owl", "opencode-calm-fox", "opencode-calm-owl", "opencode-swift-fox"],
+  },
+  {
+    harness: "claude", otherSeed: "other-0-AAAAAA", fullNames: ["claude-calm-owl", "claude-swift-owl"],
+    collisionSeeds: ["collision-4", "collision-6", "collision-14", "fixture-AAAAAA"],
+    pairOrder: ["claude-calm-owl", "claude-swift-fox", "claude-swift-owl", "claude-calm-fox"],
+  },
+] as const;
+
+for (const { harness, otherSeed, fullNames, collisionSeeds, pairOrder } of defaultNameFixtures) {
+  test(`${harness} default naming uses the full session id rather than its shared last six characters`, async () => {
+    env = await startEnv({ defaultNameWords: { adjectives: ["calm", "swift"], animals: ["fox", "owl"] } });
+    const human = env.human();
+    const actual: { id: string; name: string }[] = [];
+    for (const seed of ["fixture-AAAAAA", otherSeed]) {
+      const session: { id: string; name: string } = harness === "claude"
+        ? (await human.request("claude_hook", {
+          event: "start", key: `process-${seed}`, socket: null, sessionId: seed,
+        })).session as { id: string; name: string }
+        : (await env.adapter(harness, seed)).session;
+      actual.push(session);
+    }
+    assert.deepEqual(actual.map((session) => session.name), fullNames);
+    assert.notEqual(actual[0].id, actual[1].id);
+    assert.deepEqual((await human.sync()).sessions.map((session) => session.name).sort(), [...fullNames].sort());
+  });
+
+  test(`${harness} live and gone clashes walk every pair before exhaustion uses the first pair with -2 and -3`, async () => {
+    env = await startEnv({ defaultNameWords: { adjectives: ["calm", "swift"], animals: ["fox", "owl"] } });
+    const human = env.human();
+    const live = await env.adapter("omp", "live-holder", pairOrder[0]);
+    const gone = await env.adapter("opencode", "gone-holder", pairOrder[1]);
+    const goneEvent = await env.watch(isSession("gone", pairOrder[1]));
+    gone.client.close();
+    await goneEvent.event;
+    assert.equal(await sessionState(human, pairOrder[0]), "live");
+    assert.equal(await sessionState(human, pairOrder[1]), "gone");
+
+    const expected = [pairOrder[2], pairOrder[3], `${pairOrder[0]}-2`, `${pairOrder[0]}-3`];
+    const registered: { id: string; name: string }[] = [];
+    for (const [index, seed] of collisionSeeds.entries()) {
+      const session: { id: string; name: string } = harness === "claude"
+        ? (await human.request("claude_hook", {
+          event: "start", key: `process-${seed}`, socket: null, sessionId: seed,
+        })).session as { id: string; name: string }
+        : (await env.adapter(harness, seed)).session;
+      assert.equal(session.name, expected[index]);
+      assert.ok(session.name.length <= 40);
+      registered.push(session);
+    }
+    const snapshot = await human.sync();
+    assert.equal(snapshot.sessions.find((session) => session.id === live.session.id)?.name, pairOrder[0]);
+    assert.equal(snapshot.sessions.find((session) => session.id === gone.session.id)?.state, "gone");
+    assert.deepEqual(registered.map(({ id }) => snapshot.sessions.find((session) => session.id === id)?.name), expected);
+    assert.equal(new Set([live.session.id, gone.session.id, ...registered.map((session) => session.id)]).size, 6);
+  });
+}
 
 test("delivery: push carries the rendered text; ack marks delivered; no ack leaves it queued", async () => {
   // A 200 ms ack timeout exercises the daemon's real ack timer without the 10 s production wait.
