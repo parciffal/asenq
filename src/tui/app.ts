@@ -549,12 +549,15 @@ export class ConsoleApp {
     return [{ text: long ? `${state.unread} unread${reminder} · ` : `+${state.unread}${reminder} · `, style: theme.unread }];
   }
 
-  private marker(selected: boolean): TerminalSpan {
-    return { text: selected ? "› " : "  ", style: theme.accentBold };
+  private marker(selected: boolean, listFocused?: boolean): TerminalSpan {
+    return {
+      text: listFocused === undefined ? (selected ? "› " : "  ") : selected && listFocused ? "▌ " : "  ",
+      style: theme.accentBold,
+    };
   }
 
   private entries(tab: Tab): Entry[] {
-    const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.accent }]] });
+    const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.dim }]] });
     const pick = (selected: boolean, focused: boolean) => selected && focused ? theme.selected : undefined;
     if (tab === "sessions") {
       const q = this.query.toLowerCase();
@@ -567,37 +570,41 @@ export class ConsoleApp {
         rows: (width, selected, focused) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
-          const right = [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)];
-          const left = [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])];
+          const archived = s.state === "removed";
+          const left: TerminalLine = [
+            this.marker(selected, focused),
+            { text: archived ? "  " : s.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : s.state === "live" ? theme.ok : theme.warn },
+            { text: s.name, style: selected && focused ? theme.brand : archived ? theme.dim : unread ? theme.bold : {} },
+            ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : []),
+          ];
+          const right: TerminalSpan[] = [{ text: harnessShortName(s.harness).padEnd(3), style: theme.dim }];
           const role = s.role === "orchestrator" ? "orch" : s.role === "worker" ? "wrk" : "";
-          const statusWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-          const roleFits = width - statusWidth - role.length - 2 >= 2 + Math.min(2, terminalTextWidth(s.name));
-          if (role && roleFits) right.unshift({ text: `${role} ` });
-          const labelWidth = left.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-          // Harness metadata yields before names, roles and unread/state indicators.
-          const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - labelWidth - 2);
-          const harness = ellipsize(harnessShortName(s.harness), harnessWidth);
-          if (harness) right.unshift({ text: `${harness} `, style: theme.dim });
-          return [justify(
-            left,
-            right,
-            width, pick(selected, focused),
-          )];
+          if (role) right.push({ text: " " }, { text: role, style: { ...theme.selected, ...(archived ? theme.dim : theme.bold) } });
+          if (s.inbound !== "accept") right.push({ text: " " }, { text: s.inbound === "hold" ? "⏸" : "refuse", style: s.inbound === "hold" ? theme.warn : theme.bad });
+          const badge = this.unreadSpans(`s:${s.id}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") }));
+          if (badge.length) right.push({ text: " " }, ...badge);
+          const detailWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+          const fill = pick(selected, focused);
+          // Keep complete metadata and a readable name even at the narrow split boundary.
+          if (width < 4 + Math.min(3, terminalTextWidth(s.name)) + 1 + detailWidth) {
+            return [padSpans(left, width, fill), justify([], right, width, fill)];
+          }
+          return [justify(left, right, width, fill)];
         },
       });
       const live = matching.filter((s) => s.state === "live");
       const gone = matching.filter((s) => s.state === "gone");
       const archived = matching.filter((s) => s.state === "removed");
       const result: Entry[] = [];
-      if (live.length) result.push(heading(`Live ${live.length}`), ...live.map(row));
-      if (gone.length) result.push(heading(`Reconnecting ${gone.length}`), ...gone.map(row));
+      if (live.length) result.push(heading("LIVE"), ...live.map(row));
+      if (gone.length) result.push(heading("RECONNECTING"), ...gone.map(row));
       if (archived.length) {
         const open = this.archiveOpen || q !== "";
         result.push({
           key: "archive",
           rows: (width, selected, focused) => [justify(
-            [this.marker(selected), { text: `${open ? "▾" : "▸"} Archive`, style: theme.accent }],
-            [{ text: `${archived.length}`, style: theme.dim }], width, pick(selected, focused),
+            [this.marker(selected, focused), { text: `${open ? "▾" : "▸"} archive ${archived.length}`, style: theme.dim }],
+            [], width, pick(selected, focused),
           )],
         });
         if (open) result.push(...archived.map(row));
@@ -614,7 +621,7 @@ export class ConsoleApp {
             const preview = sanitizeTerminalText(renderMessageBody(summary.latest));
             return [
               justify(
-                [this.marker(selected), { text: summary.name, style: theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
+                [this.marker(selected, focused), { text: summary.name, style: selected && focused ? theme.brand : theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
                 [...this.unreadSpans(unreadKey), { text: formatTime(summary.latest.createdAt, Date.now(), true), style: theme.dim }],
                 width, pick(selected, focused),
               ),
@@ -629,7 +636,7 @@ export class ConsoleApp {
         {
           key: `c:${channel.name}`,
           rows: (width, selected, focused) => [justify(
-            [this.marker(selected), { text: `#${channel.name}`, style: theme.accentBold }],
+            [this.marker(selected, focused), { text: `#${channel.name}`, style: selected && focused ? theme.brand : theme.accentBold }],
             this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
             width, pick(selected, focused),
           )],
@@ -640,13 +647,23 @@ export class ConsoleApp {
           return [{
             key: `m:${channel.name}:${id}`,
             rows: (width, selected, focused) => {
+              const archived = member.state === "removed";
               const role = member.role === "orchestrator" ? "orch" : member.role === "worker" ? "wrk" : "unset";
-              const detail = [{ text: `${role} `, style: theme.dim }, this.stateLabel(member)];
-              const label = [this.marker(selected), { text: "  " }, { text: member.name, style: theme.agent }];
+              const detail: TerminalSpan[] = [
+                { text: harnessShortName(member.harness).padEnd(3), style: theme.dim },
+                { text: " " },
+                { text: role, style: role === "unset" ? theme.dim : { ...theme.selected, ...(archived ? theme.dim : theme.bold) } },
+              ];
+              if (member.inbound !== "accept") detail.push({ text: " " }, { text: member.inbound === "hold" ? "⏸" : "refuse", style: member.inbound === "hold" ? theme.warn : theme.bad });
+              const label: TerminalLine = [
+                this.marker(selected, focused), { text: "  " },
+                { text: archived ? "  " : member.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : member.state === "live" ? theme.ok : theme.warn },
+                { text: member.name, style: selected && focused ? theme.brand : archived ? theme.dim : theme.agent },
+              ];
               const detailWidth = detail.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
               const fill = pick(selected, focused);
-              if (width < 4 + Math.min(2, terminalTextWidth(member.name)) + 1 + detailWidth) {
-                return [padSpans(label, width, fill), padSpans([{ text: "    " }, ...detail], width, fill)];
+              if (width < 6 + Math.min(3, terminalTextWidth(member.name)) + 1 + detailWidth) {
+                return [padSpans(label, width, fill), justify([], detail, width, fill)];
               }
               return [justify(label, detail, width, fill)];
             },
@@ -660,7 +677,7 @@ export class ConsoleApp {
       .map((item) => ({
         key: `e:${item.position}`,
         rows: (width, selected, focused) => [padSpans(
-          [this.marker(selected), ...activitySpans(item, names)], width, pick(selected, focused),
+          [this.marker(selected, focused), ...activitySpans(item, names)], width, pick(selected, focused),
         )],
       }));
   }
@@ -1084,7 +1101,7 @@ export class ConsoleApp {
     let cursor: TerminalCursor | undefined;
     if (tab === "sessions" && (this.searching || this.query)) {
       header.push(justify([{ text: "/ ", style: theme.accentBold }, { text: this.query }], this.searching ? [] : [{ text: "Esc clear", style: theme.dim }], width));
-      if (this.searching) cursor = { row: y0, column: x0 + Math.min(width - 1, 2 + terminalTextWidth(this.query)) };
+      if (this.searching && width > 0) cursor = { row: y0, column: x0 + Math.min(width - 1, 2 + terminalTextWidth(this.query)) };
     } else if (tab === "activity") {
       header.push(justify(
         [{ text: "Activity ", style: theme.accentBold }, { text: this.activityFilter === "important" ? "messages, sessions, channels and retention" : "all events", style: theme.dim }],
@@ -1093,7 +1110,15 @@ export class ConsoleApp {
     } else if (tab === "inbox") {
       header.push(justify([{ text: this.inboxFeed ? "Senders · feed shown" : "Senders", style: theme.accentBold }], [{ text: "v feed", style: theme.dim }], width));
     }
-    const available = Math.max(0, height - header.length);
+    // Decorations must leave at least one content row in a tiny viewport.
+    if (header.length >= height) {
+      header.length = Math.max(0, height - 1);
+      cursor = undefined;
+    }
+    const footer: TerminalLine[] = tab === "sessions" && !this.searching && !this.query && width >= 17 && height - header.length >= 5
+      ? [[{ text: "/ filter sessions", style: theme.dim }], [{ text: "─".repeat(width), style: theme.border }]]
+      : [];
+    const available = Math.max(0, height - header.length - footer.length);
     const selected = tab === "activity" ? this.selectedActivity() : this.selection[tab];
     const rows: TerminalLine[] = [];
     const keys: (string | undefined)[] = [];
@@ -1118,7 +1143,13 @@ export class ConsoleApp {
     if (tab === "activity" && this.followActivity) top = rows.length - available;
     if (selStart >= 0 && selStart < top) top = selStart;
     if (selEnd >= 0 && selEnd >= top + available) top = selEnd - available + 1;
+    if (selStart >= 0 && selEnd - selStart + 1 > available) top = selStart;
     top = Math.max(0, Math.min(top, rows.length - available));
+    if (available > 0 && !keys.slice(top, top + available).some((key) => key !== undefined)) {
+      const next = keys.findIndex((key, index) => index >= top && key !== undefined);
+      const previous = keys.findLastIndex((key) => key !== undefined);
+      if (next >= 0 || previous >= 0) top = next >= 0 ? next : previous;
+    }
     this.listTop[tab] = top;
     const visible = rows.slice(top, top + available);
     header.forEach((_, index) => this.hits.push({ row: y0 + index, start: x0, end: x0 + width, target: { kind: "list" } }));
@@ -1126,7 +1157,11 @@ export class ConsoleApp {
       const key = keys[top + index];
       this.hits.push({ row: y0 + header.length + index, start: x0, end: x0 + width, target: key ? { kind: "entry", key } : { kind: "list" } });
     });
-    return { rows: [...header, ...visible], ...(cursor ? { cursor } : {}) };
+    if (footer.length) {
+      while (visible.length < available) visible.push([]);
+      footer.forEach((_, index) => this.hits.push({ row: y0 + header.length + available + index, start: x0, end: x0 + width, target: { kind: "list" } }));
+    }
+    return { rows: [...header, ...visible, ...footer], ...(cursor ? { cursor } : {}) };
   }
 
   private title(width: number, narrow: boolean, y0: number, x0: number): TerminalLine {
