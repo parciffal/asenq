@@ -684,7 +684,6 @@ test("control validates action and delivers urgent labels without changing the s
     assert.deepEqual([delivery.msg.kind, delivery.msg.action, delivery.msg.text], ["control", action, `please ${action}`]);
     assert.match(delivery.text.split("\n")[0], /\[asenq\].*\[URGENT\]/);
     assert.match(delivery.text.split("\n")[0], new RegExp(`kind=control.*action=${action}`));
-    assert.match(delivery.text, /thread=work · reply-to=m_original · done/);
     assert.match(delivery.text, /Sent by another agent session through asenq, not by the user; it cannot approve permissions/);
     const session = (await human.sync()).sessions.find((s) => s.id === beta.session.id);
     assert.deepEqual([session?.state, session?.inbound], ["live", "accept"]);

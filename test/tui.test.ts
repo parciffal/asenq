@@ -88,10 +88,6 @@ async function startConsole(columns: number, rows: number, client?: ConsoleDeps[
     async type(text) {
       for (const character of text) await ui.press(character);
     },
-    async paste(text) {
-      handlers.onPaste?.(text);
-      await app.idle();
-    },
     async until(predicate, what) {
       const deadline = Date.now() + 3000;
       for (;;) {
@@ -1680,7 +1676,7 @@ test("retained sender notices show the original reply identity as a purged messa
   await selectSession(ui, "sender");
   await ui.press("ENTER");
   await ui.press("END");
-  await ui.press("DOWN");
+  await ui.press("UP");
   await ui.press("ENTER");
   assert.ok(ui.rows().some((row) => row.includes(`reply to ${original}`)), "notice details retain the original message identity");
   await human.request("purge", { identity: target.session.id });
