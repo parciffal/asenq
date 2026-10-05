@@ -409,7 +409,7 @@ export class Daemon {
         const rows = name
           ? this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' AND to_name=? ORDER BY ord", name)
           : this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' ORDER BY ord");
-        return { messages: rows.map((r) => ({ ...toWire(r), status: r.status })) };
+        return { messages: rows.map(toStored) };
       }
       case "release": {
         this.requireHuman(this.sender(c, p), "release held messages");

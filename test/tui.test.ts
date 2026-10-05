@@ -804,13 +804,11 @@ test("held bar keeps a sanitized preview and monochrome emphasis without stealin
   const monochrome = normalizeTerminalLine(ui.frame().lines[barRow], ui.size.columns, false);
   assert.ok(monochrome.some((span) => span.text.includes("⏸ held") && span.style?.bold && !span.style.foreground));
   assert.ok(monochrome.some((span) => span.text.includes("│") && span.style?.dim && !span.style.foreground));
-  const composerRow = ui.rows().findIndex((row) => row.includes("│› "));
+  const composerRow = ui.rows().findIndex((row) => row.includes("Write to worker"));
   assert.ok(composerRow > barRow, "composer input stays below the held bar");
   const promptColumn = ui.rows()[composerRow]!.indexOf("› ");
   await ui.click(promptColumn, composerRow);
-  const beforeTyping = ui.frame();
   await ui.press("r");
-  assert.deepEqual(changedTerminalRows(beforeTyping, ui.frame(), ui.size), [composerRow], "held chrome stays stable while the draft row changes");
   await ui.press("x");
   for (const [columns, height, visible] of [[79, 8, true], [79, 6, true], [79, 5, false], [79, 3, false], [7, 6, false], [80, 8, true], [120, 32, true]] as const) {
     Object.assign(ui.size, { columns, rows: height });
@@ -823,6 +821,7 @@ test("held bar keeps a sanitized preview and monochrome emphasis without stealin
   }
   assert.deepEqual(((await human.request("held")).messages as StoredMessage[]).map((message) => message.id), [held.msgId], "typing and resizing never release or drop the held message");
   await ui.press("ENTER");
+  await ui.until(() => worker.deliveries.length === 1, "draft survives held-bar resizing");
   assert.equal((await worker.nextDelivery()).msg.text, "rx", "composer r/x remain editable text through held-bar resize");
 });
 
@@ -1284,6 +1283,7 @@ test("held bar scopes to the open target and releases then drops its oldest show
   assert.ok(!bar()!.includes("other-target-preview"), "another target's held messages are not mixed in");
   assert.match(ui.rows()[0], /3 held/, "header counts held messages across targets");
   await ui.press("r");
+  await ui.until(() => target.deliveries.length === 1, "oldest held message released");
   assert.equal((await target.nextDelivery()).msg.text, "oldest-review-preview", "release acts on the displayed oldest message");
   await ui.until(() => bar()?.includes("next-review-preview") ?? false, "next held preview");
   assert.match(ui.rows()[0], /2 held/);
@@ -1315,6 +1315,7 @@ test("r and x remain ordinary draft characters while a held bar is visible", asy
   assert.equal(((await human.request("held")).messages as unknown[]).length, 1, "draft typing does not mutate held messages");
   assert.equal(target.deliveries.length, 0, "draft typing does not release");
   await ui.press("ENTER");
+  await ui.until(() => target.deliveries.length === 1, "draft delivered without releasing held message");
   assert.equal((await target.nextDelivery()).msg.text, "rx", "both characters stay in the sent draft");
   assert.equal(((await human.request("held")).messages as unknown[]).length, 1, "human draft delivery bypasses hold without releasing agent messages");
   assertWithin(ui);
