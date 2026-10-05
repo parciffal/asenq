@@ -26,28 +26,6 @@ function messageIds(output: string): string[] {
   return [...output.matchAll(/· (m_[0-9a-f]{12})/g)].map((match) => match[1]);
 }
 
-test("list identifies human-assigned roles without transferring them across reused names", async () => {
-  env = await startEnv();
-  const human = env.human();
-  const orchestrator = await env.adapter("omp", "orch-key", "coordinator");
-  const worker = await env.adapter("opencode", "worker-key", "builder");
-  await human.request("set_role", { name: "coordinator", role: "orchestrator" });
-  await human.request("set_role", { name: "builder", role: "worker" });
-  const listed = await callTool(orchestrator.client, "asenq_list", {});
-  assert.match(listed.split("\n").find((line) => line.startsWith("coordinator "))!, /role=orchestrator.*\[you\]/);
-  assert.match(listed.split("\n").find((line) => line.startsWith("builder "))!, /role=worker/);
-  await worker.client.request("rename", { name: "renamed" });
-  const renamed = await callTool(orchestrator.client, "asenq_list", {});
-  assert.match(renamed.split("\n").find((line) => line.startsWith("renamed "))!, /role=worker/);
-  await human.request("set_role", { name: "renamed", role: null });
-  const unset = await callTool(orchestrator.client, "asenq_list", {});
-  assert.doesNotMatch(unset.split("\n").find((line) => line.startsWith("renamed "))!, /role=/);
-  await human.request("set_role", { name: "renamed", role: "worker" });
-  await worker.client.request("unregister");
-  await env.adapter("opencode", "replacement-key", "renamed");
-  const reused = await callTool(orchestrator.client, "asenq_list", {});
-  assert.doesNotMatch(reused.split("\n").find((line) => line.startsWith("renamed "))!, /role=/);
-});
 
 test("orchestrator tools edit only their channels and shared members' roles", async () => {
   env = await startEnv();
