@@ -4073,7 +4073,7 @@ test("queued messages expire at exactly the default 24-hour boundary with one li
   env.clock.advance(86_400_000 - 1);
   env.daemon.sweep();
   assert.equal((await logOf(human, queued.msgId!)).status, "queued");
-  assert.deepEqual(sender.deliveries, []);
+  assert.equal(sender.deliveries.length, 0);
   const expired = await env.watch(isStatus(queued.msgId, "expired"));
   env.clock.advance(1);
   env.daemon.sweep();
@@ -4157,7 +4157,7 @@ test("ambiguous retained current names reject name routing while stable ids reta
   assert.equal(toGoneHolder.status, "queued");
   assert.equal((await human.historyPage({ scope: "session", sessionId: second.session.id })).messages.at(-1)?.toSessionId, second.session.id);
   const delivered = await env.watch(isStatus(toGoneHolder.msgId, "delivered"));
-  const reconnected = await env.adapter("opencode", "second-key", "ignored");
+  const reconnected = await env.adapter("opencode", "second-key", "ignored", { cwd: "/second" });
   await delivered.event;
   await reconnected.client.request("unregister");
   await assert.rejects(send(human, "shared", "must not guess"), (error: unknown) => {
@@ -4348,7 +4348,8 @@ test("expired and dropped originals cannot become replied or be resurrected by l
   const receiver = await env.adapter("omp", "receiver-key", "receiver");
   await human.request("set_inbound", { name: "receiver", mode: "hold" });
   const [dropped] = await send(sender.client, "receiver", "original dropped by user");
-  assert.equal((await human.request("drop", { msgId: dropped.msgId })).status, "dropped");
+  await human.request("drop", { msgId: dropped.msgId });
+  assert.equal((await logOf(human, dropped.msgId!)).status, "dropped");
   const [aged] = await send(sender.client, "receiver", "original expires on release");
   env.clock.advance(1000);
   assert.equal((await human.request("release", { msgId: aged.msgId })).status, "expired");
@@ -4369,7 +4370,8 @@ test("failedCount excludes pending, policy rejected, dropped and posted messages
   await human.request("set_inbound", { name: "receiver", mode: "hold" });
   const [held] = await send(sender.client, "receiver", "held");
   const [toDrop] = await send(sender.client, "receiver", "dropped");
-  assert.equal((await human.request("drop", { msgId: toDrop.msgId })).status, "dropped");
+  await human.request("drop", { msgId: toDrop.msgId });
+  assert.equal((await logOf(human, toDrop.msgId!)).status, "dropped");
   await human.request("set_inbound", { name: "receiver", mode: "refuse" });
   const [rejected] = await send(sender.client, "receiver", "rejected");
   assert.equal(rejected.status, "rejected");
