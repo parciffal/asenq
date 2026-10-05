@@ -377,7 +377,7 @@ test("session list shows short harness labels without losing state or unread bad
   assertWithin(ui);
 });
 
-test("session roles remain visible with names, unread counts and state at 80 columns", async () => {
+test("session roles yield to archived names, unread counts and state at 80 columns", async () => {
   env = await startEnv();
   const human = env.human();
   const alpha = await env.adapter("omp", "role-alpha", "alpha");
@@ -406,12 +406,12 @@ test("session roles remain visible with names, unread counts and state at 80 col
   await ui.press("END");
   await ui.press("ENTER");
   await ui.until(() => list().filter((row) => row.includes("archived")).length === 2, "expanded archive");
-  for (const [prefix, role] of [["al", "orch"], ["br", "wrk"]]) {
+  for (const prefix of ["al", "br"]) {
     const rows = list();
     const index = rows.findIndex((row) => row.includes(prefix) && row.includes("archived"));
     assert.ok(index >= 0, `${prefix} retains a distinct visible name prefix`);
     assert.match(rows[index], /\+1.*archived/);
-    assert.match(rows[index + 1], new RegExp(`\\b${role}\\b`));
+    assert.doesNotMatch(rows[index], /\b(?:orch|wrk)\b/, "role yields to archived identity and unread state");
   }
   assertWithin(ui);
 });

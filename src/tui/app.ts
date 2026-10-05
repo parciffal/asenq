@@ -34,7 +34,6 @@ export type ConsoleDeps = {
 const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"]] as const;
 type Tab = typeof TABS[number][0];
 type Focus = "tabs" | "list" | "transcript" | "composer";
-type SessionWithRole = SessionIdentity & { role?: "orchestrator" | "worker" | null };
 
 const ACTION_GROUPS = [
   ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
@@ -135,7 +134,7 @@ const jumpRank = (name: string, query: string): number => {
 export class ConsoleApp {
   private readonly screen: Screen;
   private readonly client: AsenqClient;
-  private sessions: SessionWithRole[] = [];
+  private sessions: SessionIdentity[] = [];
   private sessionOrders: Record<string, number> = {};
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
@@ -275,7 +274,7 @@ export class ConsoleApp {
     return scope && scope.scope !== "inbox" ? scope : undefined;
   }
 
-  private session(id: string): SessionWithRole | undefined {
+  private session(id: string): SessionIdentity | undefined {
     return this.sessions.find((s) => s.id === id);
   }
 
@@ -491,7 +490,7 @@ export class ConsoleApp {
       const matching = this.sessions
         .filter((s) => !q || s.name.includes(q) || s.previousNames.some((name) => name.includes(q)))
         .sort((a, b) => (orders[b.id] ?? 0) - (orders[a.id] ?? 0) || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
-      const row = (s: SessionWithRole): Entry => ({
+      const row = (s: SessionIdentity): Entry => ({
         key: `s:${s.id}`,
         rows: (width, selected, focused) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
@@ -500,20 +499,18 @@ export class ConsoleApp {
           const left = [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])];
           const role = s.role === "orchestrator" ? "orch" : s.role === "worker" ? "wrk" : "";
           const statusWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-          const roleBelow = !!role && width - statusWidth - role.length - 2 < 2 + Math.min(2, terminalTextWidth(s.name));
-          if (role && !roleBelow) right.unshift({ text: `${role} ` });
+          const roleFits = width - statusWidth - role.length - 2 >= 2 + Math.min(2, terminalTextWidth(s.name));
+          if (role && roleFits) right.unshift({ text: `${role} ` });
           const labelWidth = left.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
           // Harness metadata yields before names, roles and unread/state indicators.
           const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - labelWidth - 2);
           const harness = ellipsize(harnessShortName(s.harness), harnessWidth);
           if (harness) right.unshift({ text: `${harness} `, style: theme.dim });
-          const rows = [justify(
+          return [justify(
             left,
             right,
             width, pick(selected, focused),
           )];
-          if (roleBelow) rows.push(justify([{ text: `  ${role}` }], [], width, pick(selected, focused)));
-          return rows;
         },
       });
       const live = matching.filter((s) => s.state === "live");
@@ -1020,6 +1017,7 @@ export class ConsoleApp {
     }
     const session = this.session(scope.sessionId);
     const left: TerminalSpan[] = [...back, { text: session?.name ?? scope.sessionId, style: theme.accentBold }];
+    if (session?.role) left.push({ text: ` · ${session.role}` });
     if (session?.previousNames.length) left.push({ text: ` formerly ${session.previousNames.join(", ")}`, style: theme.dim });
     if (session?.harness && session.harness !== "unknown") left.push({ text: ` · ${session.harness}`, style: theme.dim });
     const right: TerminalSpan[] = [...this.unreadSpans(keyOf(scope), true)];

@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import type { ControlAction, SendResult, TailEvent } from "../shared/protocol.js";
+import type { ControlAction, Role, SendResult, TailEvent } from "../shared/protocol.js";
 import { formatSendResults } from "../shared/tools.js";
 
 type LoggedMsg = {
@@ -75,7 +75,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
   switch (cmd) {
     case "ls": {
       const r = await client.request("list");
-      const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; inbound: string; role: "orchestrator" | "worker" | null }[];
+      const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; inbound: string; role: Role | null }[];
       const table = [["NAME", "HARNESS", "STATE", "INBOUND", "ROLE", "CWD"], ...rows.map((s) => [s.name, s.harness, s.state, s.inbound, s.role ?? "unset", s.cwd ?? ""])];
       const widths = table[0].map((_, i) => Math.max(...table.map((row) => row[i].length)));
       for (const row of table) out(row.map((c, i) => (i === row.length - 1 ? c : c.padEnd(widths[i]))).join("  "));
