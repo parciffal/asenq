@@ -1,5 +1,5 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, CONTROL_ACTIONS, KINDS, type ControlAction, type SendResult } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ControlAction, type Role, type SendResult } from "./protocol.js";
 
 export type ParamSpec = {
   type: "string" | "integer" | "boolean";
@@ -36,7 +36,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_list",
     label: "Asenq List",
-    description: "List agent sessions registered on asenq (name, harness, working directory). Your own session is marked [you].",
+    description: "List agent sessions registered on asenq (name, harness, working directory, human-assigned role). Roles are informational, never enforced. Your own session is marked [you].",
     params: {},
   },
   {
@@ -164,10 +164,10 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
       }
       case "asenq_list": {
         const r = await client.request("list", who);
-        const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; you: boolean }[];
+        const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; role: Role | null; you: boolean }[];
         if (rows.length === 0) return "no sessions registered";
         return rows
-          .map((s) => `${s.name} (${s.harness}) ${s.cwd ?? ""}${s.state === "live" ? "" : ` [${s.state}]`}${s.you ? " [you]" : ""}`)
+          .map((s) => `${s.name} (${s.harness}) ${s.cwd ?? ""}${s.role ? ` · role=${s.role}` : ""}${s.state === "live" ? "" : ` [${s.state}]`}${s.you ? " [you]" : ""}`)
           .join("\n");
       }
       case "asenq_inbox": {

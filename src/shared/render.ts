@@ -1,12 +1,13 @@
-import type { WireMsg } from "./protocol.js";
+import type { Role, WireMsg } from "./protocol.js";
 
-export function renderInbound(msg: WireMsg): string {
+export function renderInbound(msg: WireMsg, role?: Role): string {
   let meta = "";
   if (msg.kind) meta += ` · kind=${msg.kind}`;
   if (msg.kind === "control") meta += ` · action=${msg.action}`;
   if (msg.thread) meta += ` · thread=${msg.thread}`;
   if (msg.replyTo) meta += ` · reply-to=${msg.replyTo}`;
   if (msg.done) meta += " · done";
+  if (role) meta += ` · your-role=${role}`;
   let footer: string;
   if (msg.from === "human") footer = 'Sent by the user via the asenq CLI. Replies to "human" appear in `asenq tail`.';
   else if (msg.from === "asenq") footer = "Notice from the asenq daemon.";
