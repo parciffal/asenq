@@ -36,7 +36,7 @@ type Tab = typeof TABS[number][0];
 type Focus = "tabs" | "list" | "transcript" | "composer";
 
 const ACTION_GROUPS = [
-  ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
+  ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
   ["Sessions", ["Rename session", "Inbound policy"]],
@@ -47,7 +47,7 @@ type Action = typeof ACTION_GROUPS[number][1][number];
 const ACTIONS: { group: string; label: Action }[] = ACTION_GROUPS.flatMap(([group, labels]) =>
   labels.map((label: Action) => ({ group, label })));
 const SHORTCUTS: Partial<Record<Action, string>> = {
-  Sessions: "s", Inbox: "i", Channels: "#", Activity: "a", "Search sessions": "/", "Toggle inbox feed": "v",
+  Sessions: "s", Inbox: "i", Channels: "#", Activity: "a", "Quick jump": "Ctrl+K", "Search sessions": "/", "Toggle inbox feed": "v",
   "Toggle activity filter": "f", "Compose / send": "c", "Full editor": "Ctrl+E", "Mark read": "End",
   "Mark latest unread": "u", Help: "?", Quit: "q",
 };
@@ -57,6 +57,7 @@ const HELP = [
   "",
   "Tabs: s Sessions · i Inbox · # Channels · a Activity. Tab / Shift+Tab move focus between tabs, list, conversation and composer.",
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
+  "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
@@ -93,6 +94,7 @@ type Target =
   | { kind: "entry"; key: string }
   | { kind: "message"; id: string }
   | { kind: "palette"; index: number }
+  | { kind: "finder"; key: string }
   | { kind: "field"; index: number }
   | { kind: "composer" }
   | { kind: "picker" }
@@ -103,6 +105,7 @@ type Entry = { key?: string; rows(width: number, selected: boolean, focused: boo
 type Shown = { key: string; layout: TranscriptLayout; top: number; height: number };
 type ComposeTarget = { kind: "session"; id: string; name: string } | { kind: "channel"; name: string };
 type Pane = { rows: TerminalLine[]; cursor?: TerminalCursor };
+type JumpItem = { key: string; name: string; former?: string; session?: SessionIdentity; rank: number; state: number };
 
 /** Shift+Enter where the terminal reports it; Alt+Enter and Ctrl+J (iTerm's Shift+Enter) elsewhere. */
 const NEWLINE_KEYS: Record<string, true> = { SHIFT_ENTER: true, ALT_ENTER: true, CTRL_J: true };
@@ -113,6 +116,20 @@ const senderKey = (m: { fromSessionId?: string; from: string }): string =>
   m.fromSessionId ? `i:${m.fromSessionId}` : `i:n:${m.from}`;
 const cleanInput = (text: string): string =>
   sanitizeTerminalText(text.replace(/\r\n?/g, "\n"), { multiline: true });
+
+/** Exact and prefix matches precede case-insensitive ordered subsequences. */
+const jumpRank = (name: string, query: string): number => {
+  const value = name.toLowerCase();
+  if (!query || value === query) return 0;
+  if (value.startsWith(query)) return 1;
+  let offset = 0;
+  for (const character of query) {
+    const index = value.indexOf(character, offset);
+    if (index < 0) return Infinity;
+    offset = index + character.length;
+  }
+  return 2;
+};
 
 export class ConsoleApp {
   private readonly screen: Screen;
@@ -139,6 +156,7 @@ export class ConsoleApp {
   private panel?: Panel;
   private form?: Form;
   private palette?: { query: string; selected: number; top: number };
+  private finder?: { query: string; selected?: string; top: number };
   private notice?: Notice;
   private noticeTimer?: NodeJS.Timeout;
   private errorDetail = "";
@@ -644,6 +662,139 @@ export class ConsoleApp {
     this.render();
   }
 
+  // ------------------------------------------------------------------ quick jump
+
+  private jumpItems(): JumpItem[] {
+    const query = (this.finder?.query ?? "").toLowerCase();
+    const items: JumpItem[] = [];
+    if (!query.startsWith("#")) {
+      for (const session of this.sessions) {
+        let rank = jumpRank(session.name, query);
+        let former: string | undefined;
+        for (const name of session.previousNames) {
+          const previousRank = jumpRank(name, query);
+          if (previousRank < rank) {
+            rank = previousRank;
+            former = name;
+          }
+        }
+        if (rank !== Infinity) items.push({
+          key: `s:${session.id}`, name: session.name, session, rank,
+          state: session.state === "live" ? 0 : session.state === "gone" ? 1 : 2,
+          ...(former ? { former } : {}),
+        });
+      }
+    }
+    const channelQuery = query.startsWith("#") ? query.slice(1) : query;
+    for (const channel of this.channels) {
+      const rank = jumpRank(channel.name, channelQuery);
+      if (rank !== Infinity) items.push({ key: `c:${channel.name}`, name: channel.name, rank, state: 0 });
+    }
+    return items.sort((a, b) => a.rank - b.rank || a.state - b.state
+      || Number(!a.session) - Number(!b.session)
+      || a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+  }
+
+  private openFinder(): void {
+    if (!this.finder) this.finder = { query: "", top: 0 };
+    this.render();
+  }
+
+  private finderIndex(items: JumpItem[]): number {
+    const finder = this.finder!;
+    const index = Math.max(0, items.findIndex((item) => item.key === finder.selected));
+    finder.selected = items[index]?.key;
+    return index;
+  }
+
+  private async jumpTo(key: string): Promise<void> {
+    const item = this.jumpItems().find((entry) => entry.key === key);
+    if (!item) return this.render();
+    if (this.form) this.syncFormDraft(this.form);
+    this.finder = undefined;
+    this.form = undefined;
+    this.palette = undefined;
+    this.panel = undefined;
+    this.searching = false;
+    this.query = "";
+    this.readHold = undefined;
+    this.tab = item.session ? "sessions" : "channels";
+    this.selection[this.tab] = item.key;
+    if (item.session?.state === "removed") this.archiveOpen = true;
+    this.focus = "transcript";
+    await this.opened();
+  }
+
+  private async finderKey(k: KeyInput): Promise<void> {
+    const finder = this.finder!;
+    const items = this.jumpItems();
+    const selected = this.finderIndex(items);
+    if (k.name === "ESCAPE") this.finder = undefined;
+    else if (k.name === "UP" || k.name === "DOWN") {
+      const index = Math.max(0, Math.min(items.length - 1, selected + (k.name === "UP" ? -1 : 1)));
+      finder.selected = items[index]?.key;
+    } else if (k.name === "ENTER" || k.name === "KP_ENTER") {
+      const item = items[selected];
+      if (item) return this.jumpTo(item.key);
+    } else if (k.name === "BACKSPACE" || k.name === "CTRL_U") {
+      finder.query = k.name === "CTRL_U" ? "" : finder.query.slice(0, stepGrapheme(finder.query, finder.query.length, -1));
+      finder.selected = undefined;
+      finder.top = 0;
+    } else if (k.text && !k.ctrl) {
+      finder.query += cleanInput(k.text).replace(/\n/g, " ");
+      finder.selected = undefined;
+      finder.top = 0;
+    }
+    this.render();
+  }
+
+  private finderPane(width: number, height: number, y0: number): Pane {
+    const finder = this.finder!;
+    const items = this.jumpItems();
+    const selectedIndex = this.finderIndex(items);
+    const boxed = width >= 6 && height >= 4;
+    const inset = boxed ? 1 : 0;
+    const innerWidth = Math.max(0, width - 2 * inset);
+    const innerHeight = height - 2 * inset;
+    const title: TerminalLine = [{ text: "Quick jump", style: theme.accentBold }];
+    const rows: TerminalLine[] = !boxed && innerHeight >= 2 ? [clipSpans(title, innerWidth)] : [];
+    const queryRow = rows.length;
+    const prompt = innerWidth >= 3 ? "› " : "";
+    const promptWidth = terminalTextWidth(prompt);
+    const query = editorLayout(finder.query, finder.query.length, Math.max(1, innerWidth - promptWidth));
+    rows.push(clipSpans([
+      { text: prompt, style: theme.accentBold },
+      { text: query.rows[query.cursorRow] },
+    ], innerWidth));
+    const available = Math.max(0, innerHeight - rows.length);
+    if (selectedIndex < finder.top) finder.top = selectedIndex;
+    if (selectedIndex >= finder.top + available) finder.top = selectedIndex - available + 1;
+    finder.top = Math.max(0, Math.min(finder.top, items.length - available));
+    if (!items.length && available) rows.push(clipSpans([{ text: "No matching sessions or channels", style: theme.dim }], innerWidth));
+    for (let index = finder.top; index < Math.min(items.length, finder.top + available); index++) {
+      const item = items[index];
+      const selected = item.key === finder.selected;
+      const left: TerminalSpan[] = [
+        this.marker(selected),
+        { text: item.session ? item.name : `#${item.name}`, style: selected ? theme.accentBold : theme.bold },
+        ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
+      ];
+      const right: TerminalSpan[] = item.session
+        ? [{ text: item.session.state === "gone" ? "reconnecting" : item.session.state === "live" ? "live" : "archived", style: this.stateLabel(item.session).style }]
+        : [{ text: "channel", style: theme.dim }];
+      this.hits.push({ row: y0 + inset + rows.length, start: inset, end: width - inset, target: { kind: "finder", key: item.key } });
+      rows.push(justify(left, right, innerWidth, selected ? theme.selected : undefined));
+    }
+    const cursor = width > 0 ? {
+      row: y0 + inset + queryRow,
+      column: inset + Math.max(0, Math.min(innerWidth - 1, promptWidth + query.cursorColumn)),
+    } : undefined;
+    return {
+      rows: boxed ? roundedPanel(title, rows, width, height, true) : rows,
+      ...(cursor ? { cursor } : {}),
+    };
+  }
+
   // ------------------------------------------------------------------ rendering
 
   private render(): void {
@@ -656,6 +807,7 @@ export class ConsoleApp {
     const bodyHeight = Math.max(0, height - top - bottom);
     const lines: TerminalLine[] = [];
     if (top) lines.push(this.tabBar(width));
+    if (this.finder) this.hits = []; // visible tabs are inert while the finder owns input
     const body = this.body(width, bodyHeight, top);
     lines.push(...body.rows);
     if (bottom) lines.push(this.footer(width));
@@ -749,13 +901,14 @@ export class ConsoleApp {
   }
 
   private footer(width: number): TerminalLine {
-    const hints = this.palette ? "type to filter · ↑↓ · Enter run · Esc close"
-      : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel"
-      : this.searching ? "type name · ↑↓ · Enter keep · Esc clear"
-      : this.focus === "composer" ? "Enter send · Shift+Enter newline · Ctrl+E editor · Esc done"
-      : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · ? menu"
-      : this.focus === "tabs" ? "←→ switch · Enter open · ? menu"
-      : "↑↓ move · Enter open · Tab focus · ? menu";
+    const hints = this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
+      : this.palette ? "type to filter · ↑↓ · Enter run · Esc close · Ctrl+K jump"
+      : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel · Ctrl+K jump"
+      : this.searching ? "type name · ↑↓ · Enter keep · Esc clear · Ctrl+K jump"
+      : this.focus === "composer" ? "Enter send · Shift+Enter newline · Ctrl+E editor · Esc done · Ctrl+K jump"
+      : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · Ctrl+K jump · ? menu"
+      : this.focus === "tabs" ? "←→ switch · Enter open · Ctrl+K jump · ? menu"
+      : "↑↓ move · Enter open · Tab focus · Ctrl+K jump · ? menu";
     const notice = this.notice;
     if (!notice) return padSpans(hintSpans(hints, width), width);
     const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
@@ -769,6 +922,7 @@ export class ConsoleApp {
 
   private body(width: number, height: number, y0: number): Pane {
     if (height <= 0) return { rows: [] };
+    if (this.finder) return this.finderPane(width, height, y0);
     if (this.palette) return this.palettePane(width, height, y0);
     if (this.form) return this.formPane(width, height, y0);
     if (this.tab === "activity") return this.listPane(width, height, y0, 0);
@@ -1211,7 +1365,11 @@ export class ConsoleApp {
 
   private paste(text: string): void {
     const clean = cleanInput(text);
-    if (this.palette) this.palette.query += clean.replace(/\n/g, " ");
+    if (this.finder) {
+      this.finder.query += clean.replace(/\n/g, " ");
+      this.finder.selected = undefined;
+      this.finder.top = 0;
+    } else if (this.palette) this.palette.query += clean.replace(/\n/g, " ");
     else if (this.form) this.formInsert(clean);
     else if (this.searching) this.query += clean.replace(/\n/g, " ").toLowerCase();
     else if (this.composeTarget()) {
@@ -1311,6 +1469,8 @@ export class ConsoleApp {
 
   private async key(k: KeyInput): Promise<void> {
     if (this.closed) return;
+    if (k.name === "CTRL_K") return this.openFinder();
+    if (this.finder) return this.finderKey(k);
     if (this.palette) return this.paletteKey(k);
     if (this.form) return this.formKey(k);
     if (this.searching) return this.searchKey(k);
@@ -1485,6 +1645,18 @@ export class ConsoleApp {
   private async mouse(m: MouseInput): Promise<void> {
     if (this.closed) return;
     const hit = this.hits.find((h) => h.row === m.row && m.column >= h.start && m.column < h.end);
+    if (this.finder) {
+      if (m.action === "wheel-up" || m.action === "wheel-down") {
+        const items = this.jumpItems();
+        const index = Math.max(0, Math.min(items.length - 1, this.finderIndex(items) + (m.action === "wheel-up" ? -1 : 1)));
+        this.finder.selected = items[index]?.key;
+        return this.render();
+      }
+      if (m.action === "press" && m.button === "left" && hit?.target.kind === "finder") {
+        return this.jumpTo(hit.target.key);
+      }
+      return;
+    }
     if (m.action === "wheel-up" || m.action === "wheel-down") {
       const delta = m.action === "wheel-up" ? -3 : 3;
       if (this.palette) this.palette.selected = Math.max(0, this.palette.selected + Math.sign(delta));
@@ -1631,6 +1803,7 @@ export class ConsoleApp {
         case "Inbox": return this.setTab("inbox");
         case "Channels": return this.setTab("channels");
         case "Activity": return this.setTab("activity");
+        case "Quick jump": return this.openFinder();
         case "Search sessions":
           await this.setTab("sessions");
           this.searching = true;

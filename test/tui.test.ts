@@ -25,6 +25,7 @@ type Console = {
   frame(): TerminalFrame;
   press(name: string): Promise<void>;
   click(column: number, row?: number): Promise<void>;
+  paste(text: string): Promise<void>;
   close(): void;
   type(text: string): Promise<void>;
   until(predicate: () => boolean | Promise<boolean>, what: string): Promise<void>;
@@ -57,6 +58,10 @@ async function startConsole(columns: number, rows: number): Promise<Console> {
     },
     async click(column, row = 0) {
       handlers.onMouse?.({ name: "MOUSE_LEFT_BUTTON_PRESSED", column, row, action: "press", button: "left", ctrl: false, alt: false, shift: false });
+      await app.idle();
+    },
+    async paste(text) {
+      handlers.onPaste?.(text);
       await app.idle();
     },
     close: () => handlers.onInterrupt?.(),
@@ -210,6 +215,7 @@ test("keyboard protocol reports become legacy keys, and Shift+Enter its own key"
   assert.deepEqual(translateKeyboardInput("\u001b[27;2;13~"), [{ key: "SHIFT_ENTER" }]);
   assert.deepEqual(translateKeyboardInput("\u001b[99;5u\u001b[27u\u001b[9;2u\u001b[97;3u\u001b[13u"), [{ text: "\u0003\u001b\u001b[Z\u001ba\r" }]);
   assert.deepEqual(translateKeyboardInput("\u001b[57399u\u001b[200~x\u001b[1;2A"), [{ text: "\u001b[200~x\u001b[1;2A" }]);
+  assert.deepEqual(translateKeyboardInput("\u001b[107;5u\u001b[27;5;107~\u000b"), [{ text: "\u000b\u000b\u000b" }]);
 });
 
 test("frame diff reports only rows whose visible text or style changed", () => {
@@ -627,4 +633,290 @@ test("console shows control actions beside their kind without changing ordinary 
   assert.ok(ordinary, "ordinary status tag remains visible");
   assert.ok(!ordinary.includes("pause") && !ordinary.includes("control"), "ordinary metadata is unchanged");
   assertWithin(ui);
+});
+
+async function quickJump(ui: Console, query: string, body: string): Promise<void> {
+  await ui.press("CTRL_K");
+  assert.ok(ui.rows().some((row) => row.includes("Quick jump")), "finder opens");
+  await ui.type(query);
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes(body)), `jump to ${body}`);
+  assert.ok(!ui.rows().some((row) => row.includes("Quick jump")), "Enter closes the finder");
+}
+
+test("quick jump opens from every focus and Esc restores the focus and composer cursor", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "jump-alpha", "alpha");
+  await alpha.client.request("send", { to: "human", text: "alpha-focus-history" });
+  const ui = await startConsole(100, 24);
+  await ui.until(() => ui.rows().some((row) => row.includes("alpha-focus-history")), "initial history");
+  const cancel = async (focus: string): Promise<void> => {
+    const cursor = ui.frame().cursor;
+    await ui.press("CTRL_K");
+    assert.ok(ui.rows().some((row) => row.includes("Quick jump")), `opens from ${focus}`);
+    await ui.type("no-such-session");
+    await ui.press("ESCAPE");
+    assert.ok(!ui.rows().some((row) => row.includes("Quick jump")), `closes from ${focus}`);
+    assert.deepEqual(ui.frame().cursor, cursor, `${focus} cursor is restored`);
+  };
+  await cancel("list");
+  await ui.press("SHIFT_TAB");
+  await cancel("tabs");
+  await ui.press("RIGHT");
+  await ui.press("s");
+  await ui.press("TAB");
+  await ui.press("ENTER");
+  await cancel("transcript");
+  await ui.press("c");
+  await ui.type("ab");
+  await ui.press("LEFT");
+  await cancel("composer");
+  await ui.type("X");
+  await ui.press("ENTER");
+  assert.equal((await alpha.nextDelivery()).msg.text, "aXb", "Esc returns to the same draft insertion point");
+});
+
+test("quick jump suspends search, the action palette and full editor without editing their text", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "jump-modal-alpha", "alpha");
+  await alpha.client.request("send", { to: "human", text: "modal-alpha-history" });
+  const ui = await startConsole(120, 32);
+  await ui.press("/");
+  await ui.type("alp");
+  await ui.press("CTRL_K");
+  assert.ok(ui.rows().some((row) => row.includes("Quick jump")));
+  await ui.type("missing");
+  await ui.press("ESCAPE");
+  await ui.type("ha");
+  assert.ok(ui.rows().some((row) => row.includes("/ alpha")), "search query and search focus are restored");
+  await ui.press("ESCAPE");
+
+  await ui.press("?");
+  await ui.type("ren");
+  await ui.press("CTRL_K");
+  assert.ok(ui.rows().some((row) => row.includes("Quick jump")));
+  await ui.type("missing");
+  await ui.press("ESCAPE");
+  await ui.type("ame");
+  assert.ok(ui.rows().some((row) => row.includes("Rename session")), "palette query resumes");
+  assert.ok(!ui.rows().some((row) => row.includes("Daemon start")), "palette filter remains active");
+  await ui.press("ESCAPE");
+
+  await ui.press("CTRL_E");
+  await ui.type("editor draft");
+  const cursor = ui.frame().cursor;
+  await ui.press("CTRL_K");
+  assert.ok(ui.rows().some((row) => row.includes("Quick jump")));
+  await ui.type("missing");
+  await ui.press("ESCAPE");
+  assert.deepEqual(ui.frame().cursor, cursor, "full editor returns to its original field");
+  await ui.type(" retained");
+  await ui.press("CTRL_D");
+  assert.equal((await alpha.nextDelivery()).msg.text, "editor draft retained", "finder text never enters the editor draft");
+});
+
+test("quick jump matches former names, reconnecting and archived identities and channel subsequences", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const archived = await env.adapter("omp", "jump-archive", "reviewer");
+  await archived.client.request("send", { to: "human", text: "retired-history-marker" });
+  await human.request("rename", { from: "reviewer", name: "retired" });
+  await archived.client.request("unregister");
+  const reconnecting = await env.adapter("omp", "jump-reconnect", "remote-worker");
+  await reconnecting.client.request("send", { to: "human", text: "reconnecting-history-marker" });
+  const gone = await env.watch((event) => event.type === "session" && event.action === "gone" && event.name === "remote-worker");
+  reconnecting.client.close();
+  await gone.event;
+  const alpha = await env.adapter("omp", "jump-live", "alpha");
+  await alpha.client.request("send", { to: "human", text: "live-alpha-marker" });
+  await human.request("channel_send", { channel: "release-work", text: "release-channel-marker" });
+  const ui = await startConsole(120, 32);
+
+  await ui.press("/");
+  await ui.type("alpha");
+  await quickJump(ui, "RvW", "retired-history-marker");
+  await ui.press("LEFT");
+  const list = ui.rows().map((row) => truncateTerminalText(row, paneWidths(120)!.list)).join("\n");
+  assert.ok(list.includes("retired"), "archive is expanded and the previous session filter is cleared");
+  assert.ok(list.includes("alpha"), "unrelated live identities remain reachable after jumping");
+  await quickJump(ui, "RmW", "reconnecting-history-marker");
+  await ui.press("CTRL_K");
+  await ui.type("rlw");
+  assert.ok(ui.rows().some((row) => row.includes("#release-work")), "channels carry a # label");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("release-channel-marker")), "unprefixed channel subsequence");
+  await quickJump(ui, "#RLW", "release-channel-marker");
+});
+
+test("quick jump ranks exact before prefix before subsequence and live before archived ties", async () => {
+  env = await startEnv();
+  const archived = await env.adapter("omp", "rank-archived", "review");
+  await archived.client.request("send", { to: "human", text: "archived-exact-marker" });
+  await archived.client.request("unregister");
+  env.clock.advance(1000);
+  const exact = await env.adapter("omp", "rank-live", "review");
+  await exact.client.request("send", { to: "human", text: "live-exact-marker" });
+  env.clock.advance(1000);
+  const prefix = await env.adapter("omp", "rank-prefix", "reviewer");
+  await prefix.client.request("send", { to: "human", text: "live-prefix-marker" });
+  env.clock.advance(1000);
+  const subsequence = await env.adapter("omp", "rank-subsequence", "red-view");
+  await subsequence.client.request("send", { to: "human", text: "live-subsequence-marker" });
+  const ui = await startConsole(100, 24);
+  for (const [index, marker] of ["live-exact-marker", "archived-exact-marker", "live-prefix-marker", "live-subsequence-marker"].entries()) {
+    await ui.press("CTRL_K");
+    await ui.type("ReViEw");
+    const results = ui.rows().filter((row) => row.includes("review") || row.includes("red-view"));
+    assert.ok(results.some((row) => row.includes("reviewer")), "prefix match is rendered");
+    assert.ok(results.some((row) => row.includes("red-view")), "ordered subsequence match is rendered");
+    assert.ok(results.some((row) => row.includes("archived")), "reused names retain their archived identity");
+    for (let step = 0; step < index; step++) await ui.press("DOWN");
+    await ui.press("ENTER");
+    await ui.until(() => ui.rows().some((row) => row.includes(marker)), `rank ${index + 1} opens its own history`);
+    for (const other of ["live-exact-marker", "archived-exact-marker", "live-prefix-marker", "live-subsequence-marker"]) {
+      if (other !== marker) assert.ok(!ui.rows().some((row) => row.includes(other)), "same or similar names do not merge histories");
+    }
+  }
+});
+
+test("quick jumps preserve separate identity and channel drafts and send once to the renamed identity", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const reviewer = await env.adapter("omp", "jump-draft-reviewer", "reviewer");
+  const peer = await env.adapter("omp", "jump-draft-peer", "peer");
+  await reviewer.client.request("send", { to: "human", text: "reviewer-draft-history" });
+  await peer.client.request("send", { to: "human", text: "peer-draft-history" });
+  await human.request("channel_send", { channel: "work", text: "work-draft-history" });
+  const ui = await startConsole(120, 32);
+  await quickJump(ui, "reviewer", "reviewer-draft-history");
+  await ui.press("c");
+  await ui.type("identity draft");
+  await human.request("rename", { from: "reviewer", name: "renamed" });
+  await ui.until(() => ui.rows().some((row) => row.includes("renamed")), "rename");
+  await quickJump(ui, "#work", "work-draft-history");
+  await ui.press("c");
+  await ui.type("channel draft");
+  await quickJump(ui, "peer", "peer-draft-history");
+  await ui.press("c");
+  await ui.type("peer draft");
+  await quickJump(ui, "#work", "work-draft-history");
+  assert.ok(ui.rows().some((row) => row.includes("channel draft")), "channel draft survives a jump");
+  assert.ok(!ui.rows().some((row) => row.includes("identity draft") || row.includes("peer draft")), "drafts do not leak between targets");
+  await quickJump(ui, "RvW", "reviewer-draft-history");
+  assert.ok(ui.rows().some((row) => row.includes("identity draft")), "former-name jump restores the stable identity draft");
+  await ui.press("c");
+  await ui.press("ENTER");
+  await ui.press("ENTER");
+  assert.equal((await reviewer.nextDelivery()).msg.text, "identity draft");
+  const history = await human.historyPage({ scope: "session", sessionId: reviewer.session.id });
+  assert.equal(history.messages.filter((message) => message.from === "human" && message.text === "identity draft").length, 1, "draft is sent exactly once");
+  const peerHistory = await human.historyPage({ scope: "session", sessionId: peer.session.id });
+  assert.ok(!peerHistory.messages.some((message) => message.text === "identity draft"), "no send to another identity");
+  await quickJump(ui, "peer", "peer-draft-history");
+  assert.ok(ui.rows().some((row) => row.includes("peer draft")), "unsent peer draft is intact");
+});
+
+test("quick jump empty results cannot open or send and Backspace recovers without changing the draft", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "jump-empty", "alpha");
+  await alpha.client.request("send", { to: "human", text: "empty-recovery-history" });
+  const ui = await startConsole(80, 20);
+  await ui.press("c");
+  await ui.type("untouched draft");
+  await ui.press("CTRL_K");
+  await ui.type("alphaz");
+  assert.ok(!ui.rows().some((row) => row.includes("empty-recovery-history")), "finder replaces the transcript");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("Quick jump")), "Enter with no match stays in the finder");
+  assert.equal(alpha.deliveries.length, 0, "Enter in the finder never submits the composer");
+  await ui.press("BACKSPACE");
+  assert.ok(ui.rows().some((row) => row.includes("alpha")), "Backspace restores the matching identity");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("empty-recovery-history")), "recovered selection");
+  assert.ok(ui.rows().some((row) => row.includes("untouched draft")), "draft was not used as the query");
+});
+
+test("quick jump scrolls beyond the visible results and clips in narrow and tiny terminals", async () => {
+  env = await startEnv();
+  for (let index = 0; index < 12; index++) {
+    const session = await env.adapter("omp", `jump-scroll-${index}`, `worker-${String(index).padStart(2, "0")}`);
+    await session.client.request("send", { to: "human", text: `scroll-history-${index}` });
+  }
+  const ui = await startConsole(24, 8);
+  await ui.press("CTRL_K");
+  assert.ok(ui.rows().some((row) => row.includes("Quick jump")));
+  await ui.type("worker");
+  const initiallyVisible = ui.rows().join("\n");
+  for (let index = 0; index < 11; index++) {
+    await ui.press("DOWN");
+    assertWithin(ui);
+  }
+  const result = ui.rows().find((row) => row.includes("›") && /worker-\d\d/.test(row));
+  assert.ok(result, "selected result remains visible after scrolling");
+  const selected = Number(result.match(/worker-(\d\d)/)![1]);
+  assert.ok(!initiallyVisible.includes(`worker-${String(selected).padStart(2, "0")}`), "selection reached a result outside the original viewport");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes(`scroll-history-${selected}`)), "off-screen result history");
+  await ui.press("CTRL_K");
+  for (const dimensions of [{ columns: 10, rows: 4 }, { columns: 1, rows: 3 }, { columns: 24, rows: 8 }]) {
+    Object.assign(ui.size, dimensions);
+    await ui.press("DOWN");
+    assertWithin(ui);
+  }
+  await ui.press("ESCAPE");
+  assert.ok(ui.rows().some((row) => row.includes(`scroll-history-${selected}`)), "tiny rendering does not alter the selected conversation");
+});
+
+test("pasting into quick jump filters results without leaking into a suspended composer", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "jump-paste-alpha", "alpha");
+  const reviewer = await env.adapter("omp", "jump-paste-reviewer", "reviewer");
+  await alpha.client.request("send", { to: "human", text: "paste-alpha-history" });
+  await reviewer.client.request("send", { to: "human", text: "paste-reviewer-history" });
+  const ui = await startConsole(120, 32);
+  await quickJump(ui, "alpha", "paste-alpha-history");
+  await ui.press("c");
+  await ui.type("paste-safe draft");
+  await ui.press("CTRL_K");
+  await ui.paste("RvW");
+  assert.ok(ui.rows().some((row) => row.includes("reviewer")), "paste updates the finder query");
+  assert.ok(!ui.rows().some((row) => row.includes("alpha")), "pasted query filters out other identities");
+  await ui.press("ESCAPE");
+  await ui.press("ENTER");
+  assert.equal((await alpha.nextDelivery()).msg.text, "paste-safe draft", "pasted finder text does not enter the saved draft");
+  assert.equal(reviewer.deliveries.length, 0, "filtering does not send to a result");
+});
+
+test("quick jump keeps the highlighted identity through live result reordering", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "jump-churn-alpha", "alpha");
+  const bravo = await env.adapter("omp", "jump-churn-bravo", "bravo");
+  await env.adapter("omp", "jump-churn-charlie", "charlie");
+  await bravo.client.request("send", { to: "human", text: "stable-bravo-history" });
+  const ui = await startConsole(120, 32);
+  await ui.press("CTRL_K");
+  await ui.press("DOWN");
+  assert.ok(ui.rows().some((row) => row.includes("› bravo")), "bravo is highlighted");
+  await env.adapter("omp", "jump-churn-earlier", "aardvark");
+  await ui.until(() => ui.rows().some((row) => row.includes("aardvark")), "inserted earlier result");
+  assert.ok(ui.rows().some((row) => row.includes("› bravo")), "insertion retains the highlighted identity");
+  await alpha.client.request("unregister");
+  await ui.until(() => ui.rows().some((row) => /alpha.*archived/.test(row)), "earlier result changes state");
+  assert.ok(ui.rows().some((row) => row.includes("› bravo")), "state sorting retains the highlighted identity");
+  await human.request("rename", { from: "bravo", name: "zz-bravo" });
+  await ui.until(() => ui.rows().some((row) => row.includes("zz-bravo")), "highlighted identity renamed");
+  assert.ok(ui.rows().some((row) => row.includes("› zz-bravo")), "rename retains the highlighted identity");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("stable-bravo-history")), "Enter opens highlighted identity");
+
+  await human.request("channel_send", { channel: "zebra", text: "stable-zebra-history" });
+  await ui.press("CTRL_K");
+  await ui.type("#");
+  await ui.until(() => ui.rows().some((row) => row.includes("#zebra")), "channel result");
+  await human.request("channel_send", { channel: "aardvark", text: "other-channel-history" });
+  await ui.until(() => ui.rows().some((row) => row.includes("#aardvark")), "inserted earlier channel");
+  assert.ok(ui.rows().some((row) => row.includes("› #zebra")), "channel insertion retains the highlighted channel");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("stable-zebra-history")), "Enter opens highlighted channel");
 });
