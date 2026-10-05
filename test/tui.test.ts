@@ -139,6 +139,7 @@ test("held shortcuts retain search, palette and form typing and cannot act from 
   await ui.press("CTRL_E");
   await ui.type("rx");
   await ui.press("CTRL_D");
+  await ui.until(() => target.deliveries.length > 0, "expected form message delivery");
   assert.equal((await target.nextDelivery()).msg.text, "rx", "form typing reaches the target as a human message");
   assert.equal((await logOf(human, msgId)).status, "held");
 
@@ -171,6 +172,7 @@ test("held actions stay bound to the target identity across rename and name reus
   await human.request("rename", { from: "beta", name: "renamed" });
   await ui.until(() => ui.rows().some((row) => row.includes("to renamed")), "bound target rename");
   await ui.press("r");
+  await ui.until(() => target.deliveries.length > 0, "expected oldest held message delivery after rename");
   assert.equal((await target.nextDelivery()).msg.id, firstId);
   assert.equal((await logOf(human, secondId)).status, "held");
   const replacement = await env.adapter("omp", "held-rename-replacement", "beta");
@@ -206,15 +208,15 @@ test("stale held actions refresh without consuming the next message or a newly o
   const gammaId = (gamma.results as { msgId: string }[])[0].msgId;
   const firstId = (first.results as { msgId: string }[])[0].msgId;
   const secondId = (second.results as { msgId: string }[])[0].msgId;
-  const started = Promise.withResolvers<void>();
-  const proceed = Promise.withResolvers<void>();
+  let interleave: (() => void) | undefined;
+  const overlapping: Promise<void>[] = [];
   let delayRelease = true;
   const ui = await startConsole(120, 32, (options) => new class extends AsenqClient {
     override async request(op: string, params: Record<string, unknown> = {}) {
       if (op === "release" && delayRelease) {
         delayRelease = false;
-        started.resolve();
-        await proceed.promise;
+        await human.request("release", { msgId: firstId });
+        interleave?.();
       }
       return super.request(op, params);
     }
@@ -226,31 +228,22 @@ test("stale held actions refresh without consuming the next message or a newly o
   const listWidth = paneWidths(120)!.list;
   const gammaRow = ui.rows().findIndex((row) => truncateTerminalText(row, listWidth).includes("gamma"));
   assert.ok(gammaRow >= 0);
-  const pendingRelease = ui.press("r");
-  try {
-    await started.promise;
-    await human.request("release", { msgId: firstId });
-    assert.equal((await beta.nextDelivery()).msg.id, firstId);
-    const switchTarget = ui.click(3, gammaRow);
+  interleave = () => {
+    overlapping.push(ui.click(3, gammaRow));
     assert.ok(ui.rows().some((row) => row.includes("⏸") && row.includes("held") && row.includes("gamma")), "the overlapping shortcuts see gamma's actionable bar");
-    const overlappingRelease = ui.press("r");
-    const overlappingDrop = ui.press("x");
-    const compose = ui.press("c");
-    const typeR = ui.press("r");
-    const typeX = ui.press("x");
-    proceed.resolve();
-    await Promise.all([pendingRelease, switchTarget, overlappingRelease, overlappingDrop, compose, typeR, typeX]);
-    assert.equal((await logOf(human, secondId)).status, "held", "a stale captured ID never falls through to the next beta message");
-    assert.equal((await logOf(human, gammaId)).status, "held", "overlapping keys do not act on the newly opened target");
-    assert.ok(ui.rows().some((row) => row.includes("not held")), "stale release retains the existing error notice");
-    assert.ok(ui.rows().some((row) => row.includes("to gamma")), "action completion keeps the new target");
-    assert.ok(ui.rows().some((row) => row.includes("› rx")), "action completion keeps the new target's draft");
-    assert.match(ui.rows()[0], /2 held/);
-    assertWithin(ui);
-  } finally {
-    proceed.resolve();
-    await pendingRelease;
-  }
+    overlapping.push(ui.press("r"), ui.press("x"), ui.press("c"), ui.press("r"), ui.press("x"));
+  };
+  await ui.press("r");
+  await Promise.all(overlapping);
+  await ui.until(() => beta.deliveries.length > 0, "expected competing release delivery");
+  assert.equal((await beta.nextDelivery()).msg.id, firstId);
+  assert.equal((await logOf(human, secondId)).status, "held", "a stale captured ID never falls through to the next beta message");
+  assert.equal((await logOf(human, gammaId)).status, "held", "overlapping keys do not act on the newly opened target");
+  assert.ok(ui.rows().some((row) => row.includes("not held")), "stale release retains the existing error notice");
+  assert.ok(ui.rows().some((row) => row.includes("to gamma")), "action completion keeps the new target");
+  assert.ok(ui.rows().some((row) => row.includes("› rx")), "action completion keeps the new target's draft");
+  assert.match(ui.rows()[0], /2 held/);
+  assertWithin(ui);
 });
 
 test("header hydrates held messages and follows hold, release, drop and target removal", async () => {
