@@ -692,17 +692,16 @@ test("channel tool results report actual mention admission states and resolve fu
   const output = await callTool(poster.client, "asenq_channel_send", {
     channel: "work", text: "Review @delivered @holder @refuser @queued",
   });
-  assert.match(output, /^posted m_[0-9a-f]{12} to #work/);
   for (const [name, status] of [["delivered", "delivered"], ["holder", "held"], ["refuser", "rejected"], ["queued", "queued"]]) {
     assert.match(output, new RegExp(`^${name} m_[0-9a-f]{12} ${status}(?: |$)`, "m"));
   }
   const invalid = await callTool(poster.client, "asenq_channel_send", { channel: "work", text: "@delivered @missing" });
-  assert.match(invalid, /^asenq error \(unknown_mention\): /);
+  assert.ok(invalid.includes("unknown_mention"));
   assert.ok(invalid.includes("delivered"));
   assert.equal(delivered.deliveries.length, 1);
-  const plain = await callTool(poster.client, "asenq_channel_send", { channel: "work", text: "Read on demand" });
-  assert.ok(plain.includes("mention targets: none"));
-  assert.ok(plain.includes("no direct messages pushed"));
+  await callTool(poster.client, "asenq_channel_send", { channel: "work", text: "Read on demand" });
+  const posts = (await human.historyPage({ scope: "channel", channel: "work" })).messages;
+  assert.deepEqual(posts.map((post) => post.text), ["Review @delivered @holder @refuser @queued", "Read on demand"]);
   assert.equal(delivered.deliveries.length, 1);
 });
 

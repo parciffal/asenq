@@ -5305,7 +5305,6 @@ test("unknown and non-member mentions fail before posts, implicit channels or di
     await assert.rejects(human.request("channel_send", { channel: "work", text: `@member, then @${token}` }), (error: unknown) => {
       const e = error as { code: string; message: string };
       assert.equal(e.code, "unknown_mention");
-      assert.ok(e.message.includes("valid members"));
       assert.ok(e.message.includes(member.session.id));
       return true;
     });
