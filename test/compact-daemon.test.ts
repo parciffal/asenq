@@ -153,12 +153,90 @@ test("disconnect after compact receipt finishes the outcome and revival does not
   const push = await target.nextDelivery();
   await target.client.request("ack", { as: target.session.id, msgId: push.msg.id, ok: true, reset: "pending" });
   await sending;
+  const [deferred] = (await human.request("send", { to: "target", text: "deferred after interrupted reset" })).results as SendResult[];
+  assert.equal(deferred.status, "queued");
   const gone = await env.watch(isSession("gone", "target"));
   target.client.close();
   await gone.event;
   const retained = await logOf(human, push.msg.id);
   assert.deepEqual([retained.status, retained.resetResult], ["failed", "failed"]);
+  assert.equal((await logOf(human, deferred.msgId!)).status, "queued");
+  const finished = await env.watch(isStatus(deferred.msgId, "delivered"));
   const revived = await env.adapter("omp", "interrupted", "target");
-  await env.daemon.flush(revived.session.id);
-  assert.equal(revived.deliveries.length, 0);
+  await finished.event;
+  assert.deepEqual(revived.deliveries.map(({ msg }) => msg.id), [deferred.msgId], "revival delivers only the deferred task, not the accepted compact task");
+});
+
+test("a pending reset defers normal delivery attempts until compaction finishes", async () => {
+  env = await startEnv({ ackTimeoutMs: 30 });
+  const human = env.human();
+  const target = await env.adapter("omp", "blocking", "target", { autoAck: false });
+  await target.client.request("register", { harness: "omp", key: "blocking", caps: ["compact"] });
+  const sending = human.request("send", { to: "target", text: "compact task", reset: "compact" });
+  void sending.catch(() => {});
+  const first = await target.nextDelivery();
+  await target.client.request("ack", { as: target.session.id, msgId: first.msg.id, ok: true, reset: "pending" });
+  await sending;
+  const [normal] = (await human.request("send", { to: "target", text: "later normal task" })).results as SendResult[];
+  assert.equal(normal.status, "queued");
+  env.clock.advance(60_000);
+  await env.daemon.retry();
+  assert.equal(target.deliveries.length, 1, "normal messages are not pushed into a long compaction and retried");
+  const received = target.nextDelivery();
+  await target.client.request("reset_result", { as: target.session.id, msgId: first.msg.id, reset: "compacted", ok: true });
+  const next = await received;
+  assert.equal(next.msg.id, normal.msgId);
+  const finished = await env.watch(isStatus(normal.msgId, "delivered"));
+  await target.client.request("ack", { msgId: next.msg.id, ok: true });
+  await finished.event;
+  assert.equal(target.deliveries.length, 2, "the deferred message is delivered exactly once after compaction");
+});
+
+for (const timeout of [50, 10 * 60_000]) {
+  test(`pending reset expires at ${timeout} ms and flushes the deferred queue`, async () => {
+    env = await startEnv(timeout === 50 ? { resetTimeoutMs: timeout } : {});
+    const human = env.human();
+    const target = await env.adapter("omp", "timeout", "target", { autoAck: false });
+    await target.client.request("register", { harness: "omp", key: "timeout", caps: ["compact"] });
+    const sending = human.request("send", { to: "target", text: "hanging reset", reset: "compact" });
+    void sending.catch(() => {});
+    const first = await target.nextDelivery();
+    await target.client.request("ack", { as: target.session.id, msgId: first.msg.id, ok: true, reset: "pending" });
+    await sending;
+    const [normal] = (await human.request("send", { to: "target", text: "task after timeout" })).results as SendResult[];
+    assert.equal(normal.status, "queued");
+    env.clock.advance(timeout - 1);
+    env.daemon.sweep();
+    assert.equal((await logOf(human, first.msg.id)).resetResult, undefined);
+    assert.equal(target.deliveries.length, 1);
+    await target.client.request("ack", { as: target.session.id, msgId: first.msg.id, ok: true, reset: "pending" });
+    env.clock.advance(1);
+    const next = target.nextDelivery();
+    env.daemon.sweep();
+    assert.equal((await next).msg.id, normal.msgId, "expiry releases the next delivery attempt");
+    const delivered = await env.watch(isStatus(normal.msgId, "delivered"));
+    await target.client.request("ack", { msgId: normal.msgId, ok: true });
+    await delivered.event;
+    const retained = await logOf(human, first.msg.id);
+    assert.deepEqual([retained.status, retained.resetResult, retained.reason], ["failed", "failed", "compact delivery timed out"]);
+    await target.client.request("reset_result", { as: target.session.id, msgId: first.msg.id, reset: "compacted", ok: true });
+    assert.equal((await logOf(human, first.msg.id)).resetResult, "failed", "a late completion cannot undo timeout");
+  });
+}
+
+test("queue expiry before compact receipt does not leave the target gated forever", async () => {
+  env = await startEnv({ ackTimeoutMs: 30, queueTtlMs: 10 });
+  const human = env.human();
+  const target = await env.adapter("omp", "expiry", "target", { autoAck: false });
+  await target.client.request("register", { harness: "omp", key: "expiry", caps: ["compact"] });
+  const sending = human.request("send", { to: "target", text: "expires before receipt", reset: "compact" });
+  void sending.catch(() => {});
+  await target.nextDelivery();
+  env.clock.advance(10);
+  env.daemon.sweep();
+  assert.equal(((await sending).results as SendResult[])[0].status, "expired");
+  const [normal] = (await human.request("send", { to: "target", text: "normal after expired reset" })).results as SendResult[];
+  assert.deepEqual(target.deliveries.map(({ msg }) => msg.text), ["expires before receipt", "normal after expired reset"]);
+  await target.client.request("ack", { msgId: normal.msgId, ok: true });
+  assert.equal((await logOf(human, normal.msgId!)).status, "delivered");
 });

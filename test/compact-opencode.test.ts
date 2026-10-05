@@ -187,7 +187,7 @@ test("acks receipt immediately, compacts, then injects the flagged message in or
   await sdk.callHappened("prompt");
   assert.deepEqual(sdk.calls, ["messages", "summarize", "prompt"], "fetch model, compact, then inject");
   assert.deepEqual(sdk.summarizeCalls[0]?.body, { providerID: "anthropic", modelID: "claude-sonnet-4" });
-  assert.equal(sdk.prompts[0]?.text, "new task");
+  assert.match(sdk.prompts[0].text, /(?:^|\n)new task(?:\n|$)/);
   await finished.event;
 });
 
@@ -213,13 +213,16 @@ test("a same-session push queues behind an in-flight compaction instead of overt
   await sdk.callHappened("summarize");
 
   const normal = send(human, name, "after task");
+  void normal.catch(() => {});
   await normalQueued.event;
   assert.deepEqual(sdk.calls, ["messages", "summarize"], "no queued delivery may start before compaction ends");
   assert.equal(sdk.prompts.length, 0);
 
   held.resolve();
   await sdk.callHappened("prompt", 2);
-  assert.deepEqual(sdk.prompts.map((p) => p.text), ["compact task", "after task"]);
+  assert.equal(sdk.prompts.length, 2, "each message is injected exactly once");
+  assert.match(sdk.prompts[0].text, /(?:^|\n)compact task(?:\n|$)/);
+  assert.match(sdk.prompts[1].text, /(?:^|\n)after task(?:\n|$)/);
   await finished.event;
   assert.equal((await normal).reset, undefined, "an ordinary push carries no reset outcome");
 });
@@ -274,7 +277,9 @@ test("summarize error or false still injects the message and reports failed", as
   await firstFailed.event;
   await secondFailed.event;
   await sdk.callHappened("prompt", 2);
-  assert.deepEqual(sdk.prompts.map((p) => p.text), ["first", "second"], "compaction failure must not suppress the message");
+  assert.equal(sdk.prompts.length, 2, "compaction failure must not suppress either message");
+  assert.match(sdk.prompts[0].text, /(?:^|\n)first(?:\n|$)/);
+  assert.match(sdk.prompts[1].text, /(?:^|\n)second(?:\n|$)/);
 });
 
 test("another OpenCode binding delivers while a different binding compacts", async () => {
@@ -316,7 +321,7 @@ test("does not declare compact without summarize/messages and still delivers", a
   const result = await send(human, name, "still delivered", "compact");
   assert.equal(result.reset, "unsupported", "a target without the cap reports unsupported");
   await sdk.callHappened("prompt");
-  assert.equal(sdk.prompts[0]?.text, "still delivered");
+  assert.match(sdk.prompts[0].text, /(?:^|\n)still delivered(?:\n|$)/);
   assert.deepEqual(sdk.calls, ["prompt"], "without the SDK API no compaction work is attempted");
   await finished.event;
 });

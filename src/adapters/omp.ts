@@ -85,8 +85,9 @@ export default function asenq(pi: ExtensionAPI): void {
       }
     }
     // A push is only ever acted on for the binding it arrived under; a session switch must not leak it.
-    const current = (): boolean => client !== undefined && target !== undefined && target === ctxRef && targetKey === binding?.key;
-    if (!current()) {
+    const current = (): boolean => client !== undefined && target !== undefined && target === ctxRef
+      && targetKey === binding?.key && targetKey === p.key && target.sessionManager.getSessionId() === p.key;
+    if (!target || !current()) {
       if (flagged) reportReset(p, "failed", false, "session switched before delivery");
       else ackDelivery(p, false, "session switched before delivery");
       return;

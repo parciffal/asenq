@@ -16,6 +16,10 @@ type Host = {
   sent: string[];
 };
 
+const shutdowns: (() => void)[] = [];
+function stopHosts(): void {
+  for (const shutdown of shutdowns.splice(0)) shutdown();
+}
 /** Records the SDK surface the extension touches; compaction and injection are the mock boundary. */
 function makePi(): Host {
   const handlers = new Map<string, Handler>();
@@ -58,6 +62,7 @@ async function boot(ctx: ExtensionContext, name: string): Promise<Host> {
   process.env.ASENQ_NAME = name;
   try {
     await host.handlers.get("session_start")!({ type: "session_start" }, ctx);
+    shutdowns.push(() => { void host.handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx); });
   } finally {
     if (previous === undefined) delete process.env.ASENQ_NAME;
     else process.env.ASENQ_NAME = previous;
@@ -103,7 +108,8 @@ test("flagged push acknowledges receipt, compacts once, and injects the task ahe
     assert.deepEqual(compacts, [{ suppressContinuation: true }]);
     assert.deepEqual(sent, [], "the task is not injected before compaction finishes");
 
-    const inserted = env.watch((e) => e.type === "message" && e.msg.text === "next task");
+    const inserted = await env.watch((e) => e.type === "message" && e.msg.text === "next task");
+    const delivered = await env.watch((e) => e.type === "message" && e.msg.text === "next task" && e.status === "delivered");
     const queued = human.request("send", { to: "compact-ordered", text: "next task" });
     await inserted.event;
     await flushTurns();
@@ -111,10 +117,14 @@ test("flagged push acknowledges receipt, compacts once, and injects the task ahe
 
     gate.resolve();
     const [second] = (await queued).results as SendResult[];
-    assert.equal(second.status, "delivered");
-    assert.deepEqual(sent, ["task one", "next task"], "the task is the first turn after compaction");
+    assert.equal(second.status, "queued", "later sends wait in the daemon rather than timing out inside compaction");
+    await delivered.event;
+    assert.equal(sent.length, 2, "each task is injected exactly once");
+    assert.match(sent[0], /(?:^|\n)task one(?:\n|$)/);
+    assert.match(sent[1], /(?:^|\n)next task(?:\n|$)/);
     await waitForReset(human, first.msgId!, "compacted");
   } finally {
+    stopHosts();
     await env.close();
   }
 });
@@ -133,9 +143,11 @@ test("a failed compaction still injects the task and reports failed", async () =
     assert.equal(first.reset, "pending");
     await waitForReset(human, first.msgId!, "failed");
     assert.equal(calls, 1);
-    assert.deepEqual(sent, ["task after failure"], "a compaction error must not block delivery");
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /(?:^|\n)task after failure(?:\n|$)/, "compaction failure must not suppress the task");
     assert.equal((await logOf(human, first.msgId!)).status, "delivered");
   } finally {
+    stopHosts();
     await env.close();
   }
 });
@@ -163,9 +175,11 @@ test("a compaction slower than the delivery acknowledgment window still delivers
 
     gate.resolve();
     await waitForReset(human, first.msgId!, "compacted");
-    assert.deepEqual(sent, ["slow task"]);
+    assert.equal(sent.length, 1, "a slow compaction injects exactly once");
+    assert.match(sent[0], /(?:^|\n)slow task(?:\n|$)/);
     assert.equal((await logOf(human, first.msgId!)).status, "delivered");
   } finally {
+    stopHosts();
     t.mock.timers.reset();
     await env.close();
   }
@@ -196,6 +210,7 @@ test("a session switch during compaction never compacts or injects into the repl
     assert.deepEqual(compactsB, [], "the replacement session must not be compacted");
     assert.deepEqual(sent, [], "the queued task must not be injected into the replacement session");
   } finally {
+    stopHosts();
     await env.close();
   }
 });
@@ -212,9 +227,11 @@ test("an unflagged push delivers immediately without compacting", async () => {
     const [first] = reply.results as SendResult[];
     assert.equal(first.status, "delivered");
     assert.equal(first.reset, undefined);
-    assert.deepEqual(sent, ["plain message"]);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /(?:^|\n)plain message(?:\n|$)/);
     assert.deepEqual(compacts, []);
   } finally {
+    stopHosts();
     await env.close();
   }
 });

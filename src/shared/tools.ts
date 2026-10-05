@@ -1,5 +1,5 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type ListedSession, type MsgStatus, type ReplacementResult, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ListedSession, type MsgStatus, type ReplacementResult, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
 import { renderMessageBody } from "./render.js";
 
 export type ParamSpec = {

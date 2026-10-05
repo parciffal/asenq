@@ -35,6 +35,8 @@ export type DaemonOpts = {
   historyDays?: number;
   defaultNameWords?: DefaultNameWords;
   pingTimeoutMs?: number;
+  /** Maximum time after compact receipt before releasing the target's deferred queue (default 10 min). */
+  resetTimeoutMs?: number;
   log?: (line: string) => void;
 };
 
@@ -49,7 +51,7 @@ type Ack = { ok: boolean; reason?: string };
 type LineageDecision = { identityId?: string; reason?: string };
 type DeliveryAttempt = { recipientId: string | null; settle(status: MsgStatus): void };
 type Inflight = { conn: Conn; sessionId: string; timer: NodeJS.Timeout; settle(a: Ack): void };
-type PendingReset = { conn: Conn; sessionId: string; received: boolean };
+type PendingReset = { conn: Conn; sessionId: string; received: boolean; deadline: number };
 type PendingPing = {
   sessionId: string; requester: Conn; conn?: Conn; deadline: number; timer?: NodeJS.Timeout;
   settle(ping: PingStatus): void;
@@ -159,6 +161,7 @@ export class Daemon {
   private delivery = new Map<string, Conn>();
   private inflight = new Map<string, Inflight>();
   private pendingResets = new Map<string, PendingReset>();
+  private resetting = new Set<string>();
   private flushing = new Set<string>();
   private flushRequested = new Set<string>();
   /** Messages with a delivery attempt in progress; timers and sends must not write them twice. */
@@ -176,6 +179,7 @@ export class Daemon {
   private readonly ackTimeoutMs: number;
   private readonly graceMs: number;
   private readonly pingTimeoutMs: number;
+  private readonly resetTimeoutMs: number;
   private readonly queueTtlMs: number;
   private readonly startedAt: number;
 
@@ -185,6 +189,7 @@ export class Daemon {
     this.ackTimeoutMs = opts.ackTimeoutMs ?? ACK_TIMEOUT_MS;
     this.graceMs = opts.graceMs ?? GRACE_MS;
     this.pingTimeoutMs = opts.pingTimeoutMs ?? 3000;
+    this.resetTimeoutMs = opts.resetTimeoutMs ?? 10 * 60_000;
     this.queueTtlMs = opts.queueTtlMs ?? QUEUE_TTL_MS;
     this.startedAt = this.now();
     this.store.db.run("UPDATE sessions SET busy=NULL");
@@ -456,7 +461,10 @@ export class Daemon {
             throw new AsenqError("not_permitted", "only the target adapter may acknowledge compact delivery");
           }
           if (ack.ok && p.reset !== "pending") throw new AsenqError("bad_request", "compact receipt ack requires reset pending");
-          reset.received = ack.ok;
+          if (!reset.received && ack.ok) {
+            reset.received = true;
+            reset.deadline = this.now() + this.resetTimeoutMs;
+          }
         }
         const row = this.store.msg(msgId);
         const as = str(p, "as");
@@ -1613,14 +1621,23 @@ export class Daemon {
     for (const [msgId, pending] of this.pendingResets) {
       if (!matches(pending)) continue;
       if (pending.received) this.finishReset(msgId, "failed", false, reason);
-      else this.pendingResets.delete(msgId);
+      else {
+        this.pendingResets.delete(msgId);
+        this.resetting.delete(pending.sessionId);
+      }
     }
   }
 
   private finishReset(msgId: string, reset: ResetResult, ok: boolean, reason?: string): void {
+    const pending = this.pendingResets.get(msgId);
     this.setStatus(msgId, "delivered");
     this.pendingResets.delete(msgId);
     const current = this.store.msg(msgId);
+    const targetId = pending?.sessionId ?? current?.to_session;
+    if (targetId) {
+      this.resetting.delete(targetId);
+      setImmediate(() => { if (!this.closing) void this.flush(targetId); });
+    }
     if (!current || (current.status !== "delivered" && current.status !== "replied")) return;
     const positioned = this.store.transaction(() => {
       this.store.db.run("UPDATE messages SET reset_result=?, updated_at=? WHERE id=?", reset, this.now(), msgId);
@@ -1722,6 +1739,11 @@ export class Daemon {
     const finish = (): void => {
       if (this.delivering.get(msgId) !== attempt) return;
       this.delivering.delete(msgId);
+      const pending = this.pendingResets.get(msgId);
+      if (pending && !pending.received) {
+        this.pendingResets.delete(msgId);
+        this.resetting.delete(pending.sessionId);
+      }
       const id = attempt.recipientId;
       if (id && this.flushRequested.has(id) && !this.flushing.has(id)) void this.flush(id);
     };
@@ -1738,6 +1760,7 @@ export class Daemon {
     if (this.expireQueued(row)) return "expired";
     const target = row.to_session ? this.store.session(row.to_session) : undefined;
     if (!target || target.state !== "live") return "queued";
+    if (this.resetting.has(target.id)) return "queued";
     const message = this.store.withReplyState(toWire(row), target.id);
     const text = renderInbound(message, this.store.identity(target.id)?.role ?? undefined);
 
@@ -1771,7 +1794,10 @@ export class Daemon {
     const conn = this.delivery.get(target.id);
     if (!conn) return "queued";
     const compact = row.reset === "compact" && conn.compactSupport.has(target.id);
-    if (compact) this.pendingResets.set(row.id, { conn, sessionId: target.id, received: false });
+    if (compact) {
+      this.pendingResets.set(row.id, { conn, sessionId: target.id, received: false, deadline: this.now() + this.resetTimeoutMs });
+      this.resetting.add(target.id);
+    }
     const { promise, resolve } = Promise.withResolvers<Ack>();
     const settle = (a: Ack): void => {
       if (this.inflight.get(row.id) !== inflight) return;
@@ -1793,7 +1819,10 @@ export class Daemon {
       this.setStatus(row.id, "delivered");
       return this.store.msg(row.id)!.status;
     }
-    if (compact) this.pendingResets.delete(row.id);
+    if (compact) {
+      this.pendingResets.delete(row.id);
+      this.resetting.delete(target.id);
+    }
     if (ack.reason === "connection closed") return "queued";
     return this.failAttempt(row, ack.reason ?? "rejected by adapter");
   }
@@ -1840,6 +1869,9 @@ export class Daemon {
     const now = this.now();
     this.expirePings();
     this.expireQueues();
+    for (const [msgId, pending] of this.pendingResets) {
+      if (pending.received && now >= pending.deadline) this.finishReset(msgId, "failed", false, "compact delivery timed out");
+    }
     for (const s of this.store.db.all<SessionRow>("SELECT * FROM sessions WHERE state='gone' AND gone_at<=?", now - this.graceMs)) {
       this.removeSession(s);
     }

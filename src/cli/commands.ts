@@ -141,7 +141,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       if (values.id) {
         const m = msgs[0];
         out(`${m.id} ${m.from} → ${m.to}${m.sourceChannel ? ` via #${m.sourceChannel}` : ""} ${new Date(m.createdAt).toISOString()} ${m.status}${m.reason ? ` (${m.reason})` : ""}`);
-        const meta = [m.kind && `kind=${m.kind}`, m.action && `action=${m.action}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}`, m.done && "done"].filter(Boolean);
+        const meta = [m.kind && `kind=${m.kind}`, m.action && `action=${m.action}`, m.reset && `reset=${m.reset}`, m.resetResult && `resetResult=${m.resetResult}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}`, m.done && "done"].filter(Boolean);
         if (meta.length) out(meta.join(" · "));
         out("");
         out(m.text);

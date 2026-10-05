@@ -110,7 +110,7 @@ asenq replace --from-id <source-id> --to-id <destination-id>
 
 | Tool | Purpose |
 |---|---|
-| `asenq_send` | Send `text`, a `file: { path, summary }` reference, or both to a session name, to `"*"` (live co-members of your channels; machine-wide if you belong to none) or to `"human"`. Text may be omitted only with a file reference. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
+| `asenq_send` | Send `text`, a `file: { path, summary }` reference, or both to a session name, to `"*"` (live co-members of your channels; machine-wide if you belong to none) or to `"human"`. Text may be omitted only with a file reference. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `reset: "compact"` (human/orchestrator, named session only), `thread`, `reply_to`, `done`. |
 | `asenq_file_check` | Check a retained direct message's referenced file against its send-time snapshot. Required: `id`; returns `match`, `changed` or `missing`. |
 | `asenq_list` | Rich session metadata, availability and resume commands; the caller's own row is marked `[you]`. Optional filters: `cwd` (literal prefix), `harness` (`claude`, `opencode`, `omp`), `channel` (exact membership). Combined filters use AND. |
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
@@ -144,9 +144,31 @@ Busy is informational: omp reports agent start/end, OpenCode reports session sta
 
 When the actual harness session ID is known, the list includes a shell-quoted resume command: `claude -r <id>`, `omp -r <id>` or `opencode -s <id>`. Unknown IDs omit the command rather than inventing one.
 
+### Compact before a new task
+
+The human or a session with the **orchestrator** role can request target-context compaction before a direct message is injected:
+
+```sh
+asenq send worker-omp "Start the next task" --kind task --reset compact
+```
+
+The agent equivalent is `asenq_send { to: "worker-omp", text: "Start the next task", kind: "task", reset: "compact" }`. Workers and unset-role sessions receive `not_permitted`; broadcasts (`"*"`), the human address, stable-ID sends and channel posts reject the flag with `bad_request`. Normal inbound policy and queue admission still apply.
+
+- **omp:** the adapter declares `compact`, awaits `ctx.compact({ suppressContinuation: true })`, then injects the message. Compaction does not automatically continue the interrupted task.
+- **OpenCode:** the plugin declares `compact` only when its SDK exposes both session history and `session.summarize`. It selects the target's latest usable provider/model, summarizes, then prompts the target. A summarization error or missing model reports failure but still prompts.
+- **Claude Code / adapters without the capability:** no compaction; the message is delivered normally.
+
+A capable live target acknowledges receipt immediately: the send result reports **`reset=pending`**, not completed compaction. The adapter then compacts and delivers the task; history and tail events record **`resetResult=compacted`** or **`resetResult=failed`**. Failure to compact still delivers the message. A target without the capability reports **`reset=unsupported`** once delivered, also retained as `resetResult=unsupported`. `asenq log --id <msgId>` shows the final outcome.
+
+Held and queued sends retain the request but omit the initial reset outcome. They resolve the current adapter capability and compact only on actual delivery. Later sends to a target with a pending reset queue in the daemon, avoiding repeated pushes during a slow compaction; other sessions remain independent. Completion flushes that target's queue.
+
+A pending reset has a **10-minute** daemon-side cap (`DaemonOpts.resetTimeoutMs`); sweep expiry records failure and releases deferred delivery attempts. Disconnect also ends the pending reset as failed; deferred messages remain queued for reconnection. A hung harness API is not repaired by this deadline: subsequent attempts still use normal delivery acknowledgments and retries. An adapter injection error or an interrupted accepted delivery is recorded as failed without repeating compaction.
+
+This summarizes the existing context; it never clears context or creates a new harness session. The harness session ID and asenq identity stay unchanged.
+
 ### Human-assigned roles
 
-Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. The human can edit any role. An orchestrator can use `asenq_set_role` for sessions sharing at least one channel with it; workers and sessions with an unset role receive `not_permitted`. Roles do not enforce work or change delivery policy; the orchestrator role permits scoped roster and role editing.
+Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. The human can edit any role. An orchestrator can use `asenq_set_role` for sessions sharing at least one channel with it; workers and sessions with an unset role receive `not_permitted`. Roles do not enforce work or change inbound policy; the orchestrator role permits scoped roster/role editing and compact-before-delivery requests.
 
 A role belongs to the session identity, not its name: renaming and reconnecting preserve it, while a different identity reusing the name starts unset. `asenq ls` and `asenq_list` show the role. Every delivered direct-message header tells the recipient its own role (`your-role=worker` or `your-role=orchestrator`); unset roles omit that label. TUI rows use inverse `orch` / `wrk` tags beside short harness labels, with metadata on a second row when needed; the conversation header also shows the full role. Archived identities retain their dimmed role tag; automatically removed identities accept queued direct messages while retained.
 
