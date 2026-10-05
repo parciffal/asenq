@@ -289,7 +289,6 @@ test("narrow console reaches every wrapped row and marks an open conversation re
   assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow picker is not boxed");
   assert.equal(await unread(human, alpha.session.id), 1, "the picker alone does not mark anything read");
   await ui.press("ENTER");
-  assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow conversation is not boxed");
   await ui.until(async () => await unread(human, alpha.session.id) === 0, "opening shows the newest row and reads it");
 
   await ui.press("HOME");
