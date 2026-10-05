@@ -105,6 +105,8 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
             out(`${hhmmss(Date.now())} session ${e.name} (${e.harness}) ${e.action}${e.oldName ? ` from ${e.oldName}` : ""}`);
           } else if (e.type === "channel") {
             out(`${hhmmss(Date.now())} channel #${e.channel.name} ${e.action} (${e.channel.memberIds?.length ?? 0} members)`);
+          } else if (e.type === "ping") {
+            out(`${hhmmss(Date.now())} ping ${e.sessionId}: ${e.ping}`);
           } else if (e.type === "message") {
             out(msgLine({ ...e.msg, status: e.status, reason: e.reason }));
           } else if (e.type === "retention") {
