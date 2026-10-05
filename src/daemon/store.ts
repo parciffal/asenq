@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL UNIQUE,
   cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
   gone_at INTEGER, claude_socket TEXT, claude_session_ids TEXT NOT NULL DEFAULT '[]',
+  claude_transcript_path TEXT, claude_source TEXT, claude_lineage_state INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL, UNIQUE(harness, key));
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_name TEXT NOT NULL, from_session TEXT, to_name TEXT NOT NULL, to_session TEXT,
@@ -20,6 +21,13 @@ CREATE TABLE IF NOT EXISTS session_identities(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
   cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
   created_at INTEGER NOT NULL, removed_at INTEGER, inbox_position INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS session_harness_ids(
+  harness TEXT NOT NULL, kind TEXT NOT NULL, harness_id TEXT NOT NULL, identity_id TEXT NOT NULL,
+  PRIMARY KEY(harness,kind,harness_id));
+CREATE INDEX IF NOT EXISTS session_harness_ids_identity ON session_harness_ids(identity_id);
+CREATE TABLE IF NOT EXISTS claude_lineage(
+  fingerprint TEXT NOT NULL, identity_id TEXT NOT NULL, PRIMARY KEY(fingerprint,identity_id));
+CREATE INDEX IF NOT EXISTS claude_lineage_identity ON claude_lineage(identity_id);
 CREATE TABLE IF NOT EXISTS human_read_positions(
   scope TEXT NOT NULL, stream_key TEXT NOT NULL, position INTEGER NOT NULL,
   reminder INTEGER, version INTEGER NOT NULL DEFAULT 0,
@@ -34,6 +42,7 @@ export type SessionRow = {
   id: string; harness: Harness; key: string; name: string; cwd: string | null;
   inbound: Inbound; state: "live" | "gone"; gone_at: number | null;
   claude_socket: string | null; claude_session_ids: string; created_at: number;
+  claude_transcript_path: string | null; claude_source: string | null; claude_lineage_state: number;
 };
 
 export type MsgRow = {
@@ -97,8 +106,16 @@ export class Store {
   constructor(readonly db: Db) {
     db.exec(SCHEMA);
     this.migrateMessageAction();
+    const sessionColumns = this.db.all<{ name: string }>("PRAGMA table_info(sessions)");
+    for (const [name, type] of [
+      ["claude_transcript_path", "TEXT"], ["claude_source", "TEXT"],
+      ["claude_lineage_state", "INTEGER NOT NULL DEFAULT 1"],
+    ]) {
+      if (!sessionColumns.some((column) => column.name === name)) this.db.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}`);
+    }
     this.migrateMessageOrder();
     this.backfillIdentities();
+    this.backfillHarnessIds();
     this.initializeReadPositions();
     this.initializeInboxPositions();
   }
@@ -219,6 +236,34 @@ export class Store {
     this.setMeta("identity_backfill", 1);
   }
 
+  private backfillHarnessIds(): void {
+    if (this.meta("harness_id_backfill") !== undefined) return;
+    this.transaction(() => {
+      for (const row of this.db.all<SessionRow>(
+        `SELECT sessions.* FROM sessions JOIN session_identities ON session_identities.id=sessions.id
+         ORDER BY sessions.created_at,sessions.id`,
+      )) this.syncHarnessIds(row);
+      this.setMeta("harness_id_backfill", 1);
+    });
+  }
+
+  private syncHarnessIds(row: SessionRow): void {
+    if (row.harness !== "claude") {
+      this.db.run(
+        "INSERT OR IGNORE INTO session_harness_ids(harness,kind,harness_id,identity_id) VALUES(?,'key',?,?)",
+        row.harness, row.key, row.id,
+      );
+    }
+    if (row.harness === "claude") {
+      for (const id of JSON.parse(row.claude_session_ids) as string[]) {
+        this.db.run(
+          "INSERT OR IGNORE INTO session_harness_ids(harness,kind,harness_id,identity_id) VALUES('claude','session',?,?)",
+          id, row.id,
+        );
+      }
+    }
+  }
+
   private initializeReadPositions(): void {
     if (this.meta("read_rollout") !== undefined) return;
     this.transaction(() => {
@@ -298,10 +343,87 @@ export class Store {
     return this.db.get<SessionRow>("SELECT * FROM sessions WHERE harness=? AND key=?", harness, key);
   }
 
+  identityByHarnessId(harness: Harness, harnessId: string, kind: "key" | "session" = "key"): SessionIdentity | undefined {
+    const row = this.db.get<IdentityRow>(
+      `SELECT session_identities.* FROM session_identities JOIN session_harness_ids
+       ON session_harness_ids.identity_id=session_identities.id
+       WHERE session_harness_ids.harness=? AND kind=? AND harness_id=?`,
+      harness, kind, harnessId,
+    );
+    return row && toIdentity(row);
+  }
+
   sessionByClaudeId(sessionId: string): SessionRow | undefined {
-    return this.db
-      .all<SessionRow>("SELECT * FROM sessions WHERE harness='claude'")
-      .find((r) => (JSON.parse(r.claude_session_ids) as string[]).includes(sessionId));
+    const identity = this.identityByHarnessId("claude", sessionId, "session");
+    return identity && this.session(identity.id);
+  }
+
+  claudeIds(identityId: string): string[] {
+    return this.db.all<{ harness_id: string }>(
+      "SELECT harness_id FROM session_harness_ids WHERE identity_id=? AND harness='claude' AND kind='session' ORDER BY rowid",
+      identityId,
+    ).map((row) => row.harness_id);
+  }
+
+  recordClaudeLineage(identityId: string, fingerprints: string[]): void {
+    for (const fingerprint of fingerprints) {
+      this.db.run("INSERT OR IGNORE INTO claude_lineage(fingerprint,identity_id) VALUES(?,?)", fingerprint, identityId);
+    }
+  }
+
+  claudeLineageCandidates(fingerprints: string[], exclude?: string): SessionIdentity[] {
+    const ids = new Set<string>();
+    for (const fingerprint of fingerprints) {
+      for (const row of this.db.all<{ identity_id: string }>(
+        "SELECT identity_id FROM claude_lineage WHERE fingerprint=?", fingerprint,
+      )) if (row.identity_id !== exclude) ids.add(row.identity_id);
+    }
+    return [...ids].sort().map((id) => this.identity(id)!).filter((identity) => identity?.harness === "claude");
+  }
+
+  /** Moves a provisional conversation into its recognized ancestor, without changing ancestor policy. */
+  mergeClaudeIdentity(provisionalId: string, ancestorId: string): { droppedReminder?: number } {
+    return this.transaction(() => {
+      const provisional = this.identity(provisionalId)!;
+      const ancestor = this.identity(ancestorId)!;
+      const previous = [...ancestor.previousNames];
+      for (const name of [...provisional.previousNames, provisional.name]) {
+        if (name !== ancestor.name && !previous.includes(name)) previous.push(name);
+      }
+      this.db.run("UPDATE session_identities SET previous_names=? WHERE id=?", JSON.stringify(previous), ancestorId);
+      this.db.run(
+        `UPDATE session_identities SET inbox_position=max(inbox_position,
+         (SELECT inbox_position FROM session_identities WHERE id=?)) WHERE id=?`,
+        provisionalId, ancestorId,
+      );
+      this.db.run("UPDATE messages SET from_session=? WHERE from_session=?", ancestorId, provisionalId);
+      this.db.run("UPDATE messages SET to_session=? WHERE to_session=?", ancestorId, provisionalId);
+      this.db.run("UPDATE session_harness_ids SET identity_id=? WHERE identity_id=?", ancestorId, provisionalId);
+      this.db.run(
+        "INSERT OR IGNORE INTO claude_lineage(fingerprint,identity_id) SELECT fingerprint,? FROM claude_lineage WHERE identity_id=?",
+        ancestorId, provisionalId,
+      );
+      this.db.run("DELETE FROM claude_lineage WHERE identity_id=?", provisionalId);
+      const oldRead = this.db.get<ReadRow>(
+        "SELECT * FROM human_read_positions WHERE scope='session' AND stream_key=?", provisionalId,
+      );
+      const ancestorRead = this.db.get<ReadRow>(
+        "SELECT * FROM human_read_positions WHERE scope='session' AND stream_key=?", ancestorId,
+      );
+      if (oldRead) {
+        this.db.run(
+          `INSERT INTO human_read_positions(scope,stream_key,position,reminder,version) VALUES('session',?,?,?,?)
+           ON CONFLICT(scope,stream_key) DO UPDATE SET position=excluded.position,reminder=excluded.reminder,version=excluded.version`,
+          ancestorId, Math.max(ancestorRead?.position ?? 0, oldRead.position),
+          ancestorRead?.reminder ?? oldRead.reminder, Math.max(ancestorRead?.version ?? 0, oldRead.version) + 1,
+        );
+      }
+      this.db.run("DELETE FROM human_read_positions WHERE scope='session' AND stream_key=?", provisionalId);
+      this.db.run("DELETE FROM sessions WHERE id=?", provisionalId);
+      this.db.run("DELETE FROM session_identities WHERE id=?", provisionalId);
+      return ancestorRead?.reminder != null && oldRead?.reminder != null && ancestorRead.reminder !== oldRead.reminder
+        ? { droppedReminder: oldRead.reminder } : {};
+    });
   }
 
   sessions(): SessionRow[] {
@@ -328,6 +450,7 @@ export class Store {
        ON CONFLICT(id) DO UPDATE SET name=excluded.name,cwd=excluded.cwd,inbound=excluded.inbound,state=excluded.state,removed_at=NULL`,
       row.id, row.harness, row.name, row.cwd, row.inbound, row.state, row.created_at, this.deliveryWatermark(),
     );
+    this.syncHarnessIds(row);
     this.ensureRead({ scope: "session", sessionId: row.id });
     return this.identity(row.id)!;
   }
@@ -544,7 +667,7 @@ export class Store {
     };
   }
 
-  reconcileReads(): { states: ReadState[]; removedPositions: number; removedIdentities: number } {
+  reconcileReads(cutoff: number): { states: ReadState[]; removedPositions: number; removedIdentities: number } {
     const changed: ReadScope[] = [];
     for (const row of this.db.all<ReadRow>("SELECT * FROM human_read_positions WHERE reminder IS NOT NULL")) {
       const scope: ReadScope = row.scope === "session"
@@ -564,13 +687,21 @@ export class Store {
     ).changes;
     removedPositions += this.db.run(
       `DELETE FROM human_read_positions WHERE scope='session'
-       AND EXISTS(SELECT 1 FROM session_identities WHERE id=human_read_positions.stream_key AND state='removed')
+       AND EXISTS(SELECT 1 FROM session_identities WHERE id=human_read_positions.stream_key AND state='removed' AND removed_at<?)
        AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=human_read_positions.stream_key OR to_session=human_read_positions.stream_key)`,
+      cutoff,
     ).changes;
     const removedIdentities = this.db.run(
-      `DELETE FROM session_identities WHERE state='removed'
+      `DELETE FROM session_identities WHERE state='removed' AND removed_at<?
        AND NOT EXISTS(SELECT 1 FROM messages WHERE from_session=session_identities.id OR to_session=session_identities.id)`,
+      cutoff,
     ).changes;
+    this.db.run(
+      "DELETE FROM session_harness_ids WHERE NOT EXISTS(SELECT 1 FROM session_identities WHERE id=session_harness_ids.identity_id)",
+    );
+    this.db.run(
+      "DELETE FROM claude_lineage WHERE NOT EXISTS(SELECT 1 FROM session_identities WHERE id=claude_lineage.identity_id)",
+    );
     const states: ReadState[] = [];
     for (const scope of changed) {
       const key = scope.scope === "session" ? scope.sessionId : scope.channel;

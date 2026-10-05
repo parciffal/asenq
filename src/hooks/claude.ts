@@ -7,6 +7,8 @@ type HookInput = {
   agent_id?: string;
   cwd?: string;
   reason?: string;
+  transcript_path?: string;
+  source?: string;
   stop_hook_active?: boolean;
 };
 
@@ -30,6 +32,7 @@ async function run(): Promise<number> {
       await client.request("claude_hook", {
         event: "start", key: socket ?? "sid:" + sessionId, sessionId, socket,
         name: process.env.ASENQ_NAME || input.session_title || undefined, cwd: input.cwd,
+        transcriptPath: input.transcript_path, source: input.source,
       });
     } finally {
       client.close();
@@ -49,13 +52,14 @@ async function run(): Promise<number> {
   }
 
   if (event === "PostToolUse" || event === "UserPromptSubmit" || event === "Stop") {
-    if (socket) return 0; // socket delivery handles this session
-    if (event === "Stop" && input.stop_hook_active) return 0;
     const client = new AsenqClient();
     let texts: string[];
     try {
-      const r = await client.request("claude_hook", { event: "poll", sessionId });
-      texts = r.texts as string[];
+      const r = await client.request("claude_hook", {
+        event: socket || (event === "Stop" && input.stop_hook_active) ? "reconcile" : "poll",
+        sessionId, transcriptPath: input.transcript_path,
+      });
+      texts = (r.texts as string[] | undefined) ?? [];
     } finally {
       client.close();
     }

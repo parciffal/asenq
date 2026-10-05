@@ -12,6 +12,7 @@ import { renderInbound } from "../shared/render.js";
 import type { Db } from "../shared/sqlite.js";
 import { version } from "../shared/version.js";
 import { claudeFrame, parseEnvelopeReply, probe, replyAddr, writeLine } from "./claude.js";
+import { claudeLineage } from "./claude-lineage.js";
 import { Store, toStored, toWire, type MsgRow, type SessionRow } from "./store.js";
 
 export type DaemonOpts = {
@@ -37,6 +38,7 @@ type Result = Record<string, unknown>;
 type Sender = { kind: "agent"; session: SessionRow } | { kind: "human" } | { kind: "asenq" };
 
 type Ack = { ok: boolean; reason?: string };
+type LineageDecision = { identityId?: string; reason?: string };
 type Inflight = { conn: Conn; timer: NodeJS.Timeout; settle(a: Ack): void };
 
 const DUP_WINDOW_MS = 30_000;
@@ -264,8 +266,9 @@ export class Daemon {
       case "claude_hook":
         return this.opClaudeHook(p);
       case "claude_attach": {
-        const row = this.store.sessionByClaudeId(str(p, "sessionId", true));
+        let row = this.store.sessionByClaudeId(str(p, "sessionId", true));
         if (!row) throw new AsenqError("no_session", "this Claude session is not registered yet (SessionStart hook missing? run: asenq doctor)");
+        row = this.reconcileClaudeLineage(row, str(p, "transcriptPath"));
         c.attached = row.id;
         return { session: { id: row.id, name: row.name } };
       }
@@ -273,7 +276,7 @@ export class Daemon {
         const s = this.sender(c, p);
         if (s.kind !== "agent") throw new AsenqError("not_registered", "no session bound to this connection");
         c.bound.delete(s.session.id);
-        this.removeSession(s.session, "target session closed");
+        this.removeSession(s.session);
         return {};
       }
       case "rename":
@@ -662,6 +665,7 @@ export class Daemon {
     action: "registered" | "renamed" | "gone" | "removed" | "updated",
     row: SessionRow,
     oldName?: string,
+    reason?: string,
   ): void {
     const session = this.store.identity(row.id) ?? this.store.syncIdentity(row);
     this.emit({
@@ -671,49 +675,58 @@ export class Daemon {
       harness: row.harness,
       ...(session.cwd ? { cwd: session.cwd } : {}),
       ...(oldName ? { oldName } : {}),
+      ...(reason ? { reason } : {}),
       session,
     });
   }
 
-  /**
-   * Finds or creates the row for (harness, key). New rows take over a gone row with the same
-   * name, harness and cwd (a restarted harness); other name collisions get a numeric suffix.
-   */
-  private upsertSession(harness: Harness, key: string, name: string | undefined, cwd: string | undefined, seed = key): SessionRow {
-    const now = this.now();
-    const existing = this.store.sessionByKey(harness, key);
+  /** Revives the durable identity for a harness id; names never establish identity. */
+  private upsertSession(
+    harness: Harness, key: string, name: string | undefined, cwd: string | undefined, seed = key, identityId?: string,
+    reason?: string,
+  ): SessionRow {
+    const identity = identityId ? this.store.identity(identityId)
+      : harness === "claude" ? undefined : this.store.identityByHarnessId(harness, key);
+    const existing = identity && this.store.session(identity.id);
     if (existing) {
-      this.store.db.run("UPDATE sessions SET state='live', gone_at=NULL, cwd=COALESCE(?, cwd) WHERE id=?", cwd ?? null, existing.id);
-      const row = this.store.session(existing.id)!;
-      this.store.syncIdentity(row);
-      if (existing.state !== "live") this.emitSession("registered", row);
+      const row = this.store.transaction(() => {
+        this.store.db.run(
+          "UPDATE sessions SET key=?, state='live', gone_at=NULL, cwd=COALESCE(?, cwd) WHERE id=?",
+          key, cwd ?? null, existing.id,
+        );
+        const updated = this.store.session(existing.id)!;
+        this.store.syncIdentity(updated);
+        return updated;
+      });
+      if (existing.state !== "live") this.emitSession("registered", row, undefined, reason);
       else if (cwd !== undefined && cwd !== existing.cwd) this.emitSession("updated", row);
       return row;
     }
-    let base = slug(name ?? "");
+    let base = identity?.name ?? slug(name ?? "");
     if (!base || RESERVED.includes(base) || !NAME_RE.test(base)) {
       base = `${harness}-${seed.toLowerCase().replace(/[^a-z0-9]/g, "").slice(-6)}`;
-    }
-    const holder = this.store.sessionByName(base);
-    if (holder && holder.state === "gone" && holder.harness === harness && (holder.cwd ?? null) === (cwd ?? null)) {
-      this.store.db.run("UPDATE sessions SET key=?, state='live', gone_at=NULL WHERE id=?", key, holder.id);
-      const row = this.store.session(holder.id)!;
-      this.store.syncIdentity(row);
-      this.emitSession("registered", row);
-      return row;
     }
     let chosen = base;
     for (let n = 2; this.store.sessionByName(chosen); n++) {
       const suffix = `-${n}`;
       chosen = base.slice(0, 40 - suffix.length).replace(/-+$/, "") + suffix;
     }
-    const id = newId("s_");
-    this.store.db.run(
-      "INSERT INTO sessions(id,harness,key,name,cwd,state,created_at) VALUES(?,?,?,?,?,'live',?)",
-      id, harness, key, chosen, cwd ?? null, now);
-    const row = this.store.session(id)!;
-    this.store.syncIdentity(row);
-    this.emitSession("registered", row);
+    const id = identity?.id ?? newId("s_");
+    const row = this.store.transaction(() => {
+      this.store.db.run(
+        `INSERT INTO sessions(id,harness,key,name,cwd,inbound,state,claude_session_ids,created_at)
+         VALUES(?,?,?,?,?,?,'live',?,?)`,
+        id, harness, key, chosen, cwd ?? identity?.cwd ?? null, identity?.inbound ?? "accept",
+        harness === "claude" ? JSON.stringify(this.store.claudeIds(id)) : "[]",
+        identity?.createdAt ?? this.now(),
+      );
+      const revived = this.store.session(id)!;
+      this.store.syncIdentity(revived);
+      if (identity && chosen !== identity.name) this.store.renameIdentity(id, identity.name, chosen);
+      return revived;
+    });
+    if (identity && chosen !== identity.name) this.emitSession("renamed", row, identity.name);
+    this.emitSession("registered", row, undefined, reason);
     return row;
   }
 
@@ -739,10 +752,8 @@ export class Daemon {
     this.emitSession("gone", gone);
   }
 
-  /** Deletes the session and expires everything still waiting for it. */
-  private removeSession(row: SessionRow, reason: string): void {
-    const pending = this.store.db.all<MsgRow>(
-      "SELECT * FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY ord", row.id);
+  /** Removes the transport while retaining identity and pending delivery for a later resume. */
+  private removeSession(row: SessionRow): void {
     this.store.setIdentityState(row.id, "removed", this.now());
     this.store.db.run("DELETE FROM sessions WHERE id=?", row.id);
     this.delivery.delete(row.id);
@@ -758,7 +769,6 @@ export class Daemon {
       rmSync(join(this.opts.replyDir, row.id + ".sock"), { force: true });
     }
     this.emitSession("removed", row);
-    for (const m of pending) this.setStatus(m.id, "expired", reason);
   }
 
   private opRename(c: Conn, p: Params): Result {
@@ -781,32 +791,121 @@ export class Daemon {
 
   // ---------------------------------------------------------------- claude
 
+  private classifyClaudeLineage(fingerprints: string[], exclude?: string): LineageDecision {
+    const candidates = this.store.claudeLineageCandidates(fingerprints, exclude);
+    if (candidates.some((identity) => identity.state === "live")) return {};
+    if (candidates.length === 1) return { identityId: candidates[0].id };
+    if (candidates.length > 1) {
+      const reason = `ambiguous Claude lineage candidates: ${candidates.map((identity) => identity.id).join(", ")}`;
+      this.log(reason);
+      return { reason };
+    }
+    return {};
+  }
+
+  private reconcileClaudeLineage(row: SessionRow, transcriptPath?: string): SessionRow {
+    const path = transcriptPath ?? row.claude_transcript_path;
+    const changedPath = transcriptPath !== undefined && transcriptPath !== row.claude_transcript_path;
+    if (changedPath) this.store.db.run("UPDATE sessions SET claude_transcript_path=? WHERE id=?", path, row.id);
+    if (row.claude_lineage_state === 2 && !changedPath) return row;
+    const fingerprints = claudeLineage(path, row.claude_source === "resume");
+    if (fingerprints.length === 0) {
+      if (changedPath && row.claude_lineage_state === 2) {
+        this.store.db.run("UPDATE sessions SET claude_lineage_state=1 WHERE id=?", row.id);
+      }
+      return this.store.session(row.id)!;
+    }
+    const decision: LineageDecision = row.claude_lineage_state === 0
+      ? this.classifyClaudeLineage(fingerprints, row.id) : {};
+    if (decision.identityId) {
+      const provisional = this.store.identity(row.id)!;
+      const delivery = this.delivery.get(row.id);
+      if (delivery) {
+        this.delivery.delete(row.id);
+        this.delivery.set(decision.identityId, delivery);
+      }
+      for (const conn of this.conns) {
+        if (conn.bound.delete(row.id)) conn.bound.add(decision.identityId);
+        if (conn.attached === row.id) conn.attached = decision.identityId;
+      }
+      const transfer = this.store.mergeClaudeIdentity(row.id, decision.identityId);
+      const ancestor = this.upsertSession("claude", row.key, undefined, row.cwd ?? undefined, row.key, decision.identityId);
+      this.store.db.run(
+        `UPDATE sessions SET claude_socket=?,claude_session_ids=?,claude_transcript_path=?,claude_source=?,claude_lineage_state=2 WHERE id=?`,
+        row.claude_socket, JSON.stringify(this.store.claudeIds(ancestor.id)), path, row.claude_source, ancestor.id,
+      );
+      this.store.recordClaudeLineage(ancestor.id, fingerprints);
+      this.lastSeen.delete(row.id);
+      this.lastSeen.set(ancestor.id, this.now());
+      const replyServer = this.replyServers.get(row.id);
+      if (replyServer) {
+        replyServer.close();
+        this.replyServers.delete(row.id);
+        rmSync(join(this.opts.replyDir, row.id + ".sock"), { force: true });
+        this.ensureReplyServer(ancestor.id);
+      }
+      if (transfer.droppedReminder !== undefined) {
+        this.log(`Claude lineage merge ${row.id} into ${ancestor.id}: dropped provisional reminder ${transfer.droppedReminder}; kept ancestor reminder`);
+      }
+      this.emit({
+        type: "session", action: "removed", name: provisional.name, harness: "claude",
+        reason: `merged into ${ancestor.name}`, session: { ...provisional, state: "removed", removedAt: this.now() },
+      });
+      this.emit({ type: "read", state: this.store.ensureRead({ scope: "session", sessionId: ancestor.id }) });
+      setImmediate(() => void this.flush(ancestor.id));
+      return this.store.session(ancestor.id)!;
+    }
+    this.store.recordClaudeLineage(row.id, fingerprints);
+    this.store.db.run("UPDATE sessions SET claude_lineage_state=2 WHERE id=?", row.id);
+    if (decision.reason) this.emitSession("registered", row, undefined, decision.reason);
+    return this.store.session(row.id)!;
+  }
+
   private async opClaudeHook(p: Params): Promise<Result> {
     const event = str(p, "event", true);
     const sessionId = str(p, "sessionId", true);
     if (event === "start") {
       const socket = str(p, "socket") ?? null;
-      const name = str(p, "name");
-      // A dead Claude still holding the requested name should be taken over, not suffixed around.
-      const holder = name ? this.store.sessionByName(slug(name)) : undefined;
-      if (holder?.harness === "claude" && holder.state === "live" && holder.claude_socket && holder.key !== str(p, "key")) {
-        if ((await probe(holder.claude_socket)) === "dead") this.markGone(holder);
-      }
-      const row = this.upsertSession("claude", str(p, "key", true), name, str(p, "cwd"), sessionId);
+      const key = str(p, "key", true);
+      const known = this.store.identityByHarnessId("claude", sessionId, "session")
+        ?? this.store.sessionByKey("claude", key);
+      const transcriptPath = str(p, "transcriptPath") ?? null;
+      const source = str(p, "source") ?? null;
+      const fingerprints = claudeLineage(transcriptPath, source === "resume");
+      const decision: LineageDecision = known ? { identityId: known.id } : this.classifyClaudeLineage(fingerprints);
+      const row = this.upsertSession(
+        "claude", key, str(p, "name"), str(p, "cwd"), sessionId, decision.identityId, decision.reason,
+      );
       const ids = JSON.parse(row.claude_session_ids) as string[];
       if (!ids.includes(sessionId)) ids.push(sessionId);
-      this.store.db.run("UPDATE sessions SET claude_socket=?, claude_session_ids=? WHERE id=?", socket, JSON.stringify(ids), row.id);
+      const state = fingerprints.length === 0 ? (known ? 1 : 0) : 2;
+      this.store.transaction(() => {
+        this.store.db.run(
+          `UPDATE sessions SET claude_socket=?,claude_session_ids=?,claude_transcript_path=?,claude_source=?,claude_lineage_state=? WHERE id=?`,
+          socket, JSON.stringify(ids), transcriptPath, source, state, row.id,
+        );
+        this.store.recordClaudeLineage(row.id, fingerprints);
+        this.store.syncIdentity({ ...row, claude_socket: socket, claude_session_ids: JSON.stringify(ids) });
+      });
       this.lastSeen.set(row.id, this.now());
       setImmediate(() => void this.flush(row.id));
       return { session: { id: row.id, name: row.name } };
     }
-    const row = this.store.sessionByClaudeId(sessionId);
+    let row = this.store.sessionByClaudeId(sessionId);
     if (event === "end") {
-      if (row) this.removeSession(row, "target session ended");
+      if (row) this.removeSession(row);
       return {};
+    }
+    if (event === "poll" || event === "reconcile") {
+      if (row) {
+        row = this.reconcileClaudeLineage(row, str(p, "transcriptPath"));
+        this.lastSeen.set(row.id, this.now());
+      }
+      if (event === "reconcile") return row ? { session: { id: row.id, name: row.name } } : {};
     }
     if (event === "poll") {
       if (!row) return { texts: [] };
+      if (row.claude_socket) return { texts: [] };
       this.lastSeen.set(row.id, this.now());
       const texts: string[] = [];
       let total = 0;
@@ -1124,7 +1223,7 @@ export class Daemon {
   sweep(): void {
     const now = this.now();
     for (const s of this.store.db.all<SessionRow>("SELECT * FROM sessions WHERE state='gone' AND gone_at<=?", now - this.graceMs)) {
-      this.removeSession(s, `session ${s.name} did not come back within ${this.graceMs / 1000}s`);
+      this.removeSession(s);
     }
     for (const [k, at] of this.dupSeen) if (now - at >= DUP_WINDOW_MS) this.dupSeen.delete(k);
   }
@@ -1138,7 +1237,7 @@ export class Daemon {
           if (cur?.state === "live") this.markGone(cur);
         }
       } else if (now - (this.lastSeen.get(s.id) ?? this.startedAt) > CLAUDE_IDLE_MS) {
-        this.removeSession(s, "target session inactive for 12h");
+        this.removeSession(s);
       }
     }
   }
@@ -1150,7 +1249,7 @@ export class Daemon {
       cutoff,
     ).changes;
     this.store.pruneEvents(cutoff);
-    const reconciliation = this.store.reconcileReads();
+    const reconciliation = this.store.reconcileReads(cutoff);
     for (const state of reconciliation.states) this.emit({ type: "read", state });
     if (removedMessages + reconciliation.removedPositions + reconciliation.removedIdentities > 0) {
       this.emit({ type: "retention" });

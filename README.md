@@ -144,7 +144,7 @@ Sessions lists live sessions first, then reconnecting ones, then a collapsed **A
 
 Unread is **not delivery**. Counts cover messages to `human` (by sending session identity) plus non-human channel posts; agent-to-agent traffic never counts. Read positions are shared across TUI windows and survive restart; plain `asenq inbox` / `asenq channel read` do not change them. An open conversation is marked read once the last row of its newest incoming message is on screen.
 
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 5).
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 6).
 
 ## How delivery works
 
@@ -160,7 +160,9 @@ Subagents (Claude subagents, OpenCode child sessions, omp subagents) are not reg
 
 **What happens to messages:**
 
-- **The target disappears.** asenq queues the message. The target has 2 minutes to come back; a harness restarted with the same name and working directory takes over the old session and its queue. After that, the message expires and the sender gets a notice.
+- **The target disappears.** After 2 minutes disconnected sessions leave the active list, but removal does not expire queued or held messages. Removed identities remain for at least `historyDays` after removal, and longer while retained messages reference them. Waiting messages currently have no age-based expiry.
+- **The session resumes.** omp/OpenCode registration keys and recorded Claude session ids restore the identity, current name and waiting messages, even after removal or a daemon restart. Claude resumes that change ids are also recognised by copied transcript lineage: only the first 8 JSONL lines are inspected. Exactly one offline match revives; a live match (a fork), ambiguous matches or unavailable lineage creates a new identity. If the copied head arrives later, hooks or MCP attach merge the provisional identity into its ancestor, keeping both queues, conversation history and human read state. Ambiguous candidate ids are logged for manual replacement. Sharing a name and working directory alone never establishes identity. If a revived name was claimed, revival chooses a suffix and records its former name.
+- **A resume transcript is still being copied.** Lineage recognition for `source=resume` waits for 8 complete JSONL lines. Shorter heads remain provisional and retry on later hooks or MCP attach, without timers; this avoids selecting a fork from partially copied evidence. Once a usable complete head decides revival, fork, ambiguity or no match, that decision is final: a later removed fork cannot replace the live identity.
 - **Loops and floods.** From one agent, the same text sent to the same target within 30 s is dropped. For control messages, the kind and action also distinguish duplicates, so identical text with `pause` then `resume` is delivered twice. Each agent can send 30 messages in a burst, then one every 2 s. A target with 50 queued messages refuses more.
 - **Inbound policy.** `asenq inbound <name> hold` holds messages from other agents until you run `asenq release` or `asenq drop`. `refuse` rejects them. Messages you send yourself skip `hold`.
 - **History.** Messages are kept for 7 days. Set `historyDays` in `~/.asenq/config.json` to change this.
