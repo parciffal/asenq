@@ -686,11 +686,15 @@ export class ConsoleApp {
       : this.connection === "offline" ? { text: "○ offline", style: theme.bad } : { text: "◌ connecting", style: theme.warn };
     const used = (spans: TerminalSpan[]): number => spans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
     type Fit = { labels: "full" | "active" | "short" | "minimal"; brand: boolean; badges: boolean; counters: "full" | "short" | "none"; status: boolean };
-    // Fit complete tab targets and the connection first, abbreviating counters as a group
-    // before omitting them; only then shorten tabs and finally remove brand/badges.
+    // Keep counters reachable with compact tabs before omitting them; preserve complete
+    // tab hit regions and a connection symbol even at physically constrained widths.
     const fits: Fit[] = [
       { labels: "full", brand: true, badges: true, counters: "full", status: true },
       { labels: "full", brand: true, badges: true, counters: "short", status: true },
+      { labels: "active", brand: true, badges: false, counters: "short", status: false },
+      { labels: "short", brand: false, badges: false, counters: "short", status: true },
+      { labels: "short", brand: false, badges: false, counters: "short", status: false },
+      { labels: "minimal", brand: false, badges: false, counters: "short", status: false },
       { labels: "full", brand: true, badges: true, counters: "none", status: true },
       { labels: "full", brand: true, badges: true, counters: "none", status: false },
       { labels: "active", brand: true, badges: false, counters: "none", status: true },
@@ -925,9 +929,8 @@ export class ConsoleApp {
     rows.push(...body);
     if (!composer) return { rows };
     const composerY = y0 + rows.length;
-    const composerInset = width >= 6 && composer.rows.length >= 3 ? 1 : 0;
     composer.rows.forEach((_, index) => {
-      this.hits.push({ row: composerY + index, start: x0 + composerInset, end: x0 + width - composerInset, target: { kind: "composer" } });
+      this.hits.push({ row: composerY + index, start: x0, end: x0 + width, target: { kind: "composer" } });
     });
     rows.push(...composer.rows);
     return { rows, ...(composer.cursor ? { cursor: { ...composer.cursor, row: composerY + composer.cursor.row } } : {}) };

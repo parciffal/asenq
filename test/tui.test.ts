@@ -462,7 +462,7 @@ test("rounded panes resize at the wide boundary without overflowing or moving mo
     const composerRow = rows().findIndex((row) => row.slice(listWidth + 2).startsWith("│› "));
     assert.ok(composerRow > messageRow);
     const promptColumn = rows()[composerRow]!.indexOf("› ", listWidth + 2);
-    await click(promptColumn, composerRow);
+    await click(listWidth + 2, composerRow);
     const beforeTyping = frame;
     await press("x");
     assert.deepEqual(frame.cursor, { row: composerRow, column: promptColumn + terminalTextWidth("› x") }, "composer cursor follows the typed text inside both borders");
