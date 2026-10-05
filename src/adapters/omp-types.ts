@@ -6,6 +6,15 @@ export type OmpZod = { object(shape: Record<string, unknown>): unknown } & Recor
 
 export type Timer = unknown;
 
+/** Minimal copy of omp's `CompactOptions` (`ctx.compact`), omp 18.x. */
+export interface CompactOptions {
+  /**
+   * A manual compaction aborts any turn in flight; set this when the caller dispatches its own
+   * follow-up turn so the compaction does not also resume the interrupted turn.
+   */
+  suppressContinuation?: boolean;
+}
+
 export type ExtensionContext = {
   agent: { kind: "main" | "sub"; id: string; name: string; depth: number; parentId?: string };
   cwd: string;
@@ -14,6 +23,8 @@ export type ExtensionContext = {
   ui: { setStatus(key: string, text: string | undefined): void };
   setTimeout(callback: () => void, ms?: number): Timer;
   clearTimer(timer: Timer): void;
+  /** Compact the session context; rejects when compaction fails. */
+  compact(options?: CompactOptions): Promise<void>;
 };
 
 export type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };

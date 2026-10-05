@@ -1,6 +1,6 @@
 // omp extension. The factory re-runs inside every subagent session; only main sessions join asenq.
 import { AsenqClient } from "../shared/client.js";
-import type { Push } from "../shared/protocol.js";
+import type { Push, ResetResult } from "../shared/protocol.js";
 import { zodShape, type Zod } from "../shared/schema.js";
 import { callTool, isToolError, TOOLS } from "../shared/tools.js";
 import type { ExtensionAPI, ExtensionContext } from "./omp-types.js";
@@ -8,10 +8,15 @@ import type { ExtensionAPI, ExtensionContext } from "./omp-types.js";
 /** Tools the model must see directly: inbound messages tell it to reply with asenq_send. */
 const ESSENTIAL: Record<string, true> = { asenq_send: true, asenq_list: true };
 
+/** A direct delivery push; `reset` (parent-owned protocol) asks the adapter to compact first. */
+type Delivery = Extract<Push, { push: "deliver" }>;
+
 export default function asenq(pi: ExtensionAPI): void {
   let client: AsenqClient | undefined;
   let ctxRef: ExtensionContext | undefined;
   let binding: { id: string; key: string; name: string } | undefined;
+  /** One serial delivery chain per bound asenq session; pings bypass it. */
+  const chains = new Map<string, Promise<void>>();
 
   const warn = (message: string): void => {
     try { pi.logger.warn(`asenq: ${message}`); } catch {}
@@ -25,7 +30,7 @@ export default function asenq(pi: ExtensionAPI): void {
 
   const register = async (key: string, name: string | undefined): Promise<void> => {
     if (!client || !ctxRef) return;
-    const r = await client.request("register", { harness: "omp", key, name, cwd: ctxRef.cwd, caps: ["ping"] });
+    const r = await client.request("register", { harness: "omp", key, name, cwd: ctxRef.cwd, caps: ["ping", "compact"] });
     const session = r.session as { id: string; name: string };
     binding = { id: session.id, key, name: session.name };
     setStatus();
@@ -40,13 +45,70 @@ export default function asenq(pi: ExtensionAPI): void {
     }
   };
 
-  const onPush = (p: Push): void => {
-    if (!client) return;
-    if (p.push === "ping") {
-      client.request("pong", { pingId: p.pingId }).catch((e: unknown) => warn(`pong failed: ${String(e)}`));
+  /** Runs `task` after every delivery already queued for the same bound session. */
+  const enqueue = (session: string, task: () => Promise<void>): void => {
+    const previous = chains.get(session) ?? Promise.resolve();
+    const next = previous.then(task, task);
+    chains.set(session, next);
+    const done = (): void => {
+      if (chains.get(session) === next) chains.delete(session);
+    };
+    void next.then(done, done);
+  };
+
+  /** Ordinary pushes ack after delivery, exactly as before reset support existed. */
+  const ackDelivery = (p: Delivery, ok: boolean, reason?: string): void => {
+    client?.request("ack", { msgId: p.msg.id, ok, reason })
+      .catch((e: unknown) => warn(`ack ${p.msg.id} failed: ${String(e)}`));
+  };
+
+  /** Flagged pushes acknowledge receipt before waiting on the queue or compaction. */
+  const ackReceipt = (p: Delivery): Promise<void> =>
+    client!.request("ack", { as: p.session, msgId: p.msg.id, ok: true, reset: "pending" }).then(() => undefined);
+
+  /** Reports the finished reset outcome and this adapter's delivery acceptance separately from receipt. */
+  const reportReset = (p: Delivery, reset: ResetResult, ok: boolean, reason?: string): void => {
+    client?.request("reset_result", { as: p.session, msgId: p.msg.id, reset, ok, reason })
+      .catch((e: unknown) => warn(`reset_result ${p.msg.id} failed: ${String(e)}`));
+  };
+
+  /** Compacts (when flagged) then injects, but only for the session this push was queued for. */
+  const deliver = async (p: Delivery, target: ExtensionContext | undefined, targetKey: string | undefined, receipt: Promise<void> | undefined): Promise<void> => {
+    const flagged = receipt !== undefined;
+    if (receipt) {
+      try {
+        await receipt;
+      } catch (e) {
+        // The daemon never accepted this delivery; never compact or inject an unacknowledged push.
+        warn(`receipt ack ${p.msg.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+    }
+    // A push is only ever acted on for the binding it arrived under; a session switch must not leak it.
+    const current = (): boolean => client !== undefined && target !== undefined && target === ctxRef && targetKey === binding?.key;
+    if (!current()) {
+      if (flagged) reportReset(p, "failed", false, "session switched before delivery");
+      else ackDelivery(p, false, "session switched before delivery");
       return;
     }
-    if (p.push !== "deliver") return;
+    let reset: ResetResult | undefined;
+    if (flagged) {
+      if (typeof target.compact !== "function") reset = "unsupported";
+      else {
+        try {
+          await target.compact({ suppressContinuation: true });
+          reset = "compacted";
+        } catch (e) {
+          reset = "failed";
+          warn(`compact ${p.msg.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      // Compaction can outlive a session switch; never inject the task into the replacement session.
+      if (!current()) {
+        reportReset(p, reset ?? "failed", false, "session switched during compaction");
+        return;
+      }
+    }
     let ok = true;
     let reason: string | undefined;
     try {
@@ -55,7 +117,22 @@ export default function asenq(pi: ExtensionAPI): void {
       ok = false;
       reason = e instanceof Error ? e.message : String(e);
     }
-    client.request("ack", { msgId: p.msg.id, ok, reason }).catch((e: unknown) => warn(`ack failed: ${String(e)}`));
+    if (flagged) reportReset(p, reset ?? "failed", ok, reason);
+    else ackDelivery(p, ok, reason);
+  };
+
+  const onPush = (p: Push): void => {
+    if (!client) return;
+    if (p.push === "ping") {
+      client.request("pong", { pingId: p.pingId }).catch((e: unknown) => warn(`pong failed: ${String(e)}`));
+      return;
+    }
+    if (p.push !== "deliver") return;
+    const target = ctxRef;
+    const targetKey = binding?.key;
+    // Initiate the receipt ack immediately, ahead of any queued delivery or compaction.
+    const receipt = p.reset === "compact" ? ackReceipt(p) : undefined;
+    enqueue(p.session, () => deliver(p, target, targetKey, receipt));
   };
 
   // omp's zod facade implements the string/number/boolean/enum/object subset zodShape uses.
@@ -124,5 +201,6 @@ export default function asenq(pi: ExtensionAPI): void {
     client?.close();
     client = undefined;
     binding = undefined;
+    ctxRef = undefined;
   });
 }
