@@ -1337,8 +1337,7 @@ export class Daemon {
     if (stableTarget) {
       targets = [stableTarget];
     } else if (to === "*") {
-      const self = s.kind === "agent" ? s.session.id : undefined;
-      targets = this.store.live().filter((r) => r.id !== self);
+      targets = s.kind === "agent" ? this.store.broadcastTargets(s.session.id) : this.store.live();
     } else {
       const identity = this.store.identityByName(to);
       if (!identity) throw this.unknownTarget(to);

@@ -2558,6 +2558,89 @@ test("channels are stored and read back, never pushed", async () => {
   await assert.rejects(human.request("channel_send", { channel: "Bad Name", text: "x" }), /invalid channel name/);
 });
 
+test("broadcast scopes channel members to the union of live co-members without duplicates or self", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender", "sender");
+  const overlap = await env.adapter("opencode", "overlap", "overlap", { cwd: "/other" });
+  const second = await env.adapter("omp", "second", "second");
+  const outsider = await env.adapter("omp", "outsider", "outsider");
+  const offline = await env.adapter("omp", "offline", "offline");
+  const removed = await env.adapter("omp", "removed", "removed");
+  for (const [channel, names] of [
+    ["first", ["sender", "overlap", "offline", "removed"]],
+    ["second", ["sender", "overlap", "second"]],
+    ["unrelated", ["outsider"]],
+  ] as const) {
+    await human.request("channel_create", { channel });
+    for (const name of names) await human.request("channel_add", { channel, name });
+  }
+  const removedGone = await env.watch(isSession("gone", "removed"));
+  removed.client.close();
+  await removedGone.event;
+  env.clock.advance(GRACE_MS + 1);
+  env.daemon.sweep();
+  assert.equal(await sessionState(human, "removed"), undefined);
+  const gone = await env.watch(isSession("gone", "offline"));
+  offline.client.close();
+  await gone.event;
+  const results = await send(sender.client, "*", "scoped broadcast");
+  assert.deepEqual(results.map((r) => [r.to, r.status]).sort(), [
+    ["overlap", "delivered"], ["second", "delivered"],
+  ]);
+  for (const member of [overlap, second]) {
+    assert.deepEqual(member.deliveries.map((p) => [p.msg.from, p.msg.to, p.msg.text]), [
+      ["sender", member.session.name, "scoped broadcast"],
+    ]);
+  }
+  assert.deepEqual(sender.deliveries, []);
+  assert.deepEqual(outsider.deliveries, []);
+  const history = (await human.request("log", { name: "sender" })).messages as StoredMessage[];
+  assert.deepEqual(history.map((m) => m.to).sort(), ["overlap", "second"]);
+});
+
+test("broadcast keeps an isolated member scoped, then restores machine-wide reach after its last membership is removed", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender", "sender");
+  const peer = await env.adapter("opencode", "peer", "peer");
+  await human.request("channel_create", { channel: "alone" });
+  await human.request("channel_add", { channel: "alone", name: "sender" });
+  assert.deepEqual(await send(sender.client, "*", "nobody shares my channel"), []);
+  const [direct] = await send(sender.client, "peer", "direct remains unrestricted");
+  assert.equal(direct.status, "delivered");
+  await human.request("channel_remove", { channel: "alone", name: "sender" });
+  assert.deepEqual((await send(sender.client, "*", "machine-wide agent")).map((r) => [r.to, r.status]), [
+    ["peer", "delivered"],
+  ]);
+  assert.deepEqual((await send(human, "*", "machine-wide human")).map((r) => [r.to, r.status]).sort(), [
+    ["peer", "delivered"], ["sender", "delivered"],
+  ]);
+  assert.deepEqual(peer.deliveries.map((p) => p.msg.text), [
+    "direct remains unrestricted", "machine-wide agent", "machine-wide human",
+  ]);
+  assert.deepEqual(sender.deliveries.map((p) => p.msg.text), ["machine-wide human"]);
+});
+
+test("broadcast scope follows the selected identity on a shared OpenCode connection", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const shared = await env.adapter("opencode", "scoped", "scoped");
+  const unscoped = (await shared.client.request("register", {
+    harness: "opencode", key: "unscoped", name: "unscoped", cwd: "/work",
+  })).session as { id: string };
+  const peer = await env.adapter("omp", "peer", "peer");
+  await human.request("channel_create", { channel: "work" });
+  for (const name of ["scoped", "peer"]) await human.request("channel_add", { channel: "work", name });
+  assert.deepEqual((await send(shared.client, "*", "selected member", { as: shared.session.id }))
+    .map((r) => [r.to, r.status]), [["peer", "delivered"]]);
+  assert.deepEqual((await send(shared.client, "*", "selected non-member", { as: unscoped.id }))
+    .map((r) => [r.to, r.status]).sort(), [["peer", "delivered"], ["scoped", "delivered"]]);
+  assert.deepEqual(peer.deliveries.map((p) => [p.msg.from, p.msg.text]), [
+    ["scoped", "selected member"], ["unscoped", "selected non-member"],
+  ]);
+});
+
 test("human channel lifecycle keeps empty channels, identity rosters and on-demand posts", async () => {
   env = await startEnv();
   const human = env.human();

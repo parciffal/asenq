@@ -91,7 +91,7 @@ Explicit closure ends forwarding through every former name and the current name:
 
 | Tool | Purpose |
 |---|---|
-| `asenq_send` | Send `text`, a `file: { path, summary }` reference, or both to a session name, to `"*"` (every live session) or to `"human"`. Text may be omitted only with a file reference. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
+| `asenq_send` | Send `text`, a `file: { path, summary }` reference, or both to a session name, to `"*"` (live co-members of your channels; machine-wide if you belong to none) or to `"human"`. Text may be omitted only with a file reference. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
 | `asenq_file_check` | Check a retained direct message's referenced file against its send-time snapshot. Required: `id`; returns `match`, `changed` or `missing`. |
 | `asenq_list` | List sessions and their roles; the caller's own row is marked `[you]`. |
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
@@ -122,7 +122,9 @@ Channels have durable names and rosters of session identities. A session may bel
 
 The human can create channels and edit any roster through the CLI or **? → Create channel / Add channel member / Remove channel member** in the TUI. An orchestrator can create a new channel with itself as first member, or add itself to any existing channel; it can edit other members only in channels it belongs to. Workers and unset-role sessions cannot create channels or edit rosters. Adding requires a live target. Removal resolves current names before former names within that roster and refuses ambiguous matches; the human can instead pass `--session-id` to remove a specific identity, including an archived member. The TUI always removes by identity.
 
-Posting to an unknown channel still creates it, with an empty roster and no automatic membership. Existing post-only channels migrate with empty rosters. Add/remove/member queries require an existing channel. Channel reads remain unrestricted and posts stay on demand: membership alone does not push messages or scope broadcasts. Mention delivery and broadcast scoping are separate changes.
+Posting to an unknown channel still creates it, with an empty roster and no automatic membership. Existing post-only channels migrate with empty rosters. Add/remove/member queries require an existing channel. Channel reads remain unrestricted and posts stay on demand: membership alone does not push channel posts. Mention delivery is a separate change.
+
+An agent's `"*"` direct-message broadcast reaches each **live** session sharing any of its channels, once even if several channels overlap, and never the sender. A member with no live co-members reaches nobody; it does not fall back to machine-wide delivery. A sender belonging to no channel reaches every other live session on the machine. Human broadcasts remain machine-wide, and the human is never a broadcast target. Named direct messages remain unrestricted by membership; broadcasts use the same inbound policy, rate limits and delivery handling as other direct messages.
 
 The Channels tab lists each roster under its channel with role and lifecycle state. Selecting a member keeps the channel conversation and composer in channel scope, not a direct message. Purging retained posts keeps the channel; deleting an identity through retention removes its memberships.
 

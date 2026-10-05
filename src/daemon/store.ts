@@ -540,6 +540,16 @@ export class Store {
     return this.db.all<SessionRow>("SELECT * FROM sessions WHERE state='live' ORDER BY created_at");
   }
 
+  broadcastTargets(senderId: string): SessionRow[] {
+    return this.db.all<SessionRow>(
+      `SELECT s.* FROM sessions s WHERE s.state='live' AND s.id<>?
+       AND (NOT EXISTS (SELECT 1 FROM channel_members WHERE session_id=?)
+         OR EXISTS (SELECT 1 FROM channel_members a JOIN channel_members b ON b.channel=a.channel
+                    WHERE a.session_id=? AND b.session_id=s.id))
+       ORDER BY s.created_at`, senderId, senderId, senderId,
+    );
+  }
+
   identity(id: string): SessionIdentity | undefined {
     const row = this.db.get<IdentityRow>("SELECT * FROM session_identities WHERE id=?", id);
     return row && toIdentity(row);
