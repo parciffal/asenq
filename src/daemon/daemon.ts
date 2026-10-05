@@ -405,6 +405,7 @@ export class Daemon {
       case "channel_list":
         return { channels: this.store.channelSummaries() };
       case "held": {
+        this.requireHuman(this.sender(c, p), "read held messages");
         const name = str(p, "name");
         const rows = name
           ? this.store.db.all<MsgRow>("SELECT * FROM messages WHERE status='held' AND to_name=? ORDER BY ord", name)

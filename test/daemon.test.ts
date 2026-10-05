@@ -616,6 +616,24 @@ test("control honors hold and refuse while released and queued deliveries retain
   );
 });
 
+test("held bodies are user-only for both complete and name-filtered requests", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const agent = await env.adapter("omp", "held-guard-agent", "alpha");
+  await env.adapter("omp", "held-guard-target", "beta");
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  const [held] = await send(agent.client, "beta", "waiting for user approval");
+  for (const params of [{}, { name: "beta" }]) {
+    await assert.rejects(agent.client.request("held", params), {
+      code: "bad_request", message: /only the user/,
+    });
+  }
+  assert.deepEqual(
+    ((await human.request("held", { name: "beta" })).messages as StoredMessage[]).map(({ id, status }) => [id, status]),
+    [[held.msgId, "held"]],
+  );
+});
+
 test("held payload keeps stable target identity across rename and exposes oldest-first order", async () => {
   env = await startEnv();
   const human = env.human();
