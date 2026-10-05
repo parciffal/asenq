@@ -5468,3 +5468,29 @@ test("old message databases migrate additively without changing plain history an
     ["m_old", "old plain message", undefined],
   ]);
 });
+
+test("channel mention delivery waits through the direct-message acknowledgment window", async (t) => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "slow-mention-poster", "poster");
+  const target = await env.adapter("omp", "slow-mention-target", "target", { autoAck: false });
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "target" });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const response = poster.client.request("channel_send", { channel: "work", text: "Review @target" }).then(
+      (reply) => ({ reply }),
+      (error: Error) => ({ error }),
+    );
+    const delivery = await target.nextDelivery();
+    t.mock.timers.tick(6_000);
+    await target.client.request("ack", { msgId: delivery.msg.id, ok: true });
+    const outcome = await response;
+    if ("error" in outcome) assert.fail(outcome.error.message);
+    assert.deepEqual((outcome.reply.results as SendResult[]).map((result) => [result.to, result.status]), [
+      ["target", "delivered"],
+    ]);
+  } finally {
+    t.mock.timers.reset();
+  }
+});

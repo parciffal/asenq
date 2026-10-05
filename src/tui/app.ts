@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { AsenqClient, type ClientOpts } from "../shared/client.js";
-import { KINDS, MENTION_KEYWORDS } from "../shared/protocol.js";
+import { KINDS, MENTION_KEYWORDS, hasMentionOpening } from "../shared/protocol.js";
 import { isStaleSession } from "../shared/sessions.js";
 import type {
   ChannelSummary, HistoryScope, InboxSummary, PingStatus, PositionedEvent, ReadScope, ReadState, SendResult,
@@ -1573,13 +1573,13 @@ export class ConsoleApp {
     }
     const key = this.draftKey(target);
     const draft = this.drafts.get(key) ?? "";
-    const match = /(?:^|[\s(\[<{"'`])@([A-Za-z0-9_-]*)$/.exec(draft.slice(0, this.cursor));
-    if (!match || match.index + match[0].length !== this.cursor) {
+    const match = /@([A-Za-z0-9_-]*)$/.exec(draft.slice(0, this.cursor));
+    if (!match || match.index + match[0].length !== this.cursor || !hasMentionOpening(draft, match.index)) {
       this.mention = undefined;
       return;
     }
     const query = match[1];
-    const start = this.cursor - query.length - 1;
+    const start = match.index;
     const end = this.cursor + (/^[A-Za-z0-9_-]*/.exec(draft.slice(this.cursor))?.[0].length ?? 0);
     const previous = this.mention;
     this.mention = previous?.key === key && previous.start === start && previous.query === query

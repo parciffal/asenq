@@ -5,8 +5,8 @@ import net from "node:net";
 import { isAbsolute, join } from "node:path";
 import {
   ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, MENTION_KEYWORDS, NAME_RE, PROBE_MS,
-  PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, slug,
-  type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
+  PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, hasMentionOpening, slug,
+  type ChannelSendResult, type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type MsgStatus, type PositionedEvent,
   type PingStatus, type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type SessionIdentity, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
@@ -1692,14 +1692,15 @@ export class Daemon {
     return this.mutateChannel(channel, "remove", matches[0].id);
   }
 
-  private async opChannelSend(s: Sender, p: Params): Promise<Result> {
+  private async opChannelSend(s: Sender, p: Params): Promise<ChannelSendResult> {
     const channel = this.channelName(p);
     const text = str(p, "text", true);
     if (text.length === 0) throw new AsenqError("bad_request", "text is empty");
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);
     const members = this.store.channelMembers(channel);
     const targets = new Map<string, (typeof members)[number]>();
-    for (const match of text.matchAll(/(?:^|[\s(\[<{"'`])@([A-Za-z0-9_-]+)/g)) {
+    for (const match of text.matchAll(/@([A-Za-z0-9_-]+)/g)) {
+      if (!hasMentionOpening(text, match.index)) continue;
       const token = match[1];
       let matches: typeof members;
       if (MENTION_KEYWORDS.includes(token)) {

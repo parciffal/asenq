@@ -20,6 +20,13 @@ export const CONTROL_ACTIONS: readonly ControlAction[] = ["pause", "resume", "ca
 export const INBOUND: Inbound[] = ["accept", "hold", "refuse"];
 export const MENTION_KEYWORDS: readonly string[] = ["orch", "orchestrator", "orchestrators", "wrk", "worker", "workers", "all"];
 
+const MENTION_OPENING = /[\s(\[<{"'`]/;
+
+/** Whether a candidate @ may open a mention at this UTF-16 offset. */
+export function hasMentionOpening(text: string, index: number): boolean {
+  return index === 0 || (index > 0 && MENTION_OPENING.test(text[index - 1]));
+}
+
 export type ErrCode =
   | "bad_request" | "unknown_target" | "name_taken" | "invalid_name"
   | "unknown_channel" | "not_live" | "ambiguous_target" | "unknown_mention"
