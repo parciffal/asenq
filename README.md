@@ -128,7 +128,7 @@ When the actual harness session ID is known, the list includes a shell-quoted re
 
 Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. The human can edit any role. An orchestrator can use `asenq_set_role` for sessions sharing at least one channel with it; workers and sessions with an unset role receive `not_permitted`. Roles do not enforce work or change delivery policy; the orchestrator role permits scoped roster and role editing.
 
-A role belongs to the session identity, not its name: renaming and reconnecting preserve it, while a different identity reusing the name starts unset. `asenq ls` and `asenq_list` show the role. Every delivered direct-message header tells the recipient its own role (`your-role=worker` or `your-role=orchestrator`); unset roles omit that label. TUI rows use plain `orch` / `wrk` tags, omitted when space is needed for the name, unread count and state; the conversation header also shows the full role. Archived identities retain their role; automatically removed identities accept queued direct messages while retained.
+A role belongs to the session identity, not its name: renaming and reconnecting preserve it, while a different identity reusing the name starts unset. `asenq ls` and `asenq_list` show the role. Every delivered direct-message header tells the recipient its own role (`your-role=worker` or `your-role=orchestrator`); unset roles omit that label. TUI rows use inverse `orch` / `wrk` tags beside short harness labels, with metadata on a second row when needed; the conversation header also shows the full role. Archived identities retain their dimmed role tag; automatically removed identities accept queued direct messages while retained.
 
 ### Channel rosters
 
@@ -247,7 +247,9 @@ These commands accept an exact **current** name or a stable identity ID; former 
 
 Full-screen view of live and archived session conversations (messages involving that session, not only messages to you). Four tabs — **Sessions**, **Inbox**, **Channels**, **Activity** — share one layout: list beside conversation at ≥80 columns, or a picker on narrower terminals.
 
-Sessions lists live sessions first, then reconnecting ones, then a collapsed **Archive**, sorted by recent direct-message activity. Renaming keeps a conversation; reusing a removed name starts another. Message bodies are never truncated; only labels shorten with `…`.
+Sessions groups **LIVE** (`●`), **RECONNECTING** (`◌`) and a collapsed **▸ archive N**, sorted by recent direct-message activity. Rows show `cc` / `oc` / `omp` harness labels, role tags and `⏸` for a non-accepting inbound policy. The selected identity keeps its cyan `▌` marker and name highlight while you read or write. Renaming keeps a conversation; reusing a removed name starts another. Channels show the same identity cues in their member lists.
+
+Transcript headers put sender → target on the left and delivery state with time on the right. Non-chat kinds use a tag; chat omits it. A dashed cyan **N new** divider uses the human unread count, not intervening agent traffic. Direct agent-to-agent blocks are dim and adjacent blocks omit blank spacers; messages to/from the human and channel posts keep full contrast. Every body stays wrapped and reachable, never truncated; only labels shorten with `…`. When scrolled away from the tail, **End ↓ latest** appears outside the readable message rows.
 
 | Key | Action |
 |---|---|
