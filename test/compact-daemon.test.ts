@@ -240,3 +240,18 @@ test("queue expiry before compact receipt does not leave the target gated foreve
   await target.client.request("ack", { msgId: normal.msgId, ok: true });
   assert.equal((await logOf(human, normal.msgId!)).status, "delivered");
 });
+
+test("expired compact receipt is rejected before the adapter may compact or inject", async () => {
+  env = await startEnv({ ackTimeoutMs: 100, queueTtlMs: 10 });
+  const human = env.human();
+  const target = await env.adapter("omp", "late-receipt", "target", { autoAck: false });
+  await target.client.request("register", { harness: "omp", key: "late-receipt", caps: ["compact"] });
+  const sending = human.request("send", { to: "target", text: "must not compact after expiry", reset: "compact" });
+  void sending.catch(() => {});
+  const push = await target.nextDelivery();
+  env.clock.advance(10);
+  env.daemon.sweep();
+  await assert.rejects(target.client.request("ack", { as: target.session.id, msgId: push.msg.id, ok: true, reset: "pending" }), { code: "bad_request" });
+  assert.equal(((await sending).results as SendResult[])[0].status, "expired");
+  assert.equal((await logOf(human, push.msg.id)).resetResult, undefined, "no compaction outcome is claimed");
+});

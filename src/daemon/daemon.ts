@@ -462,6 +462,11 @@ export class Daemon {
           }
           if (ack.ok && p.reset !== "pending") throw new AsenqError("bad_request", "compact receipt ack requires reset pending");
           if (!reset.received && ack.ok) {
+            const row = this.store.msg(msgId);
+            if (!row || row.status !== "queued" || this.expireQueued(row)) {
+              f?.settle({ ok: false, reason: "compact message is no longer queued" });
+              throw new AsenqError("bad_request", "compact message is no longer queued");
+            }
             reset.received = true;
             reset.deadline = this.now() + this.resetTimeoutMs;
           }
