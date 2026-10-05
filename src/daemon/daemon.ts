@@ -14,6 +14,7 @@ import type { Db } from "../shared/sqlite.js";
 import { version } from "../shared/version.js";
 import { claudeFrame, parseEnvelopeReply, probe, replyAddr, writeLine } from "./claude.js";
 import { claudeLineage } from "./claude-lineage.js";
+import { defaultName, type DefaultNameWords } from "./default-names.js";
 import { Store, toStored, toWire, type MsgRow, type SessionRow } from "./store.js";
 
 export type DaemonOpts = {
@@ -29,6 +30,7 @@ export type DaemonOpts = {
   timers?: boolean;
   envelope?: boolean;
   historyDays?: number;
+  defaultNameWords?: DefaultNameWords;
   log?: (line: string) => void;
 };
 
@@ -746,6 +748,11 @@ export class Daemon {
     });
   }
 
+  private nameTaken(name: string, exceptIdentityId?: string): boolean {
+    const holder = this.store.sessionByName(name);
+    return holder !== undefined && holder.id !== exceptIdentityId;
+  }
+
   /** Revives the durable identity for a harness id; names never establish identity. */
   private upsertSession(
     harness: Harness, key: string, name: string | undefined, cwd: string | undefined, seed = key, identityId?: string,
@@ -769,11 +776,14 @@ export class Daemon {
       return row;
     }
     let base = identity?.name ?? slug(name ?? "");
+    const isTaken = (candidate: string) => this.nameTaken(candidate, identity?.id);
     if (!base || RESERVED.includes(base) || !NAME_RE.test(base)) {
-      base = `${harness}-${seed.toLowerCase().replace(/[^a-z0-9]/g, "").slice(-6)}`;
+      base = identity
+        ? `${harness}-${seed.toLowerCase().replace(/[^a-z0-9]/g, "").slice(-6)}`
+        : defaultName(harness, seed, isTaken, this.opts.defaultNameWords);
     }
     let chosen = base;
-    for (let n = 2; this.store.sessionByName(chosen); n++) {
+    for (let n = 2; isTaken(chosen); n++) {
       const suffix = `-${n}`;
       chosen = base.slice(0, 40 - suffix.length).replace(/-+$/, "") + suffix;
     }
