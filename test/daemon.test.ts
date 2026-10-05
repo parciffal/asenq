@@ -325,6 +325,299 @@ test("channels are stored and read back, never pushed", async () => {
   await assert.rejects(human.request("channel_send", { channel: "Bad Name", text: "x" }), /invalid channel name/);
 });
 
+test("thread reads retain both directions in durable order and isolate the caller", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const beta = await env.adapter("omp", "beta-key", "beta");
+  const gamma = await env.adapter("omp", "gamma-key", "gamma");
+  const first = (await send(human, "alpha", "human to alpha", { thread: "work" }))[0];
+  const second = (await send(alpha.client, "beta", "alpha to beta", { thread: "work" }))[0];
+  await send(beta.client, "gamma", "not alpha's exchange", { thread: "work" });
+  const third = (await send(beta.client, "alpha", "beta to alpha", { thread: "work" }))[0];
+  const fourth = (await send(alpha.client, "human", "alpha to human", { thread: "work" }))[0];
+  await send(human, "gamma", "not alpha's human message", { thread: "work" });
+  await send(beta.client, "alpha", "another thread", { thread: "other" });
+  await alpha.client.request("channel_send", { channel: "work", text: "not a direct message" });
+
+  const snapshot = await human.sync();
+  const read = (await alpha.client.request("thread_read", { thread: "work" })).messages as StoredMessage[];
+  assert.deepEqual(read.map((message) => message.id), [first.msgId, second.msgId, third.msgId, fourth.msgId]);
+  assert.deepEqual(read.map((message) => message.createdAt), Array(4).fill(env.clock.now()));
+  assert.ok(read.every((message, index) => index === 0 || read[index - 1].order < message.order));
+  const humanRead = (await human.request("thread_read", { thread: "work" })).messages as StoredMessage[];
+  assert.deepEqual(humanRead.map((message) => message.text), [
+    "human to alpha", "alpha to human", "not alpha's human message",
+  ]);
+  assert.deepEqual((await human.sync()).readStates, snapshot.readStates);
+  assert.deepEqual((await human.request("replay", { position: snapshot.watermark })).events, []);
+});
+
+test("thread scope survives renames but does not transfer to a reused name", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = await env.adapter("omp", "original-key", "alpha");
+  const peer = await env.adapter("omp", "peer-key", "peer");
+  const first = (await send(original.client, "peer", "before rename", { thread: "work" }))[0];
+  await original.client.request("rename", { name: "renamed" });
+  const second = (await send(peer.client, "renamed", "after rename", { thread: "work" }))[0];
+  const third = (await send(original.client, "human", "human exchange", { thread: "work" }))[0];
+  assert.deepEqual(
+    ((await original.client.request("thread_read", { thread: "work", since: first.msgId })).messages as StoredMessage[]).map((message) => message.id),
+    [second.msgId, third.msgId],
+  );
+  assert.deepEqual((await original.client.request("thread_read", { thread: "work", since: env.clock.now() })).messages, []);
+  await original.client.request("unregister");
+  const replacement = await env.adapter("omp", "replacement-key", "renamed");
+  const fresh = (await send(peer.client, "renamed", "replacement exchange", { thread: "work" }))[0];
+  assert.notEqual(replacement.session.id, original.session.id);
+  assert.deepEqual(
+    ((await replacement.client.request("thread_read", { thread: "work" })).messages as StoredMessage[]).map((message) => message.id),
+    [fresh.msgId],
+  );
+  assert.deepEqual(
+    ((await peer.client.request("thread_read", { thread: "work" })).messages as StoredMessage[]).map((message) => message.id),
+    [first.msgId, second.msgId, fresh.msgId],
+  );
+  await assert.rejects(replacement.client.request("thread_read", { thread: "work", since: first.msgId }), { code: "bad_request" });
+});
+
+test("inbox pages newest first with exclusive durable cursors, default and maximum limits", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const ids: string[] = [];
+  for (let index = 0; index < 205; index++) {
+    ids.push((await send(human, "human", `note ${index}`))[0].msgId!);
+  }
+  const newest = await human.request("inbox");
+  assert.deepEqual((newest.messages as StoredMessage[]).map((message) => message.id), ids.slice(-20).reverse());
+  assert.equal(newest.hasMore, true);
+  const capped = await human.request("inbox", { limit: 999 });
+  assert.deepEqual((capped.messages as StoredMessage[]).map((message) => message.id), ids.slice(-200).reverse());
+  assert.equal(capped.hasMore, true);
+  const middle = await human.request("inbox", { since: ids[1], before: ids[5], limit: 2 });
+  assert.deepEqual((middle.messages as StoredMessage[]).map((message) => message.id), [ids[4], ids[3]]);
+  assert.equal(middle.hasMore, true);
+  const oldest = await human.request("inbox", { before: ids[3], limit: 3 });
+  assert.deepEqual((oldest.messages as StoredMessage[]).map((message) => message.id), ids.slice(0, 3).reverse());
+  assert.equal(oldest.hasMore, false);
+  assert.deepEqual((await human.request("inbox", { since: env.clock.now() })).messages, []);
+});
+
+test("inbox filters compose across timestamps and sender renames without changing human markers", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const beta = await env.adapter("omp", "beta-key", "beta");
+  await human.sync();
+  const scope = { scope: "session" as const, sessionId: alpha.session.id };
+  const first = (await send(alpha.client, "human", "first", { thread: "work" }))[0];
+  const firstPage = await human.historyPage({ scope: "inbox" });
+  await human.markRead(scope, firstPage.messages[0].order, (await human.readState(scope)).version);
+  env.clock.advance(1000);
+  const boundary = env.clock.now();
+  const second = (await send(alpha.client, "human", "second", { thread: "work" }))[0];
+  env.clock.advance(1000);
+  const third = (await send(alpha.client, "human", "third", { thread: "work" }))[0];
+  await send(alpha.client, "human", "different thread", { thread: "other" });
+  await send(beta.client, "human", "different sender", { thread: "work" });
+  await human.request("rename", { from: "alpha", name: "renamed" });
+  await alpha.client.request("channel_send", { channel: "work", text: "channel post" });
+  const snapshot = await human.sync();
+  const params = { from: "renamed", thread: "work", unread_only: true, limit: 1 };
+  const combined = await human.request("inbox", params);
+  assert.deepEqual((combined.messages as StoredMessage[]).map((message) => message.id), [third.msgId]);
+  assert.equal(combined.hasMore, true);
+  for (const since of [boundary, String(boundary), new Date(boundary).toISOString()]) {
+    const page = await human.request("inbox", { ...params, since, limit: 20 });
+    assert.deepEqual((page.messages as StoredMessage[]).map((message) => message.id), [third.msgId]);
+  }
+  const older = await human.request("inbox", { from: "renamed", before: boundary + 1 });
+  assert.deepEqual((older.messages as StoredMessage[]).map((message) => message.id), [second.msgId, first.msgId]);
+  const sinceId = await human.request("inbox", { ...params, since: first.msgId, before: third.msgId });
+  assert.deepEqual((sinceId.messages as StoredMessage[]).map((message) => message.id), [second.msgId]);
+  assert.deepEqual((await human.sync()).readStates, snapshot.readStates);
+  assert.deepEqual((await human.replay(snapshot.watermark)).events, []);
+  const reminder = await human.markUnread(scope);
+  const latest = await human.historyPage({ ...scope, limit: 1 });
+  await human.markRead(scope, latest.messages[0].order, reminder.state.version);
+  await human.markUnread(scope);
+  assert.deepEqual(
+    ((await human.request("inbox", { unread_only: true, from: "renamed" })).messages as StoredMessage[]).map((message) => message.text),
+    ["different thread"],
+  );
+  assert.deepEqual((await human.request("inbox", { from: "no-such-sender" })).messages, []);
+  assert.deepEqual((await human.request("inbox", { from: "human" })).messages, []);
+  assert.deepEqual((await human.replay(snapshot.watermark)).events.map(({ event }) => event.type), ["read", "read", "read"]);
+});
+
+test("plain session unread drains oldest first within budget; filtered reads do not consume", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const ids: string[] = [];
+  for (let index = 0; index < 3; index++) {
+    ids.push((await send(human, "alpha", `${index}${"x".repeat(8000)}`, { thread: "work" }))[0].msgId!);
+  }
+  const filtered = await alpha.client.request("inbox", { unread_only: true, thread: "work", limit: 1 });
+  assert.deepEqual((filtered.messages as StoredMessage[]).map((message) => message.id), [ids[2]]);
+  const sent = (await send(alpha.client, "human", "reply in thread", { thread: "work" }))[0];
+  const thread = await alpha.client.request("thread_read", { thread: "work" });
+  assert.deepEqual((thread.messages as StoredMessage[]).map((message) => message.id), [...ids, sent.msgId]);
+  for (let index = 0; index < ids.length; index++) {
+    const page = await alpha.client.request("inbox", { unread_only: true, max_chars: 15000 });
+    assert.deepEqual((page.messages as StoredMessage[]).map((message) => message.id), [ids[index]]);
+    assert.equal(page.hasMore, index < ids.length - 1);
+  }
+  assert.deepEqual((await alpha.client.request("inbox", { unread_only: true })).messages, []);
+  assert.deepEqual(
+    ((await alpha.client.request("inbox")).messages as StoredMessage[]).map((message) => message.id), [...ids].reverse(),
+  );
+  await alpha.client.request("rename", { name: "renamed" });
+  const resumed = await env.adapter("omp", "alpha-key", "renamed");
+  assert.equal(resumed.session.id, alpha.session.id);
+  assert.deepEqual((await resumed.client.request("inbox", { unread_only: true })).messages, []);
+  const fresh = await env.adapter("omp", "fresh-key", "fresh");
+  assert.deepEqual((await fresh.client.request("inbox", { unread_only: true })).messages, []);
+});
+
+test("session unread includes an earlier held message exactly once when released after a later delivery", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  await human.request("set_inbound", { name: "receiver", mode: "hold" });
+  const held = (await send(sender.client, "receiver", "held first"))[0];
+  assert.equal(held.status, "held");
+  const later = (await send(human, "receiver", "delivered later"))[0];
+  assert.equal(later.status, "delivered");
+  assert.deepEqual(
+    ((await receiver.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map((message) => message.id),
+    [later.msgId],
+  );
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+  assert.deepEqual(
+    ((await receiver.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map((message) => message.id),
+    [held.msgId],
+  );
+  assert.deepEqual((await receiver.client.request("inbox", { unread_only: true })).messages, []);
+  assert.deepEqual(
+    ((await receiver.client.request("inbox")).messages as StoredMessage[]).map((message) => message.id),
+    [later.msgId, held.msgId],
+  );
+});
+
+test("session unread excludes queued messages until ack and includes their later delivery exactly once", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const original = await env.adapter("omp", "receiver-key", "receiver");
+  const gone = await env.watch(isSession("gone", "receiver"));
+  original.client.close();
+  await gone.event;
+  const queued = (await send(human, "receiver", "queued first"))[0];
+  assert.equal(queued.status, "queued");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver", { autoAck: false });
+  assert.equal((await receiver.nextDelivery()).msg.id, queued.msgId);
+  const sendingLater = send(human, "receiver", "delivered later");
+  const laterDelivery = await receiver.nextDelivery();
+  await receiver.client.request("ack", { msgId: laterDelivery.msg.id, ok: true });
+  const later = (await sendingLater)[0];
+  assert.equal(later.status, "delivered");
+  assert.deepEqual(
+    ((await receiver.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map((message) => message.id),
+    [later.msgId],
+  );
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  await receiver.client.request("ack", { msgId: queued.msgId, ok: true });
+  await delivered.event;
+  assert.deepEqual(
+    ((await receiver.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map((message) => message.id),
+    [queued.msgId],
+  );
+  assert.deepEqual((await receiver.client.request("inbox", { unread_only: true })).messages, []);
+  await receiver.client.request("ack", { msgId: queued.msgId, ok: true });
+  await receiver.client.request("ack", { msgId: later.msgId, ok: true });
+  assert.deepEqual((await receiver.client.request("inbox", { unread_only: true })).messages, []);
+});
+
+test("thread reads, id recovery and cursors honor recipient inbound policy while preserving sender history", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  await human.request("set_inbound", { name: "receiver", mode: "hold" });
+  const held = (await send(sender.client, "receiver", "held private body", { thread: "work" }))[0];
+  await human.request("set_inbound", { name: "receiver", mode: "refuse" });
+  const refused = (await send(sender.client, "receiver", "refused private body", { thread: "work" }))[0];
+  assert.deepEqual([held.status, refused.status], ["held", "rejected"]);
+  assert.deepEqual((await receiver.client.request("thread_read", { thread: "work" })).messages, []);
+  for (const message of [held, refused]) {
+    await assert.rejects(receiver.client.request("inbox", { msgId: message.msgId }), { code: "bad_request" });
+    for (const op of ["inbox", "thread_read"]) {
+      await assert.rejects(receiver.client.request(op, { thread: "work", since: message.msgId }), { code: "bad_request" });
+    }
+    await assert.rejects(receiver.client.request("inbox", { before: message.msgId }), { code: "bad_request" });
+    const sent = (await sender.client.request("inbox", { msgId: message.msgId })).messages as StoredMessage[];
+    assert.deepEqual(sent.map((row) => [row.id, row.status]), [[message.msgId, message.status]]);
+  }
+  const history = (await sender.client.request("thread_read", { thread: "work" })).messages as StoredMessage[];
+  assert.deepEqual(history.map((message) => [message.id, message.status]), [[held.msgId, "held"], [refused.msgId, "rejected"]]);
+});
+
+test("inbox id recovery is full, caller scoped and nonmutating despite other params", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const beta = await env.adapter("omp", "beta-key", "beta");
+  const oversizedText = "x".repeat(20000);
+  const oversized = (await send(human, "alpha", oversizedText))[0];
+  const next = (await send(human, "alpha", "next message"))[0];
+  const page = await alpha.client.request("inbox", { unread_only: true, max_chars: 15000 });
+  assert.deepEqual((page.messages as StoredMessage[]).map((message) => [message.id, message.text]), [[oversized.msgId, oversizedText]]);
+  assert.equal(page.hasMore, true);
+  for (const caller of [alpha.client, human]) {
+    const recovered = await caller.request("inbox", {
+      msgId: oversized.msgId, max_chars: 1, limit: 0, unread_only: true, since: "invalid", from: "wrong", thread: "wrong",
+    });
+    assert.deepEqual((recovered.messages as StoredMessage[]).map((message) => [message.id, message.text]), [[oversized.msgId, oversizedText]]);
+    assert.equal(recovered.hasMore, false);
+  }
+  await assert.rejects(beta.client.request("inbox", { msgId: oversized.msgId }), { code: "bad_request" });
+  await assert.rejects(alpha.client.request("inbox", { msgId: "m_missing" }), { code: "bad_request" });
+  const remaining = await alpha.client.request("inbox", { unread_only: true });
+  assert.deepEqual((remaining.messages as StoredMessage[]).map((message) => message.id), [next.msgId]);
+  const secret = (await send(beta.client, "human", "private human inbox"))[0];
+  const normal = await alpha.client.request("inbox", { name: "human" });
+  assert.ok(!(normal.messages as StoredMessage[]).some((message) => message.id === secret.msgId));
+});
+
+test("inbox and thread cursors reject invalid and foreign ids without consuming unread", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const beta = await env.adapter("omp", "beta-key", "beta");
+  const incoming = (await send(human, "alpha", "incoming", { thread: "work" }))[0];
+  const foreign = (await send(beta.client, "human", "foreign", { thread: "work" }))[0];
+  await alpha.client.request("channel_send", { channel: "work", text: "post" });
+  const channel = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  for (const op of ["inbox", "thread_read"]) {
+    for (const since of [foreign.msgId, channel[0].id, "m_unknown", "yesterday", "2026-99-99T00:00:00Z", -1, 1.5, {}, true, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(alpha.client.request(op, { thread: "work", since }), { code: "bad_request" });
+    }
+  }
+  for (const before of [foreign.msgId, "m_unknown", -1]) {
+    await assert.rejects(alpha.client.request("inbox", { before }), { code: "bad_request" });
+  }
+  for (const params of [{ limit: 0 }, { limit: 1.5 }, { limit: "2" }, { unread_only: "true" }, { from: 3 }, { thread: 3 }, { max_chars: 0 }]) {
+    await assert.rejects(alpha.client.request("inbox", params), { code: "bad_request" });
+  }
+  await assert.rejects(alpha.client.request("thread_read"), { code: "bad_request" });
+  assert.deepEqual(
+    ((await alpha.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map((message) => message.id),
+    [incoming.msgId],
+  );
+});
+
 test("history pages use durable order across equal timestamps and concurrent arrivals", async () => {
   env = await startEnv();
   const human = env.human();
@@ -471,6 +764,10 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
       channel TEXT, text TEXT NOT NULL, kind TEXT, thread TEXT, reply_to TEXT,
       done INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE TABLE session_identities(
+      id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
+      cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
+      created_at INTEGER NOT NULL, removed_at INTEGER);
   `);
   db.run(
     `INSERT INTO sessions(id,harness,key,name,cwd,inbound,state,created_at)
@@ -494,6 +791,12 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
       done,status,reason,attempts,created_at,updated_at)
      VALUES('m_orphan','human',NULL,'removed-session','s_removed',NULL,'archived',NULL,NULL,NULL,0,'delivered',NULL,0,11,12)`,
   );
+  db.run(
+    `INSERT INTO messages(
+      id,from_name,from_session,to_name,to_session,channel,text,kind,thread,reply_to,
+      done,status,reason,attempts,created_at,updated_at)
+     VALUES('m_incoming','human',NULL,'old-session','s_old',NULL,'already delivered',NULL,NULL,NULL,0,'delivered',NULL,0,13,13)`,
+  );
 
   const daemon = new Daemon({
     socket: socketPath(),
@@ -504,6 +807,7 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
     log: () => {},
   });
   const client = new AsenqClient();
+  const agent = new AsenqClient();
   try {
     await daemon.listen();
     const page = await client.historyPage({ scope: "inbox" });
@@ -523,8 +827,15 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
     );
     const archived = await client.historyPage({ scope: "session", sessionId: "s_removed" });
     assert.deepEqual(archived.messages.map((message) => message.id), ["m_orphan"]);
+    await agent.request("register", { harness: "omp", key: "old-key", name: "old-session", cwd: "/old" });
+    assert.deepEqual((await agent.request("inbox", { unread_only: true })).messages, []);
+    assert.deepEqual(
+      ((await agent.request("inbox")).messages as StoredMessage[]).map((message) => message.id), ["m_incoming"],
+    );
+    assert.equal(((await agent.request("inbox", { msgId: "m_incoming" })).messages as StoredMessage[])[0].text, "already delivered");
   } finally {
     client.close();
+    agent.close();
     await daemon.close();
     db.close();
     rmSync(home, { recursive: true, force: true });
@@ -614,6 +925,77 @@ test("recent events return the newest bounded window in ascending order, includi
     assert.equal(resumed[1].event.type === "message" && resumed[1].event.msg.text, "after restart");
   } finally {
     client.close();
+    await daemon.close();
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ASENQ_HOME;
+    else process.env.ASENQ_HOME = previousHome;
+  }
+});
+
+test("session inbox position survives daemon restart without skipping pending unread", async () => {
+  const previousHome = process.env.ASENQ_HOME;
+  const home = mkdtempSync(join(tmpdir(), "asenq-inbox-restart-"));
+  process.env.ASENQ_HOME = home;
+  const db = await openDb(join(home, "asenq.db"));
+  let now = 1_700_000_000_000;
+  const options = { socket: socketPath(), db, replyDir: join(home, "replies"), now: () => now, timers: false, log: () => {} };
+  let daemon = new Daemon(options);
+  let agent = new AsenqClient({
+    onPush: (push) => { if (push.push === "deliver") void agent.request("ack", { msgId: push.msg.id, ok: true }); },
+  });
+  let human = new AsenqClient();
+  try {
+    await daemon.listen();
+    const registered = await agent.request("register", { harness: "omp", key: "alpha-key", name: "alpha" });
+    const first = (await send(human, "alpha", "first"))[0];
+    const second = (await send(human, "alpha", "second"))[0];
+    assert.deepEqual(
+      ((await agent.request("inbox", { unread_only: true, limit: 1 })).messages as StoredMessage[]).map((message) => message.id),
+      [first.msgId],
+    );
+    agent.close();
+    human.close();
+    await daemon.close();
+    now += 1000;
+    daemon = new Daemon(options);
+    await daemon.listen();
+    agent = new AsenqClient({
+      onPush: (push) => { if (push.push === "deliver") void agent.request("ack", { msgId: push.msg.id, ok: true }); },
+    });
+    human = new AsenqClient();
+    assert.deepEqual((await agent.request("register", { harness: "omp", key: "alpha-key", name: "alpha" })).session, registered.session);
+    const third = (await send(human, "alpha", "third"))[0];
+    assert.deepEqual(
+      ((await agent.request("inbox", { unread_only: true })).messages as StoredMessage[]).map((message) => message.id),
+      [second.msgId, third.msgId],
+    );
+    assert.deepEqual((await agent.request("inbox", { unread_only: true })).messages, []);
+    assert.deepEqual(
+      ((await agent.request("inbox")).messages as StoredMessage[]).map((message) => message.id),
+      [third.msgId, second.msgId, first.msgId],
+    );
+    now += 8 * 86_400_000;
+    daemon.prune();
+    assert.deepEqual((await agent.request("inbox")).messages, []);
+    agent.close();
+    human.close();
+    await daemon.close();
+    daemon = new Daemon(options);
+    await daemon.listen();
+    agent = new AsenqClient({
+      onPush: (push) => { if (push.push === "deliver") void agent.request("ack", { msgId: push.msg.id, ok: true }); },
+    });
+    human = new AsenqClient();
+    await agent.request("register", { harness: "omp", key: "alpha-key", name: "alpha" });
+    const afterPrune = (await send(human, "alpha", "after prune and reopen"))[0];
+    assert.deepEqual(
+      ((await agent.request("inbox", { unread_only: true })).messages as StoredMessage[]).map((message) => message.id),
+      [afterPrune.msgId],
+    );
+  } finally {
+    agent.close();
+    human.close();
     await daemon.close();
     db.close();
     rmSync(home, { recursive: true, force: true });

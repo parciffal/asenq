@@ -326,18 +326,10 @@ export class Daemon {
       case "mark_unread":
         this.requireHuman(this.sender(c, p), "mark human streams unread");
         return this.opMarkUnread(p);
-      case "inbox": {
-        const s = this.sender(c, p);
-        const limit = limitParam(p, 20, 200);
-        const rows = s.kind === "agent" && str(p, "name") !== "human"
-          ? this.store.db.all<MsgRow>(
-            "SELECT * FROM (SELECT * FROM messages WHERE to_session=? AND status IN ('delivered','queued') ORDER BY ord DESC LIMIT ?) ORDER BY ord",
-            s.session.id, limit)
-          : this.store.db.all<MsgRow>(
-            "SELECT * FROM (SELECT * FROM messages WHERE to_name='human' AND channel IS NULL ORDER BY ord DESC LIMIT ?) ORDER BY ord",
-            limit);
-        return { messages: rows.map((r) => ({ ...toWire(r), status: r.status })) };
-      }
+      case "inbox":
+        return this.opInbox(this.sender(c, p), p);
+      case "thread_read":
+        return this.opThreadRead(this.sender(c, p), p);
       case "list": {
         const s = this.sender(c, p);
         const me = s.kind === "agent" ? s.session.id : undefined;
@@ -386,6 +378,131 @@ export class Daemon {
         throw new AsenqError("bad_request", `unknown op "${p.op}"`);
     }
   }
+
+  private directScope(s: Sender): { sql: string; params: (string | number)[] } {
+    return s.kind === "agent"
+      ? {
+        sql: "channel IS NULL AND (from_session=? OR (to_session=? AND status IN ('delivered','queued')))",
+        params: [s.session.id, s.session.id],
+      }
+      : { sql: "channel IS NULL AND (from_name='human' OR to_name='human')", params: [] };
+  }
+
+  private messageCursor(
+    p: Params, key: "since" | "before", s: Sender,
+  ): { sql: string; params: (string | number)[] } {
+    const value = p[key];
+    if (value === undefined || value === null) return { sql: "", params: [] };
+    const comparison = key === "since" ? ">" : "<";
+    let timestamp: number | undefined;
+    if (typeof value === "number") timestamp = value;
+    else if (typeof value === "string" && /^\d+$/.test(value)) timestamp = Number(value);
+    else if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value)) timestamp = Date.parse(value);
+    if (timestamp !== undefined && Number.isSafeInteger(timestamp) && timestamp >= 0) {
+      return { sql: ` AND created_at${comparison}?`, params: [timestamp] };
+    }
+    if (timestamp === undefined && typeof value === "string") {
+      const scope = this.directScope(s);
+      const row = this.store.db.get<{ ord: number }>(
+        `SELECT ord FROM messages WHERE id=? AND ${scope.sql}`, value, ...scope.params,
+      );
+      if (row) return { sql: ` AND ord${comparison}?`, params: [row.ord] };
+    }
+    throw new AsenqError("bad_request", `"${key}" must be a timestamp or a retained direct message id for the caller`);
+  }
+
+  private opThreadRead(s: Sender, p: Params): Result {
+    const thread = str(p, "thread", true);
+    const scope = this.directScope(s);
+    const since = this.messageCursor(p, "since", s);
+    const rows = this.store.db.all<MsgRow>(
+      `SELECT * FROM messages WHERE ${scope.sql} AND thread=?${since.sql} ORDER BY ord`,
+      ...scope.params, thread, ...since.params,
+    );
+    return { messages: rows.map(toStored) };
+  }
+  private unreadInbox(s: Sender): { sql: string; params: (string | number)[] } {
+    if (s.kind === "agent") {
+      return {
+        sql: " AND status='delivered' AND delivery_seq>(SELECT inbox_position FROM session_identities WHERE id=?)",
+        params: [s.session.id],
+      };
+    }
+    return {
+      sql: ` AND from_session IS NOT NULL AND (
+        ord>COALESCE((SELECT position FROM human_read_positions WHERE scope='session' AND stream_key=messages.from_session),0)
+        OR ord=(SELECT reminder FROM human_read_positions WHERE scope='session' AND stream_key=messages.from_session))`,
+      params: [],
+    };
+  }
+
+  private opInbox(s: Sender, p: Params): Result {
+    const id = str(p, "msgId");
+    if (id !== undefined) {
+      const scope = this.directScope(s);
+      const row = this.store.db.get<MsgRow>(
+        `SELECT * FROM messages WHERE id=? AND ${scope.sql}`, id, ...scope.params,
+      );
+      if (!row) throw new AsenqError("bad_request", '"msgId" must be a retained direct message id for the caller');
+      return { messages: [toStored(row)], hasMore: false };
+    }
+    const limit = limitParam(p, 20, 200);
+    const budget = integerParam(p, "max_chars");
+    if (budget === 0) throw new AsenqError("bad_request", '"max_chars" must be a positive integer');
+    if (p.unread_only !== undefined && p.unread_only !== null && typeof p.unread_only !== "boolean") {
+      throw new AsenqError("bad_request", '"unread_only" must be a boolean');
+    }
+    const thread = str(p, "thread");
+    const from = str(p, "from");
+    const since = this.messageCursor(p, "since", s);
+    const before = this.messageCursor(p, "before", s);
+    let sql = s.kind === "agent"
+      ? "channel IS NULL AND to_session=? AND status IN ('delivered','queued')"
+      : "channel IS NULL AND to_name='human'";
+    const params: (string | number)[] = s.kind === "agent" ? [s.session.id] : [];
+    if (thread !== undefined) {
+      sql += " AND thread=?";
+      params.push(thread);
+    }
+    if (from !== undefined) {
+      const session = this.store.sessionByName(from);
+      sql += session ? " AND from_session=?" : " AND from_name=?";
+      params.push(session?.id ?? from);
+    }
+    sql += since.sql + before.sql;
+    params.push(...since.params, ...before.params);
+    const unread = p.unread_only === true;
+    if (unread) {
+      const filter = this.unreadInbox(s);
+      sql += filter.sql;
+      params.push(...filter.params);
+    }
+    const advances = s.kind === "agent" && unread && thread === undefined && from === undefined
+      && since.sql === "" && before.sql === "";
+    const rows = this.store.db.all<MsgRow>(
+      `SELECT * FROM messages WHERE ${sql} ORDER BY ${advances ? "delivery_seq ASC" : "ord DESC"} LIMIT ?`,
+      ...params, limit + 1,
+    );
+    const messages = [];
+    let chars = 0;
+    for (const row of rows) {
+      if (messages.length === limit) break;
+      const message = toStored(row);
+      if (budget !== undefined) {
+        const size = JSON.stringify(message).length + 2;
+        if (messages.length > 0 && chars + size > budget) break;
+        chars += size;
+      }
+      messages.push(message);
+    }
+    if (advances && s.kind === "agent" && messages.length > 0) {
+      this.store.db.run(
+        "UPDATE session_identities SET inbox_position=? WHERE id=?", rows[messages.length - 1].delivery_seq!, s.session.id,
+      );
+    }
+    return { messages, hasMore: rows.length > messages.length };
+  }
+
 
   private validateReadScope(scope: ReadScope): void {
     if (scope.scope === "session") {
@@ -867,6 +984,7 @@ export class Daemon {
       this.store.db.run("UPDATE messages SET status=?, reason=?, updated_at=? WHERE id=?", status, reason ?? null, this.now(), msgId);
       const row = this.store.msg(msgId);
       if (!row) return undefined;
+      this.store.stampDelivery(row);
       const event: TailEvent = {
         type: "message",
         msg: toStored(row),
