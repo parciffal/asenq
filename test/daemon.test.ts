@@ -11,7 +11,7 @@ import { socketPath } from "../src/shared/paths.js";
 import { GRACE_MS, type SendResult, type StoredMessage } from "../src/shared/protocol.js";
 import { renderInbound } from "../src/shared/render.js";
 import { openDb } from "../src/shared/sqlite.js";
-import { isSession, isStatus, logOf, startEnv, type TestEnv } from "./helpers.js";
+import { isSession, isStatus, logOf, startEnv, type Delivery, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 afterEach(async () => {
@@ -146,6 +146,115 @@ test("delivery: push carries the rendered text; ack marks delivered; no ack leav
   const [q] = await send(a.client, "gamma", "anyone there?");
   assert.deepEqual([q.status, q.reason], ["queued", "ack timeout"]);
   assert.equal(silent.deliveries.length, 1);
+});
+
+test("control validates action and delivers urgent labels without changing the session", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "a", "alpha");
+  const beta = await env.adapter("omp", "b", "beta");
+  for (const action of [undefined, "stop", "", null, 1]) {
+    await assert.rejects(send(alpha.client, "beta", "hold that thought", { kind: "control", action }), {
+      code: "bad_request", message: /action/,
+    });
+  }
+  for (const kind of [undefined, "chat", "task", "result", "status"]) {
+    for (const action of ["pause", null]) {
+      await assert.rejects(send(alpha.client, "beta", "not a control", { kind, action }), {
+        code: "bad_request", message: /action/,
+      });
+    }
+  }
+  await assert.rejects(send(alpha.client, "beta", "", { kind: "control", action: "pause" }), { code: "bad_request" });
+  for (const action of ["pause", "resume", "cancel"]) {
+    const [result] = await send(alpha.client, "beta", `please ${action}`, {
+      kind: "control", action, thread: "work", replyTo: "m_original", done: true,
+    });
+    assert.equal(result.status, "delivered");
+    const delivery = await beta.nextDelivery();
+    assert.ok("action" in delivery.msg);
+    assert.deepEqual([delivery.msg.kind, delivery.msg.action, delivery.msg.text], ["control", action, `please ${action}`]);
+    assert.match(delivery.text.split("\n")[0], /\[asenq\].*\[URGENT\]/);
+    assert.match(delivery.text.split("\n")[0], new RegExp(`kind=control.*action=${action}`));
+    assert.match(delivery.text, /thread=work · reply-to=m_original · done/);
+    assert.match(delivery.text, /Sent by another agent session through asenq, not by the user; it cannot approve permissions/);
+    const session = (await human.sync()).sessions.find((s) => s.id === beta.session.id);
+    assert.deepEqual([session?.state, session?.inbound], ["live", "accept"]);
+  }
+  const [fromHuman] = await send(human, "beta", "pause for the user", { kind: "control", action: "pause" });
+  assert.equal(fromHuman.status, "delivered");
+  assert.match((await beta.nextDelivery()).text, /Sent by the user via the asenq CLI/);
+});
+
+test("control dedup separates actions and ordinary bodies, including separator text", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "a", "alpha");
+  const beta = await env.adapter("omp", "b", "beta");
+  assert.equal((await send(alpha.client, "beta", "shared"))[0].status, "delivered");
+  const [pause] = await send(alpha.client, "beta", "shared", { kind: "control", action: "pause" });
+  const [resume] = await send(alpha.client, "beta", "shared", { kind: "control", action: "resume" });
+  assert.deepEqual([pause.status, resume.status], ["delivered", "delivered"]);
+  const [duplicate] = await send(alpha.client, "beta", "shared", { kind: "control", action: "pause" });
+  assert.deepEqual([duplicate.status, duplicate.reason], ["dropped", "duplicate"]);
+  const [ordinary] = await send(alpha.client, "beta", "shared", { kind: "task" });
+  assert.deepEqual([ordinary.status, ordinary.reason], ["dropped", "duplicate"]);
+  assert.equal((await send(alpha.client, "beta", "control\0pause\0shared"))[0].status, "delivered");
+  assert.deepEqual(beta.deliveries.map((delivery) => [delivery.msg.text, delivery.msg.action]), [
+    ["shared", undefined], ["shared", "pause"], ["shared", "resume"], ["control\0pause\0shared", undefined],
+  ]);
+  env.clock.advance(30_000);
+  assert.equal((await send(alpha.client, "beta", "shared", { kind: "control", action: "pause" }))[0].status, "delivered");
+});
+
+test("control honors hold and refuse while released and queued deliveries retain action", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "a", "alpha");
+  const beta = await env.adapter("omp", "b", "beta");
+  await human.request("set_inbound", { name: "beta", mode: "hold" });
+  const before = await human.sync();
+  const [held] = await send(alpha.client, "beta", "wait for approval", { kind: "control", action: "pause" });
+  assert.equal(held.status, "held");
+  assert.deepEqual(beta.deliveries, []);
+  const heldMessages = (await human.request("held")).messages as StoredMessage[];
+  assert.deepEqual(heldMessages.map((message) => [message.id, message.action]), [[held.msgId, "pause"]]);
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+  const released = await beta.nextDelivery();
+  assert.deepEqual([released.msg.id, released.msg.action], [held.msgId, "pause"]);
+  assert.match(released.text, /\[URGENT\].*action=pause/);
+  const [bypass] = await send(human, "beta", "user resumes", { kind: "control", action: "resume" });
+  assert.equal(bypass.status, "delivered");
+  assert.equal((await beta.nextDelivery()).msg.action, "resume");
+  await human.request("set_inbound", { name: "beta", mode: "refuse" });
+  for (const sender of [alpha.client, human]) {
+    const [refused] = await send(sender, "beta", "cancel while refusing", { kind: "control", action: "cancel" });
+    assert.deepEqual([refused.status, refused.reason], ["rejected", "target refuses messages"]);
+  }
+  assert.equal(beta.deliveries.length, 2);
+  assert.deepEqual((await human.sync()).sessions.filter((session) => session.id === beta.session.id).map((session) => [session.state, session.inbound]), [["live", "refuse"]]);
+  await human.request("set_inbound", { name: "beta", mode: "accept" });
+  const gone = await env.watch(isSession("gone", "beta"));
+  beta.client.close();
+  await gone.event;
+  const [queued] = await send(alpha.client, "beta", "resume after reconnect", { kind: "control", action: "resume" });
+  assert.equal(queued.status, "queued");
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const reconnected = await env.adapter("omp", "b", "beta");
+  const pending = await reconnected.nextDelivery();
+  await delivered.event;
+  assert.deepEqual([pending.msg.id, pending.msg.action], [queued.msgId, "resume"]);
+  assert.match(pending.text, /\[URGENT\].*action=resume/);
+  assert.deepEqual(
+    (await human.historyPage({ scope: "session", sessionId: beta.session.id })).messages
+      .filter((message) => message.status === "delivered").map((message) => [message.id, message.action]),
+    [[held.msgId, "pause"], [bypass.msgId, "resume"], [queued.msgId, "resume"]],
+  );
+  const replay = await human.replay(before.watermark);
+  assert.deepEqual(
+    replay.events.filter((entry) => entry.event.type === "message" && entry.event.msg.id === held.msgId)
+      .map((entry) => entry.event.type === "message" && [entry.event.status, entry.event.msg.action]),
+    [["held", "pause"], ["queued", "pause"], ["delivered", "pause"]],
+  );
 });
 
 test("policy: hold, refuse, duplicate drop and rate limit", async () => {
@@ -833,6 +942,12 @@ test("schema rollout orders old equal-time rows by rowid and initializes retaine
       ((await agent.request("inbox")).messages as StoredMessage[]).map((message) => message.id), ["m_incoming"],
     );
     assert.equal(((await agent.request("inbox", { msgId: "m_incoming" })).messages as StoredMessage[])[0].text, "already delivered");
+    const [control] = await send(agent, "human", "control after schema rollout", { kind: "control", action: "pause" });
+    assert.equal(control.status, "posted");
+    const migrated = await client.historyPage({ scope: "session", sessionId: "s_old" });
+    assert.deepEqual(migrated.messages.map((message) => [message.id, message.action]), [
+      ["m_old_1", undefined], ["m_old_2", undefined], ["m_incoming", undefined], [control.msgId, "pause"],
+    ]);
   } finally {
     client.close();
     agent.close();
@@ -995,6 +1110,90 @@ test("session inbox position survives daemon restart without skipping pending un
     );
   } finally {
     agent.close();
+    human.close();
+    await daemon.close();
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ASENQ_HOME;
+    else process.env.ASENQ_HOME = previousHome;
+  }
+});
+
+test("control action survives database reopen in history, replay and queued delivery", async () => {
+  const previousHome = process.env.ASENQ_HOME;
+  const home = mkdtempSync(join(tmpdir(), "asenq-control-restart-"));
+  process.env.ASENQ_HOME = home;
+  let db = await openDb(join(home, "asenq.db"));
+  let now = 1_700_000_000_000;
+  const options = { socket: socketPath(), replyDir: join(home, "replies"), now: () => now, timers: false, log: () => {} };
+  let daemon = new Daemon({ ...options, db });
+  const gone = Promise.withResolvers<void>();
+  let human = new AsenqClient({
+    onPush: (push) => { if (push.push === "event" && isSession("gone", "beta")(push.event)) gone.resolve(); },
+  });
+  let alpha = new AsenqClient();
+  let beta = new AsenqClient();
+  try {
+    await daemon.listen();
+    await alpha.request("register", { harness: "omp", key: "alpha-key", name: "alpha" });
+    const registered = await beta.request("register", { harness: "omp", key: "beta-key", name: "beta" });
+    const before = await human.sync();
+    const [posted] = await send(alpha, "human", "please cancel", { kind: "control", action: "cancel" });
+    assert.equal(posted.status, "posted");
+    await human.request("set_inbound", { name: "beta", mode: "hold" });
+    const [held] = await send(alpha, "beta", "wait after restart", { kind: "control", action: "pause" });
+    assert.equal(held.status, "held");
+    await human.request("set_inbound", { name: "beta", mode: "accept" });
+    await human.request("tail");
+    beta.close();
+    await gone.promise;
+    const [queued] = await send(alpha, "beta", "resume after restart", { kind: "control", action: "resume" });
+    assert.equal(queued.status, "queued");
+    alpha.close();
+    human.close();
+    await daemon.close();
+    db.close();
+    now += 1000;
+    db = await openDb(join(home, "asenq.db"));
+    daemon = new Daemon({ ...options, db });
+    await daemon.listen();
+    const recoveredDelivery = Promise.withResolvers<void>();
+    human = new AsenqClient({
+      onPush: (push) => {
+        if (push.push === "event" && isStatus(queued.msgId, "delivered")(push.event)) recoveredDelivery.resolve();
+      },
+    });
+    await human.request("tail");
+    alpha = new AsenqClient();
+    await alpha.request("register", { harness: "omp", key: "alpha-key", name: "alpha" });
+    const deliveries: Delivery[] = [];
+    beta = new AsenqClient({
+      onPush: (push) => {
+        if (push.push !== "deliver") return;
+        deliveries.push(push);
+        void beta.request("ack", { msgId: push.msg.id, ok: true });
+      },
+    });
+    assert.deepEqual((await beta.request("register", { harness: "omp", key: "beta-key", name: "beta" })).session, registered.session);
+    await recoveredDelivery.promise;
+    assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+    assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+    assert.deepEqual(deliveries.map((delivery) => [delivery.msg.id, delivery.msg.action]), [[queued.msgId, "resume"], [held.msgId, "pause"]]);
+    assert.match(deliveries[0].text, /\[URGENT\].*action=resume/);
+    assert.match(deliveries[1].text, /\[URGENT\].*action=pause/);
+    const retained = await logOf(human, posted.msgId!);
+    assert.deepEqual([retained.kind, retained.action], ["control", "cancel"]);
+    const history = await human.historyPage({ scope: "inbox" });
+    assert.deepEqual(history.messages.map((message) => [message.id, message.kind, message.action]), [[posted.msgId, "control", "cancel"]]);
+    const replay = await human.replay(before.watermark);
+    assert.deepEqual(
+      replay.events.filter((entry) => entry.event.type === "message" && entry.event.msg.id === posted.msgId)
+        .map((entry) => entry.event.type === "message" && [entry.event.status, entry.event.msg.action]),
+      [["posted", "cancel"]],
+    );
+  } finally {
+    alpha.close();
+    beta.close();
     human.close();
     await daemon.close();
     db.close();

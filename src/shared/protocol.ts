@@ -1,4 +1,4 @@
-export const PROTOCOL = 4;
+export const PROTOCOL = 5;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -11,8 +11,10 @@ export const PROBE_MS = 30_000;
 
 export type Harness = "claude" | "opencode" | "omp";
 export type Inbound = "accept" | "hold" | "refuse";
-export type Kind = "chat" | "task" | "result" | "status";
-export const KINDS: Kind[] = ["chat", "task", "result", "status"];
+export type Kind = "chat" | "task" | "result" | "status" | "control";
+export const KINDS: Kind[] = ["chat", "task", "result", "status", "control"];
+export type ControlAction = "pause" | "resume" | "cancel";
+export const CONTROL_ACTIONS: readonly ControlAction[] = ["pause", "resume", "cancel"];
 export const INBOUND: Inbound[] = ["accept", "hold", "refuse"];
 
 export type ErrCode =
@@ -26,7 +28,7 @@ export type Res =
 
 export type WireMsg = {
   id: string; from: string; to: string;
-  kind?: Kind; thread?: string; replyTo?: string; done?: boolean;
+  kind?: Kind; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean;
   text: string; createdAt: number;
 };
 
@@ -132,6 +134,7 @@ export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unkn
 
 export type SendOptions = {
   kind?: Kind;
+  action?: ControlAction;
   thread?: string;
   replyTo?: string;
   done?: boolean;

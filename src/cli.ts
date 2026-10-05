@@ -10,7 +10,7 @@ if (!process.versions.bun && (major < 22 || (major === 22 && minor < 13))) {
 const USAGE = `usage: asenq <command>
 
   ls                                   list sessions
-  send <name|*|human> <text…>          send as the user [--kind k] [--thread t] [--reply-to id] [--done]
+  send <name|*|human> <text…>          send as the user [--kind k] [--action pause|resume|cancel] [--thread t] [--reply-to id] [--done]
   tail                                 follow messages and session events
   log [--session name] [--id msgId] [--limit n]
   inbox                                messages addressed to "human"

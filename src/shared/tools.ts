@@ -1,5 +1,5 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, KINDS, type SendResult } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ControlAction, type SendResult } from "./protocol.js";
 
 export type ParamSpec = {
   type: "string" | "integer" | "boolean";
@@ -21,11 +21,13 @@ export const TOOLS: ToolSpec[] = [
     description:
       "Send a text message to another agent session on this machine (Claude Code, OpenCode or omp) through asenq. " +
       "An idle target starts a new turn; a busy target sees it between tool calls. " +
-      `${NAMES_HINT} Use "*" to broadcast to every live session, or "human" to reach the user.`,
+      `${NAMES_HINT} Use "*" to broadcast to every live session, or "human" to reach the user. ` +
+      "Control messages carry urgent pause/resume/cancel labels; asenq only delivers them and never changes session state or inbound policy.",
     params: {
       to: { type: "string", description: 'Target session name, "*" for all live sessions, or "human"' },
       text: { type: "string", description: "Message text" },
-      kind: { type: "string", enum: KINDS, optional: true, description: "Message kind: chat, task, result or status" },
+      kind: { type: "string", enum: KINDS, optional: true, description: "Message kind: chat, task, result, status or control" },
+      action: { type: "string", enum: CONTROL_ACTIONS, optional: true, description: "Required for kind=control: pause, resume or cancel. Invalid on other kinds; asenq labels and delivers, but does not enforce the action." },
       thread: { type: "string", optional: true, description: "Free-form thread label to group related messages" },
       reply_to: { type: "string", optional: true, description: "Id of the message this answers (m_…)" },
       done: { type: "boolean", optional: true, description: "Marks the final message of a task or thread" },
@@ -92,7 +94,7 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
-type Msg = { id: string; from: string; to: string; text: string; createdAt: number; kind?: string; thread?: string };
+type Msg = { id: string; from: string; to: string; text: string; createdAt: number; kind?: string; action?: ControlAction; thread?: string };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
@@ -102,7 +104,7 @@ export function formatSendResults(results: SendResult[]): string {
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
-    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}\n${m.text}`)
+    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}\n${m.text}`)
     .join("\n\n");
 }
 
@@ -128,7 +130,7 @@ function formatInbox(msgs: Msg[], hasMore: boolean, advancing: boolean): string 
         const recovery = `Full text: asenq_inbox id=${m.id}.`
           + (m.thread ? " Or use asenq_thread_read with this message's thread." : "");
         const marker = `\n\n[truncated message ${m.id}; more available. ${recovery}]`;
-        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}\n`;
+        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}\n`;
         const visible = text.length - m.text.length < 16_000 - marker.length ? text : header + m.text;
         let end = Math.min(visible.length, 16_000 - marker.length);
         if (end > 0 && visible.charCodeAt(end - 1) >= 0xD800 && visible.charCodeAt(end - 1) <= 0xDBFF
@@ -156,7 +158,7 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
     switch (name) {
       case "asenq_send": {
         const r = await client.request("send", {
-          ...who, to: args.to, text: args.text, kind: args.kind, thread: args.thread, replyTo: args.reply_to, done: args.done,
+          ...who, to: args.to, text: args.text, kind: args.kind, action: args.action, thread: args.thread, replyTo: args.reply_to, done: args.done,
         });
         return formatSendResults(r.results as SendResult[]);
       }

@@ -153,7 +153,7 @@ function headerSpans(message: StoredMessage, now: number): TerminalSpan[] {
   else if (message.to !== "human" && !human) spans.push({ text: ` → ${message.to}`, style: theme.agent });
   else if (human) spans.push({ text: ` → ${message.to === "human" ? "you" : message.to}`, style: theme.dim });
   spans.push({ text: "  " }, { text: message.status, style: statusStyle(message.status) });
-  if (message.kind && message.kind !== "chat") spans.push({ text: ` · ${message.kind}`, style: theme.dim });
+  if (message.kind && message.kind !== "chat") spans.push({ text: ` · ${message.kind}${message.kind === "control" && message.action ? ` ${message.action}` : ""}`, style: theme.dim });
   if (message.done) spans.push({ text: " · done", style: theme.dim });
   spans.push({ text: `  ${formatTime(message.createdAt, now)}`, style: theme.dim });
   return spans;
@@ -161,7 +161,7 @@ function headerSpans(message: StoredMessage, now: number): TerminalSpan[] {
 
 function detailLines(message: StoredMessage): string[] {
   const lines = [
-    `id ${message.id}${message.kind ? ` · kind ${message.kind}` : ""}${message.done ? " · done" : ""}`,
+    `id ${message.id}${message.kind ? ` · kind ${message.kind}` : ""}${message.action ? ` · action ${message.action}` : ""}${message.done ? " · done" : ""}`,
     `from ${message.from}${message.fromSessionId ? ` (${message.fromSessionId})` : ""} → ${message.channel ? `#${message.channel}` : message.to}${message.toSessionId ? ` (${message.toSessionId})` : ""}`,
     `status ${message.status}${message.reason ? `: ${message.reason}` : ""} · order ${message.order} · ${new Date(message.createdAt).toLocaleString()}`,
   ];

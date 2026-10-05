@@ -1,12 +1,12 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import type { SendResult, TailEvent } from "../shared/protocol.js";
+import type { ControlAction, SendResult, TailEvent } from "../shared/protocol.js";
 import { formatSendResults } from "../shared/tools.js";
 
 type LoggedMsg = {
   id: string; from: string; to: string; text: string; createdAt: number;
-  kind?: string; thread?: string; replyTo?: string; done?: boolean; status: string; reason?: string;
+  kind?: string; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean; status: string; reason?: string;
 };
 
 const out = (s: string): void => void process.stdout.write(s + "\n");
@@ -18,7 +18,7 @@ const oneLine = (s: string, n: number): string => {
 
 function msgLine(m: Omit<LoggedMsg, "status"> & { status?: string; reason?: string }): string {
   const status = m.status ? ` (${m.status}${m.reason ? `: ${m.reason}` : ""})` : "";
-  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.kind ? ` [${m.kind}]` : ""} ${oneLine(m.text, 120)}${status}`;
+  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""} ${oneLine(m.text, 120)}${status}`;
 }
 
 function need(args: string[], n: number, usage: string): void {
@@ -84,12 +84,12 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
     case "send": {
       const { values, positionals } = parseArgs({
         args: argv, allowPositionals: true,
-        options: { kind: { type: "string" }, thread: { type: "string" }, "reply-to": { type: "string" }, done: { type: "boolean" } },
+        options: { kind: { type: "string" }, action: { type: "string" }, thread: { type: "string" }, "reply-to": { type: "string" }, done: { type: "boolean" } },
       });
       need(positionals, 2, "usage: asenq send <name|*|human> <text…>");
       const r = await client.request("send", {
         to: positionals[0], text: positionals.slice(1).join(" "),
-        kind: values.kind, thread: values.thread, replyTo: values["reply-to"], done: values.done,
+        kind: values.kind, action: values.action, thread: values.thread, replyTo: values["reply-to"], done: values.done,
       });
       const results = r.results as SendResult[];
       out(formatSendResults(results));
@@ -133,7 +133,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       if (values.id) {
         const m = msgs[0];
         out(`${m.id} ${m.from} → ${m.to} ${new Date(m.createdAt).toISOString()} ${m.status}${m.reason ? ` (${m.reason})` : ""}`);
-        const meta = [m.kind && `kind=${m.kind}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}`, m.done && "done"].filter(Boolean);
+        const meta = [m.kind && `kind=${m.kind}`, m.action && `action=${m.action}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}`, m.done && "done"].filter(Boolean);
         if (meta.length) out(meta.join(" · "));
         out("");
         out(m.text);
@@ -147,7 +147,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       const msgs = (r.messages as LoggedMsg[]).reverse();
       if (msgs.length === 0) out("no messages");
       for (const m of msgs) {
-        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}` : ""}${m.done ? " · done" : ""}`);
+        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}` : ""}${m.done ? " · done" : ""}`);
         out(m.text);
         out("");
       }
