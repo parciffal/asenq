@@ -78,7 +78,7 @@ Run the API tests and report back.
 | Tool | Purpose |
 |---|---|
 | `asenq_send` | Send `text` to a session name, to `"*"` (every live session) or to `"human"`. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `thread`, `reply_to`, `done`. |
-| `asenq_list` | List sessions; the caller's own row is marked `[you]`. |
+| `asenq_list` | List sessions and their roles; the caller's own row is marked `[you]`. |
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
 | `asenq_rename` | Rename this session. |
@@ -91,6 +91,12 @@ asenq send worker-oc "Pause after the current check" --kind control --action pau
 ```
 
 Agents can send the same message with `asenq_send { to: "worker-oc", text: "Pause after the current check", kind: "control", action: "pause" }`. The TUI displays control actions; use the CLI or agent tool to send them, not the TUI editor.
+
+### Human-assigned roles
+
+Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. Only the human can change roles; registered sessions receive `not_permitted` from `set_role`. Roles are informational: they grant no permissions and do not enforce work or change delivery policy.
+
+A role belongs to the session identity, not its name: renaming and reconnecting preserve it, while a different identity reusing the name starts unset. `asenq ls` and `asenq_list` show the role. Every delivered direct-message header tells the recipient its own role (`your-role=worker` or `your-role=orchestrator`); unset roles omit that label. TUI rows use plain `orch` / `wrk` tags, omitted when space is needed for the name, unread count and state; the conversation header also shows the full role. Archived identities retain their role but cannot be targeted by name.
 
 ### Inbox paging and full-text recovery
 
@@ -114,6 +120,7 @@ asenq tail                            # live feed of messages and session events
 asenq log [--session name] [--id m_…] [--limit n]
 asenq rename <old> <new>
 asenq inbound <name> accept|hold|refuse
+asenq role <name> orchestrator|worker|unset
 asenq held [name] · asenq release <msgId> · asenq drop <msgId>
 asenq channels · asenq channel read <ch> · asenq channel send <ch> <text…>
 asenq daemon start|stop|status
@@ -144,7 +151,7 @@ Sessions lists live sessions first, then reconnecting ones, then a collapsed **A
 
 Unread is **not delivery**. Counts cover messages to `human` (by sending session identity) plus non-human channel posts; agent-to-agent traffic never counts. Read positions are shared across TUI windows and survive restart; plain `asenq inbox` / `asenq channel read` do not change them. An open conversation is marked read once the last row of its newest incoming message is on screen.
 
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 6).
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 7).
 
 ## How delivery works
 

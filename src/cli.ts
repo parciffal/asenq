@@ -16,6 +16,7 @@ const USAGE = `usage: asenq <command>
   inbox                                messages addressed to "human"
   rename <old> <new>
   inbound <name> accept|hold|refuse
+  role <name> orchestrator|worker|unset
   held [name] | release <msgId> | drop <msgId>
   channels | channel read <ch> [--limit n] | channel send <ch> <text…>
   daemon run|start|stop|status

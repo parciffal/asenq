@@ -1,4 +1,4 @@
-export const PROTOCOL = 6;
+export const PROTOCOL = 7;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -11,6 +11,7 @@ export const PROBE_MS = 30_000;
 
 export type Harness = "claude" | "opencode" | "omp";
 export type Inbound = "accept" | "hold" | "refuse";
+export type Role = "orchestrator" | "worker";
 export type Kind = "chat" | "task" | "result" | "status" | "control";
 export const KINDS: Kind[] = ["chat", "task", "result", "status", "control"];
 export type ControlAction = "pause" | "resume" | "cancel";
@@ -19,7 +20,7 @@ export const INBOUND: Inbound[] = ["accept", "hold", "refuse"];
 
 export type ErrCode =
   | "bad_request" | "unknown_target" | "name_taken" | "invalid_name"
-  | "too_large" | "not_registered" | "no_session" | "rate_limited" | "internal";
+  | "too_large" | "not_registered" | "not_permitted" | "no_session" | "rate_limited" | "internal";
 
 export type Req = { id: number; op: string; [k: string]: unknown };
 export type Res =
@@ -57,6 +58,7 @@ export type SessionIdentity = {
   cwd?: string;
   state: SessionState;
   inbound: Inbound;
+  role?: Role | null;
   createdAt: number;
   removedAt?: number;
 };

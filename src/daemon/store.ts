@@ -1,6 +1,6 @@
 import type {
   ChannelSummary, ControlAction, Harness, Inbound, InboxSummary, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
-  SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
+  Role, SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
 } from "../shared/protocol.js";
 import type { Db } from "../shared/sqlite.js";
 
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS messages(
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(to_session, status);
 CREATE TABLE IF NOT EXISTS session_identities(
   id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
-  cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
+  cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL, role TEXT,
   created_at INTEGER NOT NULL, removed_at INTEGER, inbox_position INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS session_harness_ids(
   harness TEXT NOT NULL, kind TEXT NOT NULL, harness_id TEXT NOT NULL, identity_id TEXT NOT NULL,
@@ -54,7 +54,7 @@ export type MsgRow = {
 
 type IdentityRow = {
   id: string; harness: Harness | "unknown"; name: string; previous_names: string; cwd: string | null;
-  inbound: Inbound; state: SessionState; created_at: number; removed_at: number | null;
+  inbound: Inbound; state: SessionState; role: Role | null; created_at: number; removed_at: number | null;
 };
 
 type EndpointRow = {
@@ -97,6 +97,7 @@ function toIdentity(r: IdentityRow): SessionIdentity {
     ...(r.cwd ? { cwd: r.cwd } : {}),
     state: r.state,
     inbound: r.inbound,
+    role: r.role,
     createdAt: r.created_at,
     ...(r.removed_at === null ? {} : { removedAt: r.removed_at }),
   };
@@ -118,6 +119,7 @@ export class Store {
     this.backfillHarnessIds();
     this.initializeReadPositions();
     this.initializeInboxPositions();
+    this.migrateIdentityRole();
   }
 
   transaction<T>(fn: () => T): T {
@@ -315,6 +317,11 @@ export class Store {
     });
   }
 
+  private migrateIdentityRole(): void {
+    const columns = this.db.all<{ name: string }>("PRAGMA table_info(session_identities)");
+    if (!columns.some((column) => column.name === "role")) this.db.exec("ALTER TABLE session_identities ADD COLUMN role TEXT");
+  }
+
   deliveryWatermark(): number {
     return this.meta("delivery_sequence") ?? 0;
   }
@@ -473,6 +480,11 @@ export class Store {
 
   setIdentityInbound(id: string, inbound: Inbound): SessionIdentity {
     this.db.run("UPDATE session_identities SET inbound=? WHERE id=?", inbound, id);
+    return this.identity(id)!;
+  }
+
+  setIdentityRole(id: string, role: Role | null): SessionIdentity {
+    this.db.run("UPDATE session_identities SET role=? WHERE id=?", role, id);
     return this.identity(id)!;
   }
 

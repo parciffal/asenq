@@ -291,6 +291,19 @@ export class Daemon {
         this.emitSession("updated", { ...row, inbound: mode });
         return {};
       }
+      case "set_role": {
+        if (c.bound.size > 0 || c.attached) {
+          throw new AsenqError("not_permitted", "only the user (asenq CLI) can change session roles");
+        }
+        const role = p.role;
+        if (role !== null && role !== "orchestrator" && role !== "worker") {
+          throw new AsenqError("bad_request", "role must be orchestrator, worker or null");
+        }
+        const row = this.mustSession(str(p, "name", true));
+        this.store.setIdentityRole(row.id, role);
+        this.emitSession("updated", row);
+        return {};
+      }
       case "send":
         return { results: await this.send(this.sender(c, p), p) };
       case "ack": {
@@ -339,6 +352,7 @@ export class Daemon {
         return {
           sessions: this.store.sessions().map((r) => ({
             name: r.name, harness: r.harness, cwd: r.cwd, state: r.state, inbound: r.inbound, you: r.id === me,
+            role: this.store.identity(r.id)?.role ?? null,
           })),
         };
       }
@@ -909,8 +923,9 @@ export class Daemon {
       this.lastSeen.set(row.id, this.now());
       const texts: string[] = [];
       let total = 0;
+      const role = this.store.identity(row.id)?.role ?? undefined;
       for (const m of this.store.queuedFor(row.id)) {
-        let text = renderInbound(toWire(m));
+        let text = renderInbound(toWire(m), role);
         if (texts.length === 0 && text.length > POLL_BUDGET) {
           text = text.slice(0, POLL_BUDGET) + `… (truncated; full text: asenq log --id ${m.id})`;
         } else if (total + text.length > POLL_BUDGET) break;
@@ -1146,7 +1161,7 @@ export class Daemon {
     if (!row || row.status !== "queued") return row?.status ?? "failed";
     const target = row.to_session ? this.store.session(row.to_session) : undefined;
     if (!target || target.state !== "live") return "queued";
-    const text = renderInbound(toWire(row));
+    const text = renderInbound(toWire(row), this.store.identity(target.id)?.role ?? undefined);
 
     if (target.harness === "claude") {
       if (!target.claude_socket) return "queued"; // picked up by the hook poll

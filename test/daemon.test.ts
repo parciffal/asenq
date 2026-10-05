@@ -9,7 +9,7 @@ import { claudeFrame, parseEnvelopeReply, replyAddr } from "../src/daemon/claude
 import { Daemon } from "../src/daemon/daemon.js";
 import { AsenqClient } from "../src/shared/client.js";
 import { socketPath } from "../src/shared/paths.js";
-import { GRACE_MS, type SendResult, type StoredMessage } from "../src/shared/protocol.js";
+import { GRACE_MS, type SendResult, type StoredMessage, type TailEvent } from "../src/shared/protocol.js";
 import { renderInbound } from "../src/shared/render.js";
 import { openDb } from "../src/shared/sqlite.js";
 import { isSession, isStatus, logOf, startEnv, type Delivery, type TestEnv } from "./helpers.js";
@@ -130,6 +130,163 @@ test("registration: different harness ids in the same cwd stay distinct, even wh
   await delivered.event;
   const other = await env.adapter("opencode", "k4", "Worker API", { cwd: "/elsewhere" });
   assert.equal(other.session.name, "worker-api-4");
+});
+
+test("human roles validate, publish identity updates and survive rename and gone reconnection", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "alpha-key", "alpha");
+  const roleOf = async (name: string) => ((await human.request("list")).sessions as { name: string; role: string | null }[])
+    .find((session) => session.name === name)?.role;
+  assert.equal(await roleOf("alpha"), null);
+  assert.equal((await human.sync()).sessions.find((session) => session.id === alpha.session.id)?.role, null);
+
+  for (const role of ["orchestrator", "worker", null]) {
+    const updated: { event: Promise<TailEvent> } = await env.watch(isSession("updated", "alpha"));
+    await human.request("set_role", { name: "alpha", role });
+    const event: TailEvent = await updated.event;
+    assert.equal(event.type === "session" && event.session.role, role);
+    assert.equal(await roleOf("alpha"), role);
+  }
+  for (const role of ["unset", "", "manager", 1, true, {}, []]) {
+    await assert.rejects(human.request("set_role", { name: "alpha", role }), { code: "bad_request" });
+  }
+  await assert.rejects(human.request("set_role", { name: "alpha" }), { code: "bad_request" });
+  await assert.rejects(human.request("set_role", { name: "missing", role: "worker" }), { code: "unknown_target" });
+  assert.equal(await roleOf("alpha"), null);
+
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await alpha.client.request("rename", { name: "renamed" });
+  assert.equal(await roleOf("renamed"), "orchestrator");
+  await assert.rejects(human.request("set_role", { name: "alpha", role: "worker" }), { code: "unknown_target" });
+  const gone = await env.watch(isSession("gone", "renamed"));
+  alpha.client.close();
+  await gone.event;
+  await human.request("set_role", { name: "renamed", role: "worker" });
+  const resumed = await env.adapter("omp", "alpha-key", "renamed");
+  assert.equal(resumed.session.id, alpha.session.id);
+  assert.equal(await roleOf("renamed"), "worker");
+
+  await resumed.client.request("unregister");
+  await assert.rejects(human.request("set_role", { name: "renamed", role: null }), { code: "unknown_target" });
+  assert.equal((await human.sync()).sessions.find((session) => session.id === alpha.session.id)?.role, "worker");
+  const replacement = await env.adapter("omp", "replacement-key", "renamed");
+  assert.notEqual(replacement.session.id, alpha.session.id);
+  assert.equal(await roleOf("renamed"), null);
+});
+
+test("set_role denies every bound or attached agent before validating its request", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const omp = await env.adapter("omp", "omp-key", "omp");
+  const opencode = await env.adapter("opencode", "first-key", "first");
+  await opencode.client.request("register", { harness: "opencode", key: "second-key", name: "second" });
+  await human.request("claude_hook", { event: "start", key: "sid:claude", sessionId: "claude", name: "claude" });
+  const claude = env.human();
+  await claude.request("claude_attach", { sessionId: "claude" });
+  for (const client of [omp.client, opencode.client, claude]) {
+    for (const request of [
+      { name: "omp", role: "worker" }, { name: "omp", role: null },
+      { name: "missing", role: "invalid" }, {},
+      { name: "omp", role: "orchestrator", as: "unbound" },
+    ]) {
+      await assert.rejects(client.request("set_role", request), { code: "not_permitted" });
+    }
+  }
+  assert.ok((await human.sync()).sessions.every((session) => session.role === null));
+});
+
+test("push headers use the recipient role at delivery time without changing inbound policy", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("opencode", "receiver-key", "receiver");
+  await human.request("set_role", { name: "sender", role: "orchestrator" });
+  await human.request("set_role", { name: "receiver", role: "worker" });
+  assert.equal((await send(sender.client, "receiver", "ordinary"))[0].status, "delivered");
+  assert.match((await receiver.nextDelivery()).text.split("\n")[0], /your-role=worker/);
+  await send(receiver.client, "sender", "reverse");
+  assert.match((await sender.nextDelivery()).text.split("\n")[0], /your-role=orchestrator/);
+
+  await human.request("set_inbound", { name: "receiver", mode: "hold" });
+  const [held] = await send(sender.client, "receiver", "held until role changes");
+  assert.equal(held.status, "held");
+  await human.request("set_role", { name: "receiver", role: "orchestrator" });
+  assert.equal((await logOf(human, held.msgId!)).status, "held");
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+  const released = await receiver.nextDelivery();
+  assert.equal(released.msg.id, held.msgId);
+  assert.match(released.text.split("\n")[0], /your-role=orchestrator/);
+  assert.equal((await send(human, "receiver", "human bypasses hold"))[0].status, "delivered");
+  await receiver.nextDelivery();
+
+  await human.request("set_inbound", { name: "receiver", mode: "refuse" });
+  await human.request("set_role", { name: "receiver", role: null });
+  assert.equal((await send(sender.client, "receiver", "still refused"))[0].status, "rejected");
+  assert.equal((await send(human, "receiver", "human still refused"))[0].status, "rejected");
+  await human.request("set_inbound", { name: "receiver", mode: "accept" });
+  await send(sender.client, "receiver", "unset role header");
+  assert.doesNotMatch((await receiver.nextDelivery()).text.split("\n")[0], /your-role=/);
+
+  const gone = await env.watch(isSession("gone", "receiver"));
+  receiver.client.close();
+  await gone.event;
+  const [queued] = await send(sender.client, "receiver", "queued before assignment");
+  assert.equal(queued.status, "queued");
+  await human.request("set_role", { name: "receiver", role: "worker" });
+  const resumed = await env.adapter("opencode", "receiver-key", "receiver");
+  const delivered = await resumed.nextDelivery();
+  assert.equal(delivered.msg.id, queued.msgId);
+  assert.match(delivered.text.split("\n")[0], /your-role=worker/);
+});
+
+test("Claude plain and envelope delivery headers show the recipient rather than sender role", async () => {
+  for (const envelope of [false, true]) {
+    env = await startEnv({ envelope });
+    const human = env.human();
+    const sender = await env.adapter("omp", "sender-key", "sender");
+    const socket = join(env.home, "claude.sock");
+    const fake = await fakeClaude(socket);
+    try {
+      await human.request("claude_hook", { event: "start", key: socket, socket, sessionId: "s1", name: "receiver" });
+      await human.request("set_role", { name: "sender", role: "orchestrator" });
+      await human.request("set_role", { name: "receiver", role: "worker" });
+      assert.equal((await send(sender.client, "receiver", "assigned Claude body"))[0].status, "delivered");
+      const assigned = JSON.parse(await fake.nextLine()) as { message: { content: string } };
+      const header = assigned.message.content.split("\n").find((line) => line.startsWith("[asenq]"));
+      assert.match(header!, /your-role=worker/);
+      assert.doesNotMatch(header!, /your-role=orchestrator/);
+      assert.ok(assigned.message.content.includes("\nassigned Claude body\n"));
+      await human.request("set_role", { name: "receiver", role: null });
+      await send(sender.client, "receiver", "unset Claude body");
+      const unset = JSON.parse(await fake.nextLine()) as { message: { content: string } };
+      assert.doesNotMatch(unset.message.content, /your-role=/);
+    } finally {
+      await fake.stop();
+      await env.close();
+      env = undefined;
+    }
+  }
+});
+
+test("Claude hook poll renders the current identity role for previously queued messages", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  await human.request("set_role", { name: "sender", role: "orchestrator" });
+  await human.request("claude_hook", { event: "start", key: "sid:s1", sessionId: "s1", name: "receiver" });
+  const [queued] = await send(sender.client, "receiver", "before recipient assignment");
+  assert.equal(queued.status, "queued");
+  await human.request("set_role", { name: "receiver", role: "worker" });
+  const assigned = (await human.request("claude_hook", { event: "poll", sessionId: "s1" })).texts as string[];
+  assert.equal(assigned.length, 1);
+  assert.match(assigned[0].split("\n")[0], /your-role=worker/);
+  assert.equal((await logOf(human, queued.msgId!)).status, "delivered");
+  await send(sender.client, "receiver", "before recipient unset");
+  await human.request("set_role", { name: "receiver", role: null });
+  const unset = (await human.request("claude_hook", { event: "poll", sessionId: "s1" })).texts as string[];
+  assert.equal(unset.length, 1);
+  assert.doesNotMatch(unset[0].split("\n")[0], /your-role=/);
 });
 
 test("fallback names come from the key when the requested name is reserved or empty", async () => {
@@ -2269,6 +2426,97 @@ test("control action survives database reopen in history, replay and queued deli
   } finally {
     alpha.close();
     beta.close();
+    human.close();
+    await daemon.close();
+    db.close();
+    rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.ASENQ_HOME;
+    else process.env.ASENQ_HOME = previousHome;
+  }
+});
+
+test("legacy identity migration and database reopen preserve roles, queued headers and explicit unset", async () => {
+  const previousHome = process.env.ASENQ_HOME;
+  const home = mkdtempSync(join(tmpdir(), "asenq-roles-restart-"));
+  process.env.ASENQ_HOME = home;
+  let db = await openDb(join(home, "asenq.db"));
+  db.exec(`
+    CREATE TABLE session_identities(
+      id TEXT PRIMARY KEY, harness TEXT NOT NULL, name TEXT NOT NULL, previous_names TEXT NOT NULL DEFAULT '[]',
+      cwd TEXT, inbound TEXT NOT NULL DEFAULT 'accept', state TEXT NOT NULL,
+      created_at INTEGER NOT NULL, removed_at INTEGER);
+    INSERT INTO session_identities(id,harness,name,state,created_at,removed_at)
+      VALUES('s_archived','omp','archived','removed',1,2);
+  `);
+  let now = 1_700_000_000_000;
+  const options = { socket: socketPath(), replyDir: join(home, "replies"), now: () => now, timers: false, log: () => {} };
+  let daemon = new Daemon({ ...options, db });
+  let human = new AsenqClient();
+  let agent = new AsenqClient();
+  try {
+    await daemon.listen();
+    assert.equal((await human.sync()).sessions.find((session) => session.id === "s_archived")?.role, null);
+    await assert.rejects(human.request("set_role", { name: "archived", role: "worker" }), { code: "unknown_target" });
+    const registered = await agent.request("register", { harness: "omp", key: "alpha-key", name: "alpha" });
+    const session = registered.session;
+    assert.ok(session && typeof session === "object" && "id" in session && typeof session.id === "string");
+    const sessionId = session.id;
+    const before = await human.sync();
+    await human.request("set_role", { name: "alpha", role: "worker" });
+    await agent.request("rename", { name: "renamed" });
+    const gone = Promise.withResolvers<void>();
+    human.close();
+    human = new AsenqClient({
+      onPush: (push) => { if (push.push === "event" && isSession("gone", "renamed")(push.event)) gone.resolve(); },
+    });
+    await human.request("tail");
+    agent.close();
+    await gone.promise;
+    const [queued] = await send(human, "renamed", "persisted recipient role");
+    assert.equal(queued.status, "queued");
+    human.close();
+    await daemon.close();
+    db.close();
+    now += 1000;
+    db = await openDb(join(home, "asenq.db"));
+    daemon = new Daemon({ ...options, db });
+    await daemon.listen();
+    human = new AsenqClient();
+    const restored = (await human.sync()).sessions.find((session) => session.id === sessionId);
+    assert.deepEqual(restored && [restored.name, restored.previousNames, restored.role], ["renamed", ["alpha"], "worker"]);
+    const replay = await human.replay(before.watermark);
+    assert.ok(replay.events.some(({ event }) => event.type === "session" && event.action === "updated"
+      && event.session.id === sessionId && event.session.role === "worker"));
+    const delivery = Promise.withResolvers<Delivery>();
+    agent = new AsenqClient({
+      onPush: (push) => {
+        if (push.push !== "deliver") return;
+        delivery.resolve(push);
+      },
+    });
+    const reconnected = await agent.request("register", { harness: "omp", key: "alpha-key", name: "renamed" });
+    assert.deepEqual(reconnected.session, { id: sessionId, name: "renamed" });
+    const received = await delivery.promise;
+    assert.equal(received.msg.id, queued.msgId);
+    assert.match(received.text.split("\n")[0], /your-role=worker/);
+    await agent.request("ack", { msgId: received.msg.id, ok: true });
+    await human.request("set_role", { name: "renamed", role: null });
+    agent.close();
+    human.close();
+    await daemon.close();
+    db.close();
+    now += 1000;
+    db = await openDb(join(home, "asenq.db"));
+    daemon = new Daemon({ ...options, db });
+    await daemon.listen();
+    human = new AsenqClient();
+    assert.equal((await human.sync()).sessions.find((session) => session.id === sessionId)?.role, null);
+    const listed = (await human.request("list")).sessions as { name: string; role: string | null }[];
+    assert.equal(listed.find((session) => session.name === "renamed")?.role, null);
+    await human.request("set_role", { name: "renamed", role: "orchestrator" });
+    assert.equal((await human.sync()).sessions.find((session) => session.id === sessionId)?.role, "orchestrator");
+  } finally {
+    agent.close();
     human.close();
     await daemon.close();
     db.close();

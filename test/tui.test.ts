@@ -377,6 +377,74 @@ test("session list shows short harness labels without losing state or unread bad
   assertWithin(ui);
 });
 
+test("session roles yield to archived names, unread counts and state at 80 columns", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "role-alpha", "alpha");
+  const bravo = await env.adapter("claude", "role-bravo", "bravo");
+  await env.adapter("opencode", "role-charlie", "charlie");
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await human.request("set_role", { name: "bravo", role: "worker" });
+  for (const session of [alpha, bravo]) {
+    await session.client.request("send", { to: "human", text: "unread role conversation" });
+  }
+  const ui = await startConsole(80, 20);
+  const listWidth = paneWidths(80)!.list;
+  const list = (): string[] => ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  const alphaRow = list().find((row) => row.includes("al"))!;
+  const bravoRow = list().find((row) => row.includes("br"))!;
+  assert.match(alphaRow, /\borch\b.*\+1.*live/);
+  assert.match(bravoRow, /\bwrk\b.*\+1.*live/);
+  const unsetRow = list().find((row) => row.includes("charlie"))!;
+  assert.match(unsetRow, /live/);
+  assert.doesNotMatch(unsetRow, /\b(?:orch|wrk|unset)\b/);
+  assertWithin(ui);
+
+  await alpha.client.request("unregister");
+  await bravo.client.request("unregister");
+  await ui.until(() => list().some((row) => row.includes("Archive")), "archived sessions");
+  await ui.press("END");
+  await ui.press("ENTER");
+  await ui.until(() => list().filter((row) => row.includes("archived")).length === 2, "expanded archive");
+  for (const prefix of ["al", "br"]) {
+    const rows = list();
+    const index = rows.findIndex((row) => row.includes(prefix) && row.includes("archived"));
+    assert.ok(index >= 0, `${prefix} retains a distinct visible name prefix`);
+    assert.match(rows[index], /\+1.*archived/);
+    assert.doesNotMatch(rows[index], /\b(?:orch|wrk)\b/, "role yields to archived identity and unread state");
+  }
+  assertWithin(ui);
+});
+
+test("human role form updates the selected session through protocol events and can unset it", async () => {
+  env = await startEnv();
+  const human = env.human();
+  await env.adapter("omp", "form-alpha", "alpha");
+  await env.adapter("omp", "form-bravo", "bravo");
+  const ui = await startConsole(120, 20);
+  await ui.press("/");
+  await ui.type("alpha");
+  await ui.press("ENTER");
+  const listWidth = paneWidths(120)!.list;
+  const sessionRow = (): string => ui.rows().map((row) => truncateTerminalText(row, listWidth)).find((row) => row.includes("alpha") && row.includes("live")) ?? "";
+
+  for (const [value, tag] of [["orchestrator", "orch"], ["worker", "wrk"], ["unset", ""]]) {
+    await ui.press("?");
+    await ui.type("Set role");
+    await ui.press("ENTER");
+    await ui.press("TAB");
+    await ui.press("CTRL_U");
+    await ui.type(value);
+    await ui.press("CTRL_D");
+    await ui.until(() => tag ? sessionRow().includes(tag) : !!sessionRow() && !/\b(?:orch|wrk)\b/.test(sessionRow()), `${value} role event renders`);
+    const reply = await human.request("list");
+    const sessions = reply.sessions as { name: string; role: string | null }[];
+    assert.equal(sessions.find((session) => session.name === "alpha")!.role, value === "unset" ? null : value);
+    assert.equal(sessions.find((session) => session.name === "bravo")!.role, null, "another session is unchanged");
+    assertWithin(ui);
+  }
+});
+
 test("rounded panes resize at the wide boundary without overflowing or moving mouse and cursor targets onto borders", async () => {
   env = await startEnv();
   const human = env.human();

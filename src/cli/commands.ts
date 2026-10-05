@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import type { ControlAction, SendResult, TailEvent } from "../shared/protocol.js";
+import type { ControlAction, Role, SendResult, TailEvent } from "../shared/protocol.js";
 import { formatSendResults } from "../shared/tools.js";
 
 type LoggedMsg = {
@@ -75,8 +75,8 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
   switch (cmd) {
     case "ls": {
       const r = await client.request("list");
-      const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; inbound: string }[];
-      const table = [["NAME", "HARNESS", "STATE", "INBOUND", "CWD"], ...rows.map((s) => [s.name, s.harness, s.state, s.inbound, s.cwd ?? ""])];
+      const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; inbound: string; role: Role | null }[];
+      const table = [["NAME", "HARNESS", "STATE", "INBOUND", "ROLE", "CWD"], ...rows.map((s) => [s.name, s.harness, s.state, s.inbound, s.role ?? "unset", s.cwd ?? ""])];
       const widths = table[0].map((_, i) => Math.max(...table.map((row) => row[i].length)));
       for (const row of table) out(row.map((c, i) => (i === row.length - 1 ? c : c.padEnd(widths[i]))).join("  "));
       return 0;
@@ -163,6 +163,13 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       need(argv, 2, "usage: asenq inbound <name> accept|hold|refuse");
       await client.request("set_inbound", { name: argv[0], mode: argv[1] });
       out(`${argv[0]} inbound ${argv[1]}`);
+      return 0;
+    }
+    case "role": {
+      need(argv, 2, "usage: asenq role <name> orchestrator|worker|unset");
+      if (!["orchestrator", "worker", "unset"].includes(argv[1])) throw new Error("role must be orchestrator, worker or unset");
+      await client.request("set_role", { name: argv[0], role: argv[1] === "unset" ? null : argv[1] });
+      out(`${argv[0]} role ${argv[1]}`);
       return 0;
     }
     case "held": {
