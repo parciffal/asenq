@@ -529,7 +529,7 @@ test("wide console lists live sessions by recent activity, collapses the archive
   let rows = ui.rows();
   const index = (text: string): number => rows.findIndex((row) => truncateTerminalText(row, listWidth).includes(text));
   assert.ok(index("beta") < index("alpha"), "most recent activity first");
-  assert.ok(index("alpha") < index("Archive"), "live before archive");
+  assert.ok(index("alpha") < index("archive"), "live before archive");
   assert.equal(index("retired"), -1, "archive starts collapsed");
 
   await ui.press("DOWN");
@@ -632,61 +632,6 @@ test("new arrivals keep a scrolled reader in place, and the composer sends once 
   assert.ok(!ui.rows().some((row) => row.includes("› hello") || row.includes("› there")), "draft cleared after send");
 });
 
-test("session list shows short harness labels without losing state or unread badges", async () => {
-  env = await startEnv();
-  const cc = await env.adapter("claude", "cc-key", "reviewer");
-  await env.adapter("opencode", "oc-key", "planner");
-  await env.adapter("omp", "omp-key", "writer");
-  await cc.client.request("send", { to: "human", text: "review is ready" });
-  const ui = await startConsole(120, 20);
-  const listWidth = paneWidths(120)!.list;
-  await ui.until(() => ui.rows().some((row) => row.includes("writer")), "all sessions");
-  const list = ui.rows().map((row) => truncateTerminalText(row, listWidth));
-  assert.match(list.find((row) => row.includes("reviewer"))!, /\bcc\b.*\+1.*live/);
-  assert.match(list.find((row) => row.includes("planner"))!, /\boc\b.*live/);
-  assert.match(list.find((row) => row.includes("writer"))!, /\bomp\b.*live/);
-  assertWithin(ui);
-});
-
-test("session roles yield to archived names, unread counts and state at 80 columns", async () => {
-  env = await startEnv();
-  const human = env.human();
-  const alpha = await env.adapter("omp", "role-alpha", "alpha");
-  const bravo = await env.adapter("claude", "role-bravo", "bravo");
-  await env.adapter("opencode", "role-charlie", "charlie");
-  await human.request("set_role", { name: "alpha", role: "orchestrator" });
-  await human.request("set_role", { name: "bravo", role: "worker" });
-  for (const session of [alpha, bravo]) {
-    await session.client.request("send", { to: "human", text: "unread role conversation" });
-  }
-  const ui = await startConsole(80, 20);
-  const listWidth = paneWidths(80)!.list;
-  const list = (): string[] => ui.rows().map((row) => truncateTerminalText(row, listWidth));
-  const alphaRow = list().find((row) => row.includes("al"))!;
-  const bravoRow = list().find((row) => row.includes("br"))!;
-  assert.match(alphaRow, /\borch\b.*\+1.*live/);
-  assert.match(bravoRow, /\bwrk\b.*\+1.*live/);
-  const unsetRow = list().find((row) => row.includes("charlie"))!;
-  assert.match(unsetRow, /live/);
-  assert.doesNotMatch(unsetRow, /\b(?:orch|wrk|unset)\b/);
-  assertWithin(ui);
-
-  await alpha.client.request("unregister");
-  await bravo.client.request("unregister");
-  await ui.until(() => list().some((row) => row.includes("Archive")), "archived sessions");
-  await ui.press("END");
-  await ui.press("ENTER");
-  await ui.until(() => list().filter((row) => row.includes("archived")).length === 2, "expanded archive");
-  for (const prefix of ["al", "br"]) {
-    const rows = list();
-    const index = rows.findIndex((row) => row.includes(prefix) && row.includes("archived"));
-    assert.ok(index >= 0, `${prefix} retains a distinct visible name prefix`);
-    assert.match(rows[index], /\+1.*archived/);
-    assert.doesNotMatch(rows[index], /\b(?:orch|wrk)\b/, "role yields to archived identity and unread state");
-  }
-  assertWithin(ui);
-});
-
 test("human role form updates the selected session through protocol events and can unset it", async () => {
   env = await startEnv();
   const human = env.human();
@@ -697,7 +642,7 @@ test("human role form updates the selected session through protocol events and c
   await ui.type("alpha");
   await ui.press("ENTER");
   const listWidth = paneWidths(120)!.list;
-  const sessionRow = (): string => ui.rows().map((row) => truncateTerminalText(row, listWidth)).find((row) => row.includes("alpha") && row.includes("live")) ?? "";
+  const sessionRow = (): string => ui.rows().map((row) => truncateTerminalText(row, listWidth)).find((row) => row.includes("alpha")) ?? "";
 
   for (const [value, tag] of [["orchestrator", "orch"], ["worker", "wrk"], ["unset", ""]]) {
     await ui.press("?");
@@ -734,9 +679,9 @@ test("channel rosters show shared identities and follow name, role and lifecycle
     const width = paneWidths(ui.size.columns)?.list ?? ui.size.columns;
     return ui.rows().map((row) => truncateTerminalText(row, width));
   };
-  assert.equal(listRows().filter((row) => row.includes("alpha") && row.includes("orch") && row.includes("live")).length, 2);
-  assert.ok(listRows().some((row) => row.includes("bravo") && row.includes("wrk") && row.includes("live")));
-  assert.ok(listRows().some((row) => row.includes("charlie") && row.includes("unset") && row.includes("live")));
+  assert.equal(listRows().filter((row) => row.includes("alpha") && row.includes("orch") && row.includes("●")).length, 2);
+  assert.ok(listRows().some((row) => row.includes("bravo") && row.includes("wrk") && row.includes("●")));
+  assert.ok(listRows().some((row) => row.includes("charlie") && row.includes("unset") && row.includes("●")));
   for (const columns of [79, 80, 120]) {
     await ui.resize(columns, 22);
     assert.ok(listRows().some((row) => row.includes("#one")));
@@ -749,10 +694,10 @@ test("channel rosters show shared identities and follow name, role and lifecycle
   const gone = await env.watch((e) => e.type === "session" && e.action === "gone" && e.session.id === alpha.session.id);
   alpha.client.close();
   await gone.event;
-  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("gone")).length === 2, "both rosters show gone");
+  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("◌")).length === 2, "both rosters show reconnecting");
   env.clock.advance(GRACE_MS);
   env.daemon.sweep();
-  await ui.until(() => listRows().filter((row) => row.includes("renamed") && row.includes("archived")).length === 2, "both rosters show archived");
+  await ui.until(() => ui.rows().filter((row, index) => truncateTerminalText(row, paneWidths(120)!.list).includes("renamed") && normalizeTerminalLine(ui.frame().lines[index], ui.size.columns).some((span) => span.text.includes("renamed") && span.style?.dim)).length === 2, "both rosters show archived identities");
   assert.deepEqual((await human.request("channel_read", { channel: "one" })).messages, []);
   assertWithin(ui);
 });
@@ -784,7 +729,7 @@ test("channel palette edits and member hit targets keep delivery in channel scop
   await ui.press("TAB");
   await ui.type("alpha");
   await ui.press("CTRL_D");
-  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("unset") && row.includes("live")), "palette add renders roster event");
+  await ui.until(() => ui.rows().some((row) => row.includes("alpha") && row.includes("unset") && row.includes("●")), "palette add renders roster event");
 
   for (const columns of [79, 80, 120]) {
     await ui.resize(columns, 22);
@@ -1137,7 +1082,7 @@ test("unread archived sessions remain distinguishable at the 80-column boundary"
   const ui = await startConsole(80, 18);
   await ui.press("ENTER");
   const listWidth = paneWidths(80)!.list;
-  const archived = ui.rows().map((row) => truncateTerminalText(row, listWidth)).filter((row) => row.includes("archived"));
+  const archived = ui.rows().map((row) => truncateTerminalText(row, listWidth)).filter((row) => row.includes("alpha") || row.includes("bravo"));
   assert.equal(archived.length, 2);
   assert.ok(archived.some((row) => row.includes("al")), "alpha retains a visible name prefix");
   assert.ok(archived.some((row) => row.includes("br")), "bravo retains a distinct visible name prefix");
@@ -1202,8 +1147,8 @@ test("console shows control actions beside their kind without changing ordinary 
   const ui = await startConsole(120, 30);
   await ui.until(() => ui.rows().some((row) => row.includes("Please pause here")), "control message");
 
-  const control = ui.rows().find((row) => row.includes(" · control"));
-  const ordinary = ui.rows().find((row) => row.includes(" · status"));
+  const control = ui.rows().find((row) => row.includes("control pause"));
+  const ordinary = ui.rows().find((row) => /\bstatus\b/.test(row) && row.includes("✓ delivered"));
   assert.ok(control?.includes("pause"), "the visible control tag carries its action");
   assert.ok(ordinary, "ordinary status tag remains visible");
   assert.ok(!ordinary.includes("pause") && !ordinary.includes("control"), "ordinary metadata is unchanged");
@@ -1536,7 +1481,7 @@ test("held bar scopes to the open target and releases then drops its oldest show
   await ui.type("worker");
   await ui.press("ENTER");
   await ui.press("ENTER");
-  const bar = () => ui.rows().find((row) => row.includes("⏸") && row.includes("held"));
+  const bar = () => ui.rows().find((row) => row.includes("⏸ held"));
   assert.ok(bar(), "held messages for the open target expose the bar");
   assert.ok(bar()!.includes("orch → worker") && bar()!.includes("oldest-review-preview"), "the oldest message is shown with its sender and target");
   assert.match(bar()!, /held.*2/, "multiple held messages show a count");
@@ -2185,6 +2130,25 @@ test("design A session sections expose state, harness, roles, policy and focused
   assert.ok(alphaSpans.some((span) => span.text.includes("orch") && span.style?.inverse));
   assert.ok(list.some((row) => row.includes("/ filter sessions")));
   assert.equal(await unread(human, alpha.session.id), 1, "styling a selected list row never marks it read");
+  await ui.press("ENTER");
+  await ui.press("c");
+  const composerList = ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  const composerAlpha = composerList.findIndex((row) => row.includes("alpha"));
+  assert.ok(composerList[composerAlpha].includes("▌"), "selected identity stays marked while writing");
+  assert.ok(normalizeTerminalLine(ui.frame().lines[composerAlpha], ui.size.columns).some((span) => span.text.includes("alpha") && span.style?.foreground === "brightCyan"));
+  await ui.press("ESCAPE");
+  await ui.press("u");
+  await ui.resize(80, 20);
+  const narrowList = ui.rows().map((row) => truncateTerminalText(row, paneWidths(80)!.list));
+  assert.ok(narrowList.some((row) => row.includes("alpha")));
+  assert.ok(narrowList.some((row) => row.includes("omp") && row.includes("orch") && row.includes("+1")));
+  assertWithin(ui);
+  await ui.press("CTRL_K");
+  await ui.type("retired");
+  await ui.press("ENTER");
+  const archivedList = ui.rows().map((row) => truncateTerminalText(row, paneWidths(80)!.list));
+  const archivedRow = archivedList.find((row) => row.includes("retired"))!;
+  assert.ok(archivedRow.includes("cc") && !archivedRow.includes("●") && !archivedRow.includes("◌"), "archived row retains harness without a live-state dot");
   assertWithin(ui);
 });
 
