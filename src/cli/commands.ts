@@ -1,8 +1,8 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import type { ChannelSummary, ControlAction, Role, SendResult, SessionIdentity, TailEvent } from "../shared/protocol.js";
-import { formatSendResults } from "../shared/tools.js";
+import type { ChannelSummary, ControlAction, ListedSession, SendResult, SessionIdentity, TailEvent } from "../shared/protocol.js";
+import { formatSendResults, formatSessions } from "../shared/tools.js";
 
 type LoggedMsg = {
   id: string; from: string; to: string; text: string; createdAt: number;
@@ -74,11 +74,14 @@ export async function runCommand(cmd: string, argv: string[], usage: string): Pr
 async function runClientCommand(client: AsenqClient, cmd: string, argv: string[], usage: string): Promise<number> {
   switch (cmd) {
     case "ls": {
-      const r = await client.request("list");
-      const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; inbound: string; role: Role | null }[];
-      const table = [["NAME", "HARNESS", "STATE", "INBOUND", "ROLE", "CWD"], ...rows.map((s) => [s.name, s.harness, s.state, s.inbound, s.role ?? "unset", s.cwd ?? ""])];
-      const widths = table[0].map((_, i) => Math.max(...table.map((row) => row[i].length)));
-      for (const row of table) out(row.map((c, i) => (i === row.length - 1 ? c : c.padEnd(widths[i]))).join("  "));
+      const { values } = parseArgs({
+        args: argv, options: { cwd: { type: "string" }, harness: { type: "string" }, channel: { type: "string" } },
+      });
+      if (values.harness !== undefined && !["claude", "omp", "opencode"].includes(values.harness)) {
+        throw new Error("harness must be claude, omp or opencode");
+      }
+      const r = await client.request("list", values);
+      out(formatSessions(r.sessions as ListedSession[], values.cwd !== undefined || values.harness !== undefined || values.channel !== undefined));
       return 0;
     }
     case "send": {

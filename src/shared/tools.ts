@@ -1,5 +1,5 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type MsgStatus, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type ListedSession, type MsgStatus, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
 import { renderMessageBody } from "./render.js";
 
 export type ParamSpec = {
@@ -55,8 +55,16 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_list",
     label: "Asenq List",
-    description: "List agent sessions registered on asenq (name, harness, working directory, role). The human can edit any role; an orchestrator can edit roles only for sessions sharing a channel. Roles are informational for message delivery; asenq does not coordinate work. Your own session is marked [you].",
-    params: {},
+    description:
+      "List registered sessions with current and former names, identity id, harness/cwd, role/channels, inbound policy, state/stale, ping, last-seen harness contact, busy/idle, harness session id and a resume command when known. " +
+      "Filters use current metadata: cwd is a literal path prefix; harness and channel membership are exact; combined filters use AND, with no matches returning an empty list. " +
+      "Gone sessions are stale; live sessions are stale only after a not-responding ping, never because of quiet DMs. Never pinged differs from unavailable ping; unknown last-seen and busy are not idle. Your own session is marked [you]. " +
+      "The human can edit any role; an orchestrator can edit roles only for sessions sharing a channel. Roles do not restrict delivery; asenq does not coordinate work.",
+    params: {
+      cwd: { type: "string", optional: true, description: "Literal prefix of the session's current working directory" },
+      harness: { type: "string", enum: ["claude", "omp", "opencode"], optional: true, description: "Exact harness" },
+      channel: { type: "string", optional: true, description: "Exact channel name; matches current members" },
+    },
   },
   {
     name: "asenq_inbox",
@@ -174,6 +182,21 @@ export const TOOLS: ToolSpec[] = [
   },
 ];
 
+export function formatSessions(sessions: ListedSession[], filtered = false): string {
+  if (sessions.length === 0) return filtered ? "no sessions match filters" : "no sessions registered";
+  return sessions.map((s) => [
+    `${s.name}${s.you ? " [you]" : ""}`,
+    `  id=${s.id} · you=${s.you ? "yes" : "no"} · former=${s.previousNames.join(", ") || "none"}`,
+    `  harness=${s.harness} · cwd=${s.cwd ?? "unknown"}`,
+    `  role=${s.role ?? "unset"} · channels=${s.channels.map((channel) => `#${channel}`).join(", ") || "none"}`,
+    `  inbound=${s.inbound} · state=${s.state} · stale=${s.stale ? "yes" : "no"}`,
+    `  ping=${s.ping === null ? "never" : s.ping === "unknown" ? "unknown (unavailable)" : s.ping} · busy=${s.busy === null ? "unknown" : s.busy ? "busy" : "idle"}`,
+    `  lastSeen=${s.lastSeen === null ? "unknown" : new Date(s.lastSeen).toISOString()}`,
+    `  harnessSessionId=${s.harnessSessionId ?? "unknown"}`,
+    ...(s.resumeCommand === undefined ? [] : [`  resume=${s.resumeCommand}`]),
+  ].join("\n")).join("\n\n");
+}
+
 type Msg = { id: string; from: string; to: string; text: string; file?: WireMsg["file"]; createdAt: number; status?: MsgStatus; kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; sourceChannel?: string };
 
 export function formatSendResults(results: SendResult[]): string {
@@ -248,12 +271,8 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
         return String(r.status);
       }
       case "asenq_list": {
-        const r = await client.request("list", who);
-        const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; role: Role | null; you: boolean }[];
-        if (rows.length === 0) return "no sessions registered";
-        return rows
-          .map((s) => `${s.name} (${s.harness}) ${s.cwd ?? ""}${s.role ? ` · role=${s.role}` : ""}${s.state === "live" ? "" : ` [${s.state}]`}${s.you ? " [you]" : ""}`)
-          .join("\n");
+        const r = await client.request("list", { ...who, cwd: args.cwd, harness: args.harness, channel: args.channel });
+        return formatSessions(r.sessions as ListedSession[], args.cwd !== undefined || args.harness !== undefined || args.channel !== undefined);
       }
       case "asenq_inbox": {
         if (args.id !== undefined) {
