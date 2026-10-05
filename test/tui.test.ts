@@ -22,6 +22,7 @@ type Console = {
   app: ConsoleApp;
   size: TerminalSize;
   rows(): string[];
+  frame(): TerminalFrame;
   press(name: string): Promise<void>;
   close(): void;
   type(text: string): Promise<void>;
@@ -47,6 +48,7 @@ async function startConsole(columns: number, rows: number): Promise<Console> {
     app,
     size,
     rows: () => frame.lines.map(lineText),
+    frame: () => frame,
     async press(name) {
       const text = [...name].length === 1 ? name : undefined;
       handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: name.startsWith("CTRL_"), alt: false, shift: name.startsWith("SHIFT_") });
@@ -455,5 +457,54 @@ test("unread archived sessions remain distinguishable at the 80-column boundary"
   assert.ok(archived.some((row) => row.includes("al")), "alpha retains a visible name prefix");
   assert.ok(archived.some((row) => row.includes("br")), "bravo retains a distinct visible name prefix");
   for (const row of archived) assert.ok(row.includes("+1"), "unread count remains visible");
+  assertWithin(ui);
+});
+
+test("chrome header shows all counters and highlights the active tab as a pill", async () => {
+  env = await startEnv();
+  await env.adapter("omp", "chrome-header", "reviewer");
+  const ui = await startConsole(120, 32);
+  assert.match(ui.rows()[0], /1 live · 0 reconnecting · 0 held · 0 unread/);
+  assert.match(ui.rows()[0], /● connected$/);
+  const spans = ui.frame().lines[0] as readonly { text: string; style?: { inverse?: boolean } }[];
+  assert.ok(spans.some((span) => span.text.includes("Sessions") && span.style?.inverse), "active Sessions tab is an inverse pill");
+  await ui.press("i");
+  const inbox = ui.frame().lines[0] as typeof spans;
+  assert.ok(inbox.some((span) => span.text.includes("Inbox") && span.style?.inverse), "the active pill follows keyboard tab changes");
+  assertWithin(ui);
+});
+
+test("chrome footer renders context keys as inverse chips with dim labels", async () => {
+  env = await startEnv();
+  await env.adapter("omp", "chrome-footer", "reviewer");
+  const ui = await startConsole(120, 32);
+  const footer = ui.frame().lines.at(-1) as readonly { text: string; style?: { inverse?: boolean; dim?: boolean } }[];
+  assert.ok(footer.some((span) => /Enter|⏎/.test(span.text) && span.style?.inverse), "Enter is an inverse key chip");
+  assert.ok(footer.some((span) => span.text.includes("open") && span.style?.dim && !span.style.inverse), "open is a dim label rather than part of the key chip");
+  await ui.press("c");
+  const composerFooter = ui.frame().lines.at(-1) as typeof footer;
+  assert.ok(composerFooter.some((span) => /Shift\+Enter|⇧⏎/.test(span.text) && span.style?.inverse), "composer newline key stays discoverable");
+  assertWithin(ui);
+});
+
+test("chrome composer is a focused rounded box with target and editing hints", async () => {
+  env = await startEnv();
+  const reviewer = await env.adapter("omp", "chrome-composer", "reviewer");
+  const ui = await startConsole(120, 32);
+  await ui.press("c");
+  const listWidth = paneWidths(120)!.list;
+  const conversation = ui.rows().map((row) => row.slice(listWidth + 2, -1));
+  const titleRow = conversation.findIndex((row) => row.startsWith("╭─ to reviewer "));
+  assert.ok(titleRow > 1, "composer target is inset into a separate top border");
+  assert.ok(conversation[titleRow + 1].startsWith("│› "), "prompt sits inside the composer");
+  assert.ok(conversation[titleRow + 2].startsWith("╰"), "composer has its own rounded bottom border");
+  assert.ok(conversation.some((row) => row.includes("⏎ send") && row.includes("⇧⏎ newline") && row.includes("^E editor")), "editing hints are visible in the composer");
+  const title = ui.frame().lines[titleRow] as readonly { text: string; style?: { foreground?: string } }[];
+  assert.ok(title.some((span) => span.text.includes("╭") && span.style?.foreground === "cyan"), "focused composer border is cyan");
+  await ui.type("hello");
+  await ui.press("SHIFT_ENTER");
+  await ui.type("there");
+  await ui.press("ENTER");
+  assert.equal((await reviewer.nextDelivery()).msg.text, "hello\nthere");
   assertWithin(ui);
 });
