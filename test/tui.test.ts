@@ -3,10 +3,9 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { AsenqClient } from "../src/shared/client.js";
-import type { SendResult, StoredMessage } from "../src/shared/protocol.js";
+import { GRACE_MS, type SendResult, type SessionIdentity, type StoredMessage } from "../src/shared/protocol.js";
 import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
-import { GRACE_MS, type SessionIdentity, type StoredMessage } from "../src/shared/protocol.js";
 import {
   changedTerminalRows, normalizeTerminalLine, terminalTextWidth, translateKeyboardInput, truncateTerminalText, wrapTerminalText,
   type TerminalAdapterOptions, type TerminalFrame, type TerminalLine, type TerminalSize,
