@@ -2018,10 +2018,14 @@ test("Claude peer failure updates retained delivery state and replay; unknown pe
   assert.equal(sent.status, "delivered");
   const frame = JSON.parse(await fake.nextLine()) as { from: string; msg_id: string };
   const before = await human.sync();
+  assert.equal((await human.request("sync")).failedCount, 0);
   const conn = net.createConnection(decodeURIComponent(frame.from.slice(4)));
   const failed = await env.watch(isStatus(sent.msgId, "failed"));
   conn.write(JSON.stringify({ type: "control", action: "peer_message_status", msg_id: frame.msg_id, status: "failed", reason: "peer unavailable" }) + "\n");
-  await failed.event;
+  const failedEvent = await failed.event;
+  assert.ok("failedCount" in failedEvent);
+  assert.equal(failedEvent.failedCount, 1);
+  assert.equal((await human.request("sync")).failedCount, 1);
   assert.equal((await logOf(human, sent.msgId!)).status, "failed");
   const session = started.session;
   assert.ok(session && typeof session === "object" && "id" in session && typeof session.id === "string");
@@ -2032,6 +2036,12 @@ test("Claude peer failure updates retained delivery state and replay; unknown pe
   conn.write(JSON.stringify({ type: "control", action: "peer_message_status", msg_id: frame.msg_id, status: "accepted" }) + "\n");
   conn.end();
   await new Promise<void>((resolve) => conn.on("close", resolve));
+  assert.equal((await logOf(human, sent.msgId!)).status, "failed");
+  const receiver = env.human();
+  await receiver.request("claude_attach", { sessionId: "s1" });
+  assert.equal((await send(receiver, "human", "reply after failure", { replyTo: sent.msgId }))[0].status, "posted");
+  assert.equal((await logOf(human, sent.msgId!)).status, "failed");
+  await receiver.request("ack", { msgId: sent.msgId, ok: true });
   assert.equal((await logOf(human, sent.msgId!)).status, "failed");
   await fake.stop();
 });
@@ -4129,4 +4139,265 @@ test("sync failedCount increments on direct expiry and decrements when retained 
   env.daemon.prune();
   assert.equal((await human.request("sync")).failedCount, 0);
   assert.deepEqual((await human.historyPage({ scope: "session", sessionId: receiver.session.id })).messages, []);
+});
+
+test("ambiguous retained current names reject name routing while stable ids retain separate queues", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const first = await env.adapter("omp", "first-key", "shared", { cwd: "/first" });
+  await first.client.request("unregister");
+  const second = await env.adapter("opencode", "second-key", "shared", { cwd: "/second" });
+  assert.notEqual(first.session.id, second.session.id);
+  assert.equal((await send(human, "shared", "active holder wins"))[0].status, "delivered");
+  assert.equal((await second.nextDelivery()).msg.text, "active holder wins");
+  const gone = await env.watch(isSession("gone", "shared"));
+  second.client.close();
+  await gone.event;
+  const [toGoneHolder] = await send(human, "shared", "gone holder wins");
+  assert.equal(toGoneHolder.status, "queued");
+  assert.equal((await human.historyPage({ scope: "session", sessionId: second.session.id })).messages.at(-1)?.toSessionId, second.session.id);
+  const delivered = await env.watch(isStatus(toGoneHolder.msgId, "delivered"));
+  const reconnected = await env.adapter("opencode", "second-key", "ignored");
+  await delivered.event;
+  await reconnected.client.request("unregister");
+  await assert.rejects(send(human, "shared", "must not guess"), (error: unknown) => {
+    assert.ok(error instanceof Error && "code" in error);
+    assert.equal(error.code, "ambiguous_target");
+    for (const detail of [first.session.id, second.session.id, "shared", "omp", "opencode", "/first", "/second"]) {
+      assert.ok(error.message.includes(detail), `ambiguity must identify ${detail}`);
+    }
+    assert.ok(error.message.includes(String(env!.clock.now())) || error.message.includes(new Date(env!.clock.now()).toISOString()),
+      "ambiguity must include the candidates' last-seen timestamp");
+    return true;
+  });
+  const toFirst = await human.sendToSession(first.session.id, "only first");
+  const toSecond = await human.sendToSession(second.session.id, "only second");
+  assert.deepEqual([toFirst.status, toSecond.status], ["queued", "queued"]);
+  for (const [identity, message] of [[first.session, toFirst], [second.session, toSecond]] as const) {
+    const history = await human.historyPage({ scope: "session", sessionId: identity.id });
+    assert.deepEqual(history.messages.filter((row) => row.status === "queued").map(
+      (row) => [row.id, row.toSessionId],
+    ), [[message.msgId, identity.id]]);
+  }
+});
+
+for (const path of ["adapter reconnect", "Claude fallback poll"] as const) {
+  test(`expired queued messages cannot deliver through ${path} without a preceding sweep`, async () => {
+    env = await startEnv({ ...{ queueTtlMs: 1000 } });
+    const human = env.human();
+    let queued: SendResult;
+    if (path === "adapter reconnect") {
+      const receiver = await env.adapter("omp", "receiver-key", "receiver");
+      const gone = await env.watch(isSession("gone", "receiver"));
+      receiver.client.close();
+      await gone.event;
+      [queued] = await send(human, "receiver", "stale before reconnect");
+      env.clock.advance(1000);
+      const revived = await env.adapter("omp", "receiver-key", "ignored");
+      assert.equal((await logOf(human, queued.msgId!)).status, "expired");
+      assert.deepEqual(revived.deliveries, []);
+      assert.deepEqual((await revived.client.request("inbox", { unread_only: true })).messages, []);
+    } else {
+      await human.request("claude_hook", { event: "start", key: "claude-key", sessionId: "s1", name: "receiver", socket: null });
+      [queued] = await send(human, "receiver", "stale before hook");
+      env.clock.advance(1000);
+      assert.deepEqual((await human.request("claude_hook", { event: "poll", sessionId: "s1" })).texts, []);
+      assert.equal((await logOf(human, queued.msgId!)).status, "expired");
+    }
+  });
+}
+
+test("only a reciprocal direct reply counts; third-party and channel references do not", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  const outsider = await env.adapter("omp", "outsider-key", "outsider");
+  const [original] = await send(sender.client, "receiver", "private question");
+  await send(outsider.client, "sender", "wrong author", { replyTo: original.msgId });
+  await send(receiver.client, "outsider", "wrong recipient", { replyTo: original.msgId });
+  await receiver.client.request("channel_send", { channel: "work", text: "channel reply", replyTo: original.msgId });
+  assert.equal((await logOf(human, original.msgId!)).status, "delivered");
+  await sender.client.request("channel_send", { channel: "work", text: "channel original" });
+  const channelMessages = (await human.request("channel_read", { channel: "work" })).messages as StoredMessage[];
+  const channelOriginal = channelMessages.find((row) => row.text === "channel original")!;
+  assert.ok(channelOriginal);
+  await send(receiver.client, "sender", "not a direct original", { replyTo: channelOriginal.id });
+  assert.equal((await logOf(human, channelOriginal.id)).status, "posted");
+  await sender.client.request("rename", { name: "sender-renamed" });
+  await receiver.client.request("rename", { name: "receiver-renamed" });
+  const [reply] = await send(receiver.client, "sender-renamed", "identity-safe answer", { replyTo: original.msgId });
+  assert.equal(reply.status, "delivered");
+  assert.equal((await logOf(human, original.msgId!)).status, "replied");
+});
+
+test("held and queued reciprocal replies count only when delivered and do not duplicate original unread", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  const [original] = await send(sender.client, "receiver", "question for held reply");
+  assert.deepEqual(((await receiver.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map(
+    (row) => row.id,
+  ), [original.msgId]);
+  await human.request("set_inbound", { name: "sender", mode: "hold" });
+  const [held] = await send(receiver.client, "sender", "held answer", { replyTo: original.msgId });
+  assert.equal(held.status, "held");
+  assert.equal((await logOf(human, original.msgId!)).status, "delivered");
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "delivered");
+  assert.equal((await logOf(human, original.msgId!)).status, "replied");
+  await receiver.client.request("ack", { msgId: original.msgId, ok: true });
+  await receiver.client.request("ack", { msgId: original.msgId, ok: true });
+  assert.equal((await logOf(human, original.msgId!)).status, "replied");
+  assert.deepEqual((await receiver.client.request("inbox", { unread_only: true })).messages, []);
+  assert.deepEqual(((await receiver.client.request("inbox")).messages as StoredMessage[]).map(
+    (row) => [row.id, row.status],
+  ), [[original.msgId, "replied"]]);
+
+  await human.request("set_inbound", { name: "sender", mode: "accept" });
+  const [second] = await send(sender.client, "receiver", "question for queued reply");
+  const gone = await env.watch(isSession("gone", "sender"));
+  sender.client.close();
+  await gone.event;
+  const [queued] = await send(receiver.client, "sender", "queued answer", { replyTo: second.msgId });
+  assert.equal(queued.status, "queued");
+  assert.equal((await logOf(human, second.msgId!)).status, "delivered");
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const resumed = await env.adapter("omp", "sender-key", "ignored");
+  await delivered.event;
+  assert.equal((await resumed.nextDelivery()).msg.id, queued.msgId);
+  assert.equal((await logOf(human, second.msgId!)).status, "replied");
+});
+
+test("a delivered reply before the original acknowledgement becomes effective after that acknowledgement", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver", { autoAck: false });
+  const pending = send(sender.client, "receiver", "ack is still pending");
+  const original = await receiver.nextDelivery();
+  const [reply] = await send(receiver.client, "sender", "answer first", { replyTo: original.msg.id });
+  assert.equal(reply.status, "delivered");
+  assert.equal((await logOf(human, original.msg.id)).status, "queued");
+  await receiver.client.request("ack", { msgId: original.msg.id, ok: true });
+  await pending;
+  assert.equal((await logOf(human, original.msg.id)).status, "replied");
+  assert.deepEqual(((await receiver.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map(
+    (row) => [row.id, row.status],
+  ), [[original.msg.id, "replied"]]);
+  await receiver.client.request("ack", { msgId: original.msg.id, ok: true });
+  assert.deepEqual((await receiver.client.request("inbox", { unread_only: true })).messages, []);
+});
+
+test("human reciprocal replies use posted admission for the human and delivered arrival for the session", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const agent = await env.adapter("omp", "agent-key", "agent");
+  const [toHuman] = await send(agent.client, "human", "question for human");
+  assert.equal(toHuman.status, "posted");
+  const gone = await env.watch(isSession("gone", "agent"));
+  agent.client.close();
+  await gone.event;
+  const [humanReply] = await send(human, "agent", "answer while offline", { replyTo: toHuman.msgId });
+  assert.equal(humanReply.status, "queued");
+  assert.equal((await logOf(human, toHuman.msgId!)).status, "posted");
+  const delivered = await env.watch(isStatus(humanReply.msgId, "delivered"));
+  const resumed = await env.adapter("omp", "agent-key", "ignored");
+  await delivered.event;
+  assert.equal((await logOf(human, toHuman.msgId!)).status, "replied");
+  const [fromHuman] = await send(human, "agent", "question from human");
+  assert.equal(fromHuman.status, "delivered");
+  const [agentReply] = await send(resumed.client, "human", "answer to human", { replyTo: fromHuman.msgId });
+  assert.equal(agentReply.status, "posted");
+  assert.equal((await logOf(human, fromHuman.msgId!)).status, "replied");
+  assert.deepEqual(((await human.request("inbox", { msgId: toHuman.msgId })).messages as StoredMessage[]).map(
+    (row) => [row.id, row.status],
+  ), [[toHuman.msgId, "replied"]]);
+  await env.restart();
+  const restored = await env.human().historyPage({ scope: "session", sessionId: agent.session.id });
+  assert.deepEqual(restored.messages.filter((row) => row.id === toHuman.msgId || row.id === fromHuman.msgId).map(
+    (row) => [row.id, row.status],
+  ), [[toHuman.msgId, "replied"], [fromHuman.msgId, "replied"]]);
+});
+
+test("held messages never expire until release, then use their original creation age before delivery", async () => {
+  env = await startEnv({ ...{ queueTtlMs: 1000 } });
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  await human.request("set_inbound", { name: "receiver", mode: "hold" });
+  const [held] = await send(sender.client, "receiver", "awaiting a human beyond queue TTL");
+  assert.equal(held.status, "held");
+  env.clock.advance(1000);
+  env.daemon.sweep();
+  assert.equal((await logOf(human, held.msgId!)).status, "held");
+  assert.deepEqual(receiver.deliveries, []);
+  assert.deepEqual(sender.deliveries, []);
+  assert.equal((await human.request("release", { msgId: held.msgId })).status, "expired");
+  assert.equal((await logOf(human, held.msgId!)).status, "expired");
+  assert.deepEqual(receiver.deliveries, []);
+  const notice = await sender.nextDelivery();
+  assert.deepEqual([notice.msg.from, notice.msg.replyTo], ["asenq", held.msgId]);
+  assert.equal((await logOf(human, held.msgId!)).status, "expired");
+});
+
+test("expired and dropped originals cannot become replied or be resurrected by late acknowledgements", async () => {
+  env = await startEnv({ ...{ queueTtlMs: 1000 } });
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  await human.request("set_inbound", { name: "receiver", mode: "hold" });
+  const [dropped] = await send(sender.client, "receiver", "original dropped by user");
+  assert.equal((await human.request("drop", { msgId: dropped.msgId })).status, "dropped");
+  const [aged] = await send(sender.client, "receiver", "original expires on release");
+  env.clock.advance(1000);
+  assert.equal((await human.request("release", { msgId: aged.msgId })).status, "expired");
+  await sender.nextDelivery();
+  for (const [original, status] of [[dropped, "dropped"], [aged, "expired"]] as const) {
+    assert.equal((await send(receiver.client, "sender", `late answer to ${status}`, { replyTo: original.msgId }))[0].status, "delivered");
+    await receiver.client.request("ack", { msgId: original.msgId, ok: true });
+    assert.equal((await logOf(human, original.msgId!)).status, status);
+  }
+  assert.deepEqual((await receiver.client.request("inbox", { unread_only: true })).messages, []);
+});
+
+test("failedCount excludes pending, policy rejected, dropped and posted messages and includes every retained failure once", async () => {
+  env = await startEnv({ ...{ queueTtlMs: 1000 } });
+  const human = env.human();
+  const sender = await env.adapter("omp", "sender-key", "sender");
+  const receiver = await env.adapter("omp", "receiver-key", "receiver");
+  await human.request("set_inbound", { name: "receiver", mode: "hold" });
+  const [held] = await send(sender.client, "receiver", "held");
+  const [toDrop] = await send(sender.client, "receiver", "dropped");
+  assert.equal((await human.request("drop", { msgId: toDrop.msgId })).status, "dropped");
+  await human.request("set_inbound", { name: "receiver", mode: "refuse" });
+  const [rejected] = await send(sender.client, "receiver", "rejected");
+  assert.equal(rejected.status, "rejected");
+  assert.equal((await send(sender.client, "human", "human inbox post"))[0].status, "posted");
+  await sender.client.request("channel_send", { channel: "work", text: "channel post" });
+  await human.request("set_inbound", { name: "receiver", mode: "accept" });
+  const gone = await env.watch(isSession("gone", "receiver"));
+  receiver.client.close();
+  await gone.event;
+  const [first] = await send(human, "receiver", "first queued");
+  const [second] = await send(human, "receiver", "second queued");
+  assert.deepEqual([held.status, first.status, second.status], ["held", "queued", "queued"]);
+  const before = await human.sync();
+  assert.equal((await human.request("sync")).failedCount, 0);
+  env.clock.advance(1000);
+  env.daemon.sweep();
+  assert.equal((await human.request("sync")).failedCount, 2);
+  assert.equal((await logOf(human, held.msgId!)).status, "held");
+  const replay = await human.replay(before.watermark);
+  const counts = replay.events.flatMap(({ event }) =>
+    event.type === "message" && event.status === "expired" && "failedCount" in event ? [event.failedCount] : []);
+  assert.deepEqual(counts, [1, 2]);
+  env.daemon.sweep();
+  assert.equal((await human.request("sync")).failedCount, 2);
+  const afterExpiry = await human.sync();
+  await sender.client.request("channel_send", { channel: "work", text: "post after expiry" });
+  const events = (await human.replay(afterExpiry.watermark)).events.filter(({ event }) => event.type === "message");
+  assert.deepEqual(events.map(({ event }) => "failedCount" in event ? event.failedCount : undefined), [2]);
+  await env.restart();
+  assert.equal((await env.human().request("sync")).failedCount, 2);
 });
