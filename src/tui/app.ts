@@ -6,7 +6,7 @@ import type {
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
 import {
-  activitySpans, clipSpans, editorLayout, ellipsize, formatTime, isImportantEvent, justify, layoutTranscript,
+  activitySpans, clipSpans, editorLayout, ellipsize, formatTime, harnessShortName, isImportantEvent, justify, layoutTranscript,
   maxTop, padSpans, paneWidths, stepGrapheme, theme, viewportAt, viewportTop,
   type ActivityFilter, type TranscriptLayout, type Viewport,
 } from "./layout.js";
@@ -15,6 +15,7 @@ import {
   type KeyInput, type MouseInput, type TerminalAdapterOptions, type TerminalCursor, type TerminalFrame,
   type TerminalLine, type TerminalSize, type TerminalSpan,
 } from "./terminal.js";
+import { roundedPanel } from "./panel.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -461,9 +462,16 @@ export class ConsoleApp {
         rows: (width, selected, focused) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
+          const right = [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)];
+          const left = [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])];
+          const labelWidth = left.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+          // Harness metadata yields before a session name or former-name search cue.
+          const harnessWidth = Math.max(0, width - right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0) - labelWidth - 2);
+          const harness = ellipsize(harnessShortName(s.harness), harnessWidth);
+          if (harness) right.unshift({ text: `${harness} `, style: theme.dim });
           return [justify(
-            [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])],
-            [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)],
+            left,
+            right,
             width, pick(selected, focused),
           )];
         },
@@ -714,14 +722,17 @@ export class ConsoleApp {
         ? this.listPane(width, height, y0, 0)
         : this.conversationPane(width, height, y0, 0, true);
     }
-    const left = this.listPane(panes.list, height, y0, 0);
-    const right = this.conversationPane(panes.conversation, height, y0, panes.list + 1, false);
+    const interiorHeight = Math.max(0, height - 2);
+    const left: Pane = interiorHeight ? this.listPane(panes.list - 2, interiorHeight, y0 + 1, 1) : { rows: [] };
+    const right = this.conversationPane(panes.conversation - 2, interiorHeight, y0 + 1, panes.list + 2, false);
+    const listTitle: TerminalLine = [{ text: TABS.find(([tab]) => tab === this.tab)![1], style: theme.accentBold }];
+    const leftRows = roundedPanel(listTitle, left.rows, panes.list, height, this.focus === "list");
+    const rightRows = roundedPanel(
+      this.title(panes.conversation - 6, false, y0, panes.list + 4),
+      right.rows, panes.conversation, height, this.focus === "transcript" || this.focus === "composer",
+    );
     const rows: TerminalLine[] = [];
-    for (let row = 0; row < height; row++) {
-      const leftRow = padSpans(typeof left.rows[row] === "string" ? [{ text: left.rows[row] as string }] : (left.rows[row] as TerminalSpan[] | undefined) ?? [], panes.list);
-      const rightRow = typeof right.rows[row] === "string" ? [{ text: right.rows[row] as string }] : (right.rows[row] as TerminalSpan[] | undefined) ?? [];
-      rows.push([...leftRow, { text: "│", style: this.focus === "list" ? theme.accent : theme.dim }, ...rightRow]);
-    }
+    for (let row = 0; row < height; row++) rows.push([...leftRows[row], { text: " " }, ...rightRows[row]]);
     return { rows, ...(left.cursor ?? right.cursor ? { cursor: left.cursor ?? right.cursor } : {}) };
   }
 
@@ -808,8 +819,12 @@ export class ConsoleApp {
   }
 
   private conversationPane(width: number, height: number, y0: number, x0: number, narrow: boolean): Pane {
+    if (height <= 0) {
+      if (this.panel) this.panel.height = 0;
+      return { rows: [] };
+    }
     const rows: TerminalLine[] = [];
-    const titled = height >= 3;
+    const titled = narrow && height >= 3;
     if (titled) rows.push(this.title(width, narrow, y0, x0));
     if (this.panel) return this.panelPane(rows, width, height, y0, x0);
     const target = this.composeTarget();

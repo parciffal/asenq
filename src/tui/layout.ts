@@ -4,7 +4,10 @@ import {
   type TerminalLine, type TerminalSpan, type TerminalStyle,
 } from "./terminal.js";
 
-/** Semantic styles. Colors are foreground-only so the terminal's own background shows through. */
+/**
+ * Semantic styles use foreground colors so the terminal's own background shows through.
+ * The terminal adapter drops unsupported colors, retaining bold/dim/inverse fallback.
+ */
 export const theme = {
   brand: { foreground: "brightCyan", bold: true },
   accent: { foreground: "cyan" },
@@ -13,6 +16,8 @@ export const theme = {
   agent: { foreground: "magenta", bold: true },
   dim: { dim: true },
   bold: { bold: true },
+  border: { foreground: "brightBlack", dim: true },
+  key: { inverse: true, dim: true },
   ok: { foreground: "green" },
   warn: { foreground: "yellow" },
   bad: { foreground: "red", bold: true },
@@ -27,6 +32,12 @@ export function statusStyle(status: MsgStatus | string): TerminalStyle {
   if (status === "delivered" || status === "posted") return theme.ok;
   if (status === "queued" || status === "held") return theme.warn;
   return theme.bad;
+}
+
+export function harnessShortName(harness: string): string {
+  if (harness === "claude") return "cc";
+  if (harness === "opencode") return "oc";
+  return harness;
 }
 
 /** Truncate a label to `width` cells, marking any cut with an ellipsis. */

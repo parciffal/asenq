@@ -174,17 +174,25 @@ test("wide console lists live sessions by recent activity, collapses the archive
   assert.equal(await unread(human, alpha.session.id), 1, "moving through the list does not mark a conversation read");
   rows = ui.rows();
   assertWithin(ui);
-  for (const row of rows.slice(1, -1)) {
+  const top = rows[1];
+  assert.ok(top.startsWith("╭─ Sessions "), "list title is inset into its rounded top border");
+  assert.ok(top.slice(listWidth + 1).startsWith("╭─ "), "conversation has its own rounded top border");
+  assert.ok(rows.at(-2)!.startsWith("╰"), "list panel has a rounded bottom border");
+  assert.ok(rows.at(-2)!.slice(listWidth + 1).startsWith("╰"), "conversation panel has a rounded bottom border");
+  for (const row of rows.slice(2, -2)) {
     const left = truncateTerminalText(row, listWidth);
-    assert.equal(terminalTextWidth(left), listWidth, `list pane is padded: ${row}`);
-    assert.equal(row.slice(left.length)[0], "│", `separator stays in its column: ${row}`);
+    assert.equal(terminalTextWidth(left), listWidth, `list panel is padded: ${row}`);
+    assert.equal(left[0], "│", `list left edge is intact: ${row}`);
+    assert.equal(left.at(-1), "│", `list right edge is intact: ${row}`);
+    assert.equal(row.slice(left.length, left.length + 2), " │", `panels remain separate: ${row}`);
+    assert.equal(row.at(-1), "│", `conversation right edge is intact: ${row}`);
   }
-  const conversation = rows.slice(1, -1).map((row) => row.slice(truncateTerminalText(row, listWidth).length + 1)).join("");
+  const conversation = rows.slice(2, -2).map((row) => row.slice(truncateTerminalText(row, listWidth).length + 2, -1)).join("");
   assert.ok(conversation.replace(/\s+/g, "").includes(long.replace(/\s+/g, "")), "the whole message body is visible");
 
   await ui.press("/");
   await ui.type("legacy");
-  await ui.until(() => ui.rows().some((row) => row.includes("retired") && row.includes("was l")), "former-name search");
+  await ui.until(() => ui.rows().some((row) => truncateTerminalText(row, listWidth).includes("retired")), "former-name search finds the archived session");
   await ui.press("ESCAPE");
   assert.equal(ui.rows().findIndex((row) => row.includes("retired")), -1, "clearing search collapses the archive again");
 });
@@ -198,8 +206,10 @@ test("narrow console reaches every wrapped row and marks an open conversation re
 
   const ui = await startConsole(40, 12);
   await ui.until(() => ui.rows().some((row) => row.includes("alpha")), "picker");
+  assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow picker is not boxed");
   assert.equal(await unread(human, alpha.session.id), 1, "the picker alone does not mark anything read");
   await ui.press("ENTER");
+  assert.ok(!ui.rows().some((row) => /[╭╮╰╯]/.test(row)), "narrow conversation is not boxed");
   await ui.until(async () => await unread(human, alpha.session.id) === 0, "opening shows the newest row and reads it");
 
   await ui.press("HOME");
@@ -258,4 +268,192 @@ test("new arrivals keep a scrolled reader in place, and the composer sends once 
   assert.equal(alpha.deliveries.length, pending + 1, "sent exactly once");
   assert.equal(alpha.deliveries.at(-1)!.msg.text, "hello\nthere");
   assert.ok(!ui.rows().some((row) => row.startsWith("› hello") || row.includes("› there")), "draft cleared after send");
+});
+
+test("session list shows short harness labels without losing state or unread badges", async () => {
+  env = await startEnv();
+  const cc = await env.adapter("claude", "cc-key", "reviewer");
+  await env.adapter("opencode", "oc-key", "planner");
+  await env.adapter("omp", "omp-key", "writer");
+  await cc.client.request("send", { to: "human", text: "review is ready" });
+  const ui = await startConsole(120, 20);
+  const listWidth = paneWidths(120)!.list;
+  await ui.until(() => ui.rows().some((row) => row.includes("writer")), "all sessions");
+  const list = ui.rows().map((row) => truncateTerminalText(row, listWidth));
+  assert.match(list.find((row) => row.includes("reviewer"))!, /\bcc\b.*\+1.*live/);
+  assert.match(list.find((row) => row.includes("planner"))!, /\boc\b.*live/);
+  assert.match(list.find((row) => row.includes("writer"))!, /\bomp\b.*live/);
+  assertWithin(ui);
+});
+
+test("rounded panes resize at the wide boundary without overflowing or moving mouse and cursor targets onto borders", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "panel-alpha", "alpha");
+  const beta = await env.adapter("omp", "panel-beta", "beta");
+  await alpha.client.request("send", { to: "human", text: "alpha-message-tail" });
+  await beta.client.request("send", { to: "human", text: "beta-message-tail" });
+  let handlers: TerminalAdapterOptions = {};
+  let frame: TerminalFrame = { lines: [] };
+  const size = { columns: 100, rows: 18 };
+  const app = new ConsoleApp({
+    screen: (options) => {
+      handlers = options;
+      return { size, start() {}, render(next) { frame = next; }, cleanup() {} };
+    },
+  });
+  const rows = (): string[] => frame.lines.map(lineText);
+  const press = async (name: string): Promise<void> => {
+    const text = [...name].length === 1 ? name : undefined;
+    handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: false, alt: false, shift: false });
+    await app.idle();
+  };
+  const resize = async (columns: number, height: number): Promise<void> => {
+    Object.assign(size, { columns, rows: height });
+    handlers.onResize?.(size);
+    await app.idle();
+  };
+  const click = async (column: number, row: number): Promise<void> => {
+    handlers.onMouse?.({ name: "MOUSE_LEFT_BUTTON_PRESSED", action: "press", button: "left", column, row, ctrl: false, alt: false, shift: false });
+    await app.idle();
+  };
+  try {
+    void app.run();
+    await app.idle();
+    assert.ok(rows().some((row) => row.includes("beta-message-tail")), "initial conversation loaded");
+    for (const columns of [79, 80, 81, 100]) {
+      for (const height of [0, 1, 2, 3, 4, 5, 6, 8, 18]) {
+        await resize(columns, height);
+        const rendered = rows();
+        assert.ok(rendered.length <= height, `${columns}×${height}: frame exceeds the terminal height`);
+        for (const row of rendered) assert.ok(terminalTextWidth(row) <= columns, `${columns}×${height}: ${row}`);
+        if (columns < 80) {
+          assert.ok(rendered.every((row) => !row.includes("╭") && !row.includes("╰")), "narrow picker stays unboxed");
+          continue;
+        }
+        const top = height >= 4 ? 1 : 0;
+        const bottom = height >= 2 ? 1 : 0;
+        const body = rendered.slice(top, height - bottom);
+        const listWidth = paneWidths(columns)!.list;
+        for (const row of body) {
+          assert.equal(terminalTextWidth(row), columns, "both outer pane widths fill the frame");
+          assert.equal(row[listWidth], " ", "exactly one column separates the outer panels");
+        }
+        if (body.length) {
+          assert.ok(body[0]!.startsWith("╭─ Sessions"), "picker title is inset in its top border");
+          assert.ok(body[0]!.slice(listWidth + 1).startsWith("╭─ beta"), "conversation title is inset in its top border");
+          assert.equal(body[0]![listWidth - 1], "╮");
+          assert.ok(body[0]!.endsWith("╮"));
+        }
+        if (body.length >= 2) {
+          assert.equal(body.at(-1)![0], "╰");
+          assert.equal(body.at(-1)![listWidth - 1], "╯");
+          assert.equal(body.at(-1)![listWidth + 1], "╰");
+          assert.ok(body.at(-1)!.endsWith("╯"));
+        }
+        for (const row of body.slice(1, -1)) {
+          assert.equal(row[0], "│");
+          assert.equal(row[listWidth - 1], "│");
+          assert.equal(row[listWidth + 1], "│");
+          assert.ok(row.endsWith("│"));
+        }
+      }
+    }
+    assert.equal(await unread(human, alpha.session.id), 1, "resize and list focus do not read alpha");
+    assert.equal(await unread(human, beta.session.id), 1, "resize and list focus do not read beta");
+
+    await resize(100, 18);
+    const listWidth = paneWidths(100)!.list;
+    await press("/");
+    assert.deepEqual(frame.cursor, { row: 2, column: 3 }, "search cursor is inside the bordered picker");
+    for (let index = 0; index < 40; index++) await press("z");
+    assert.deepEqual(frame.cursor, { row: 2, column: listWidth - 2 }, "long search cursor stops before the right border");
+    await press("ESCAPE");
+    const alphaRow = rows().findIndex((row) => row.slice(0, listWidth).includes("alpha"));
+    assert.ok(alphaRow >= 2);
+    await click(1, alphaRow);
+    assert.ok(rows()[1]!.slice(listWidth + 1).startsWith("╭─ alpha"), "clicking the inset list row selects alpha");
+    assert.equal(await unread(human, alpha.session.id), 1, "list click does not read the conversation");
+    const messageRow = rows().findIndex((row) => row.slice(listWidth + 2).includes("alpha-message-tail"));
+    assert.ok(messageRow >= 2);
+    await click(listWidth + 1, messageRow);
+    assert.equal(await unread(human, alpha.session.id), 1, "the conversation border is not a transcript hit");
+    await click(listWidth + 2, messageRow);
+    assert.equal(await unread(human, alpha.session.id), 0, "the inset transcript hit reads the visible newest row");
+    const composerRow = rows().findIndex((row) => row.slice(listWidth + 2).startsWith("› "));
+    assert.ok(composerRow > messageRow);
+    await click(listWidth + 2, composerRow);
+    await press("x");
+    assert.deepEqual(frame.cursor, { row: composerRow, column: listWidth + 5 }, "composer cursor includes border and prompt insets");
+    await resize(80, 8);
+    assert.ok(frame.cursor && frame.cursor.column > paneWidths(80)!.list + 1 && frame.cursor.column < 79);
+    assert.ok(frame.cursor.row >= 2 && frame.cursor.row < 6, "resized composer cursor stays above the bottom border");
+    await press("ENTER");
+    assert.equal((await alpha.nextDelivery()).msg.text, "x", "mouse-focused composer sends to the selected identity after resize");
+
+    await press("ESCAPE");
+    await press("a");
+    assert.ok(rows().every((row) => !row.includes("╭") && !row.includes("╰")), "activity remains full-width");
+    await press("?");
+    assert.ok(rows().every((row) => !row.includes("╭") && !row.includes("╰")), "command palette remains unboxed");
+  } finally {
+    handlers.onInterrupt?.();
+    await app.idle();
+  }
+});
+
+test("wide bordered conversation keeps every wrapped body row reachable and reads only the visible last incoming row", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "bordered-reader", "alpha");
+  const text = [
+    ...Array.from({ length: 12 }, (_, index) => `paragraph ${index + 1} carries words across the inset conversation 漢字 and preserves all content`),
+    "",
+    "final-bordered-row-marker",
+  ].join("\n");
+  await alpha.client.request("send", { to: "human", text });
+  const ui = await startConsole(80, 8);
+  await ui.until(() => ui.rows().some((row) => row.includes("final-bordered-row-marker")), "bordered conversation preview");
+  ui.size.rows = 4;
+  await ui.press("ENTER");
+  assertWithin(ui);
+  assert.equal(await unread(human, alpha.session.id), 1, "a title and bottom border alone do not expose or read the message");
+  ui.size.rows = 8;
+  await ui.press("u");
+  await ui.press("HOME");
+  const listWidth = paneWidths(80)!.list;
+  const seen = new Set<string>();
+  let reached = false;
+  for (let step = 0; step < 120; step++) {
+    assertWithin(ui);
+    const body = ui.rows().slice(2, -2).map((row) => row.slice(truncateTerminalText(row, listWidth).length + 2, -1).trim());
+    for (const row of body) seen.add(row);
+    reached = body.includes("final-bordered-row-marker");
+    assert.equal(await unread(human, alpha.session.id), reached ? 0 : 1, "the marker advances only when the final incoming body row is on screen");
+    if (reached) break;
+    await ui.press("PAGE_DOWN");
+  }
+  assert.ok(reached, "the last row is reachable through the bordered viewport");
+  for (const row of wrapTerminalText(text, paneWidths(80)!.conversation - 4)) {
+    assert.ok(seen.has(row.trim()), `reached wrapped row: ${row}`);
+  }
+});
+
+test("unread archived sessions remain distinguishable at the 80-column boundary", async () => {
+  env = await startEnv();
+  const alpha = await env.adapter("omp", "archived-alpha", "alpha");
+  const bravo = await env.adapter("omp", "archived-bravo", "bravo");
+  for (const session of [alpha, bravo]) {
+    await session.client.request("send", { to: "human", text: "unread archived conversation" });
+    await session.client.request("unregister");
+  }
+  const ui = await startConsole(80, 18);
+  await ui.press("ENTER");
+  const listWidth = paneWidths(80)!.list;
+  const archived = ui.rows().map((row) => truncateTerminalText(row, listWidth)).filter((row) => row.includes("archived"));
+  assert.equal(archived.length, 2);
+  assert.ok(archived.some((row) => row.includes("al")), "alpha retains a visible name prefix");
+  assert.ok(archived.some((row) => row.includes("br")), "bravo retains a distinct visible name prefix");
+  for (const row of archived) assert.ok(row.includes("+1"), "unread count remains visible");
+  assertWithin(ui);
 });
