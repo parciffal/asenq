@@ -156,7 +156,7 @@ export class ConsoleApp {
   private panel?: Panel;
   private form?: Form;
   private palette?: { query: string; selected: number; top: number };
-  private finder?: { query: string; selected: number; top: number };
+  private finder?: { query: string; selected?: string; top: number };
   private notice?: Notice;
   private noticeTimer?: NodeJS.Timeout;
   private errorDetail = "";
@@ -696,8 +696,15 @@ export class ConsoleApp {
   }
 
   private openFinder(): void {
-    if (!this.finder) this.finder = { query: "", selected: 0, top: 0 };
+    if (!this.finder) this.finder = { query: "", top: 0 };
     this.render();
+  }
+
+  private finderIndex(items: JumpItem[]): number {
+    const finder = this.finder!;
+    const index = Math.max(0, items.findIndex((item) => item.key === finder.selected));
+    finder.selected = items[index]?.key;
+    return index;
   }
 
   private async jumpTo(key: string): Promise<void> {
@@ -721,19 +728,22 @@ export class ConsoleApp {
   private async finderKey(k: KeyInput): Promise<void> {
     const finder = this.finder!;
     const items = this.jumpItems();
-    finder.selected = Math.max(0, Math.min(finder.selected, items.length - 1));
+    const selected = this.finderIndex(items);
     if (k.name === "ESCAPE") this.finder = undefined;
     else if (k.name === "UP" || k.name === "DOWN") {
-      finder.selected = Math.max(0, Math.min(items.length - 1, finder.selected + (k.name === "UP" ? -1 : 1)));
+      const index = Math.max(0, Math.min(items.length - 1, selected + (k.name === "UP" ? -1 : 1)));
+      finder.selected = items[index]?.key;
     } else if (k.name === "ENTER" || k.name === "KP_ENTER") {
-      const item = items[finder.selected];
+      const item = items[selected];
       if (item) return this.jumpTo(item.key);
     } else if (k.name === "BACKSPACE" || k.name === "CTRL_U") {
       finder.query = k.name === "CTRL_U" ? "" : finder.query.slice(0, stepGrapheme(finder.query, finder.query.length, -1));
-      finder.selected = finder.top = 0;
+      finder.selected = undefined;
+      finder.top = 0;
     } else if (k.text && !k.ctrl) {
       finder.query += cleanInput(k.text).replace(/\n/g, " ");
-      finder.selected = finder.top = 0;
+      finder.selected = undefined;
+      finder.top = 0;
     }
     this.render();
   }
@@ -741,7 +751,7 @@ export class ConsoleApp {
   private finderPane(width: number, height: number, y0: number): Pane {
     const finder = this.finder!;
     const items = this.jumpItems();
-    finder.selected = Math.max(0, Math.min(finder.selected, items.length - 1));
+    const selectedIndex = this.finderIndex(items);
     const boxed = width >= 6 && height >= 4;
     const inset = boxed ? 1 : 0;
     const innerWidth = Math.max(0, width - 2 * inset);
@@ -757,13 +767,13 @@ export class ConsoleApp {
       { text: query.rows[query.cursorRow] },
     ], innerWidth));
     const available = Math.max(0, innerHeight - rows.length);
-    if (finder.selected < finder.top) finder.top = finder.selected;
-    if (finder.selected >= finder.top + available) finder.top = finder.selected - available + 1;
+    if (selectedIndex < finder.top) finder.top = selectedIndex;
+    if (selectedIndex >= finder.top + available) finder.top = selectedIndex - available + 1;
     finder.top = Math.max(0, Math.min(finder.top, items.length - available));
     if (!items.length && available) rows.push(clipSpans([{ text: "No matching sessions or channels", style: theme.dim }], innerWidth));
     for (let index = finder.top; index < Math.min(items.length, finder.top + available); index++) {
       const item = items[index];
-      const selected = index === finder.selected;
+      const selected = item.key === finder.selected;
       const left: TerminalSpan[] = [
         this.marker(selected),
         { text: item.session ? item.name : `#${item.name}`, style: selected ? theme.accentBold : theme.bold },
@@ -1357,7 +1367,8 @@ export class ConsoleApp {
     const clean = cleanInput(text);
     if (this.finder) {
       this.finder.query += clean.replace(/\n/g, " ");
-      this.finder.selected = this.finder.top = 0;
+      this.finder.selected = undefined;
+      this.finder.top = 0;
     } else if (this.palette) this.palette.query += clean.replace(/\n/g, " ");
     else if (this.form) this.formInsert(clean);
     else if (this.searching) this.query += clean.replace(/\n/g, " ").toLowerCase();
@@ -1636,7 +1647,9 @@ export class ConsoleApp {
     const hit = this.hits.find((h) => h.row === m.row && m.column >= h.start && m.column < h.end);
     if (this.finder) {
       if (m.action === "wheel-up" || m.action === "wheel-down") {
-        this.finder.selected = Math.max(0, this.finder.selected + (m.action === "wheel-up" ? -1 : 1));
+        const items = this.jumpItems();
+        const index = Math.max(0, Math.min(items.length - 1, this.finderIndex(items) + (m.action === "wheel-up" ? -1 : 1)));
+        this.finder.selected = items[index]?.key;
         return this.render();
       }
       if (m.action === "press" && m.button === "left" && hit?.target.kind === "finder") {

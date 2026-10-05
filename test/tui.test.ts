@@ -886,3 +886,37 @@ test("pasting into quick jump filters results without leaking into a suspended c
   assert.equal((await alpha.nextDelivery()).msg.text, "paste-safe draft", "pasted finder text does not enter the saved draft");
   assert.equal(reviewer.deliveries.length, 0, "filtering does not send to a result");
 });
+
+test("quick jump keeps the highlighted identity through live result reordering", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const alpha = await env.adapter("omp", "jump-churn-alpha", "alpha");
+  const bravo = await env.adapter("omp", "jump-churn-bravo", "bravo");
+  await env.adapter("omp", "jump-churn-charlie", "charlie");
+  await bravo.client.request("send", { to: "human", text: "stable-bravo-history" });
+  const ui = await startConsole(120, 32);
+  await ui.press("CTRL_K");
+  await ui.press("DOWN");
+  assert.ok(ui.rows().some((row) => row.includes("› bravo")), "bravo is highlighted");
+  await env.adapter("omp", "jump-churn-earlier", "aardvark");
+  await ui.until(() => ui.rows().some((row) => row.includes("aardvark")), "inserted earlier result");
+  assert.ok(ui.rows().some((row) => row.includes("› bravo")), "insertion retains the highlighted identity");
+  await alpha.client.request("unregister");
+  await ui.until(() => ui.rows().some((row) => /alpha.*archived/.test(row)), "earlier result changes state");
+  assert.ok(ui.rows().some((row) => row.includes("› bravo")), "state sorting retains the highlighted identity");
+  await human.request("rename", { from: "bravo", name: "zz-bravo" });
+  await ui.until(() => ui.rows().some((row) => row.includes("zz-bravo")), "highlighted identity renamed");
+  assert.ok(ui.rows().some((row) => row.includes("› zz-bravo")), "rename retains the highlighted identity");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("stable-bravo-history")), "Enter opens highlighted identity");
+
+  await human.request("channel_send", { channel: "zebra", text: "stable-zebra-history" });
+  await ui.press("CTRL_K");
+  await ui.type("#");
+  await ui.until(() => ui.rows().some((row) => row.includes("#zebra")), "channel result");
+  await human.request("channel_send", { channel: "aardvark", text: "other-channel-history" });
+  await ui.until(() => ui.rows().some((row) => row.includes("#aardvark")), "inserted earlier channel");
+  assert.ok(ui.rows().some((row) => row.includes("› #zebra")), "channel insertion retains the highlighted channel");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("stable-zebra-history")), "Enter opens highlighted channel");
+});
