@@ -1,6 +1,6 @@
 import type {
   ChannelSummary, ControlAction, Harness, Inbound, InboxSummary, Kind, MsgStatus, PositionedEvent, ReadScope, ReadState,
-  PingStatus, Role, SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
+  PingStatus, ReplacementResult, Role, SessionIdentity, SessionState, StoredMessage, TailEvent, WireMsg,
 } from "../shared/protocol.js";
 import type { Db } from "../shared/sqlite.js";
 
@@ -670,17 +670,62 @@ export class Store {
 
   /** Terminal closure and identity-association deletion commit together. */
   closeIdentity(id: string, at: number): SessionIdentity {
+    return this.transaction(() => this.closeIdentityMutation(id, at));
+  }
+
+  private closeIdentityMutation(id: string, at: number): SessionIdentity {
+    this.db.run(
+      "UPDATE session_identities SET state='removed',removed_at=COALESCE(removed_at,?),closed_at=? WHERE id=? AND closed_at IS NULL",
+      at, at, id,
+    );
+    this.db.run("DELETE FROM sessions WHERE id=?", id);
+    this.db.run("DELETE FROM session_harness_ids WHERE identity_id=?", id);
+    this.db.run("DELETE FROM claude_lineage WHERE identity_id=?", id);
+    this.db.run("DELETE FROM channel_members WHERE session_id=?", id);
+    this.db.run("UPDATE session_identities SET ping=NULL WHERE id=?", id);
+    return this.identity(id)!;
+  }
+
+  replaceIdentity(fromId: string, toId: string, at: number): ReplacementResult & { channels: string[]; messages: MsgRow[] } {
     return this.transaction(() => {
+      const from = this.identity(fromId)!;
+      const to = this.identity(toId)!;
+      const reserved = new Set<string>();
+      for (const identity of this.db.all<IdentityRow>(
+        "SELECT * FROM session_identities WHERE state IN ('live','gone') AND closed_at IS NULL AND id!=? AND id!=?",
+        fromId, toId,
+      )) {
+        reserved.add(identity.name);
+        for (const name of JSON.parse(identity.previous_names) as string[]) reserved.add(name);
+      }
+      const previous = [...to.previousNames];
+      const skippedNames: string[] = [];
+      for (const name of [...from.previousNames, from.name]) {
+        if (name === to.name || skippedNames.includes(name)) continue;
+        if (reserved.has(name)) skippedNames.push(name);
+        else if (!previous.includes(name)) previous.push(name);
+      }
       this.db.run(
-        "UPDATE session_identities SET state='removed',removed_at=COALESCE(removed_at,?),closed_at=? WHERE id=? AND closed_at IS NULL",
-        at, at, id,
+        "UPDATE session_identities SET previous_names=?,role=COALESCE(?,role) WHERE id=?",
+        JSON.stringify(previous), from.role ?? null, toId,
       );
-      this.db.run("DELETE FROM sessions WHERE id=?", id);
-      this.db.run("DELETE FROM session_harness_ids WHERE identity_id=?", id);
-      this.db.run("DELETE FROM claude_lineage WHERE identity_id=?", id);
-      this.db.run("DELETE FROM channel_members WHERE session_id=?", id);
-      this.db.run("UPDATE session_identities SET ping=NULL WHERE id=?", id);
-      return this.identity(id)!;
+      const channels = this.db.all<{ channel: string }>(
+        "SELECT channel FROM channel_members WHERE session_id=? ORDER BY channel", fromId,
+      ).map((row) => row.channel);
+      this.db.run(
+        "INSERT OR IGNORE INTO channel_members(channel,session_id) SELECT channel,? FROM channel_members WHERE session_id=?",
+        toId, fromId,
+      );
+      const waiting = this.db.all<{ id: string }>(
+        "SELECT id FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY ord", fromId,
+      );
+      this.db.run(
+        "UPDATE messages SET to_session=? WHERE to_session=? AND status IN ('queued','held')", toId, fromId,
+      );
+      return {
+        from: this.closeIdentityMutation(fromId, at), to: this.identity(toId)!, skippedNames,
+        channels, messages: waiting.map((row) => this.msg(row.id)!),
+      };
     });
   }
 

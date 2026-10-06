@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import type { ChannelSummary, ControlAction, ListedSession, SendResult, SessionIdentity, TailEvent } from "../shared/protocol.js";
+import { AsenqError, type ChannelSummary, type ControlAction, type ListedSession, type ReplacementResult, type Role, type SendResult, type SessionIdentity, type TailEvent } from "../shared/protocol.js";
 import { formatSendResults, formatSessions } from "../shared/tools.js";
 
 type LoggedMsg = {
@@ -206,6 +206,34 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       const r = await client.request("rename", { from: argv[0], name: argv[1] });
       out(`renamed ${argv[0]} → ${String(r.name)}`);
       return 0;
+    }
+    case "replace": {
+      const { values, positionals } = parseArgs({
+        args: argv, allowPositionals: true,
+        options: { "from-id": { type: "string" }, "to-id": { type: "string" } },
+      });
+      const fromId = values["from-id"];
+      const toId = values["to-id"];
+      const hasFromId = fromId !== undefined;
+      const hasToId = toId !== undefined;
+      const usage = "usage: asenq replace <from> <to> | asenq replace --from-id <id> <to> | asenq replace <from> --to-id <id> | asenq replace --from-id <id> --to-id <id>";
+      if ((hasFromId && !fromId) || (hasToId && !toId)
+        || positionals.length !== Number(!hasFromId) + Number(!hasToId)) throw new Error(usage);
+      let positional = 0;
+      const from = hasFromId ? undefined : positionals[positional++];
+      const to = hasToId ? undefined : positionals[positional++];
+      try {
+        const result = await client.request("replace", {
+          ...(hasFromId ? { fromId } : { from }),
+          ...(hasToId ? { toId } : { to }),
+        }) as ReplacementResult;
+        out(`replaced ${result.from.name} (${result.from.id}) with ${result.to.name} (${result.to.id}); source closed and archived`);
+        if (result.skippedNames.length) out(`skipped names: ${result.skippedNames.join(", ")}`);
+        return 0;
+      } catch (e) {
+        if (e instanceof AsenqError) throw new Error(`replace failed (${e.code}): ${e.message}`);
+        throw e;
+      }
     }
     case "inbound": {
       need(argv, 2, "usage: asenq inbound <name> accept|hold|refuse");

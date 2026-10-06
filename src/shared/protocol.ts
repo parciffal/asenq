@@ -1,4 +1,4 @@
-export const PROTOCOL = 15;
+export const PROTOCOL = 16;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -98,6 +98,12 @@ export type ListedSession = {
   harnessSessionId: string | null;
   resumeCommand?: string;
   you: boolean;
+};
+
+export type ReplacementResult = {
+  from: SessionIdentity;
+  to: SessionIdentity;
+  skippedNames: string[];
 };
 
 export type ChannelSummary = {

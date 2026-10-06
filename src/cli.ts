@@ -15,6 +15,9 @@ const USAGE = `usage: asenq <command>
   log [--session name] [--id msgId] [--limit n]
   inbox                                messages addressed to "human"
   rename <old> <new>
+  replace <from> <to>                   move a session onto a live one
+  replace --from-id <id> <to> | replace <from> --to-id <id>
+  replace --from-id <id> --to-id <id>
   close <name|identity>                 terminally archive a session
   purge <name|identity> | purge --all    permanently delete archived conversations
   inbound <name> accept|hold|refuse

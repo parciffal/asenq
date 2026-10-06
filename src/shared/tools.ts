@@ -1,5 +1,5 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type ListedSession, type MsgStatus, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ControlAction, type ListedSession, type MsgStatus, type ReplacementResult, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
 import { renderMessageBody } from "./render.js";
 
 export type ParamSpec = {
@@ -94,6 +94,21 @@ export const TOOLS: ToolSpec[] = [
     label: "Asenq Rename",
     description: `Rename this session on asenq. Messages to former names still reach this identity under its current name. Returns name_taken if another live or reconnecting session holds the new name as its current or former name. ${NAMES_HINT}`,
     params: { name: { type: "string", description: "New name: lowercase letters, digits, - and _" } },
+  },
+  {
+    name: "asenq_replace",
+    label: "Asenq Replace",
+    description:
+      "Move a non-closed source identity's role, channel memberships, unreserved former-name chain and queued or held messages to a live destination, then close and archive the source. " +
+      "Provide exactly one of from or from_id and exactly one of to or to_id; names use the daemon's ranked lookup, while stable ids select an identity directly. " +
+      "The destination keeps its name, cwd, inbound policy, history, read position and harness association. An orchestrator must share a channel with the source; the human may replace any source. " +
+      "Replacement can partially succeed: the reply's skippedNames lists source names still held by another live or reconnecting identity. Other names and waiting messages still move. Late acknowledgments cannot change moved messages or destination state, and already-received messages cannot be un-received.",
+    params: {
+      from: { type: "string", optional: true, description: "Source current or former name; provide exactly one of from and from_id" },
+      to: { type: "string", optional: true, description: "Live destination current or former name; provide exactly one of to and to_id" },
+      from_id: { type: "string", optional: true, description: "Source stable identity id; provide exactly one of from and from_id" },
+      to_id: { type: "string", optional: true, description: "Live destination stable identity id; provide exactly one of to and to_id" },
+    },
   },
   {
     name: "asenq_set_role",
@@ -204,6 +219,12 @@ export function formatSendResults(results: SendResult[]): string {
   return results.map((r) => `${r.to} ${r.msgId ?? "-"} ${r.status}${r.reason ? ` (${r.reason})` : ""}`).join("\n");
 }
 
+export function formatReplace(result: ReplacementResult): string {
+  const lines = [`replaced ${result.from.name} (${result.from.id}) with ${result.to.name} (${result.to.id}); source closed and archived`];
+  if (result.skippedNames.length) lines.push(`skipped names: ${result.skippedNames.join(", ")}`);
+  return lines.join("\n");
+}
+
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
@@ -295,6 +316,12 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
       case "asenq_rename": {
         const r = await client.request("rename", { ...who, name: args.name });
         return `renamed to ${String(r.name)}`;
+      }
+      case "asenq_replace": {
+        const result = await client.request("replace", {
+          ...who, from: args.from, fromId: args.from_id, to: args.to, toId: args.to_id,
+        }) as ReplacementResult;
+        return formatReplace(result);
       }
       case "asenq_set_role": {
         await client.request("set_role", { ...who, name: args.name, role: args.role === "unset" ? null : args.role });

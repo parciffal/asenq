@@ -7,7 +7,7 @@ import {
   ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, MENTION_KEYWORDS, NAME_RE, PROBE_MS,
   PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, hasMentionOpening, slug,
   type ChannelSendResult, type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type ListedSession, type MsgStatus, type PositionedEvent,
-  type PingStatus, type Push, type ReadMutationResult, type ReadScope, type Req, type SendResult, type SessionIdentity, type TailEvent,
+  type PingStatus, type Push, type ReadMutationResult, type ReadScope, type ReplacementResult, type Req, type SendResult, type SessionIdentity, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
 import { resumeCommand } from "../shared/resume.js";
@@ -47,7 +47,8 @@ type RouteTarget = Pick<SessionIdentity, "id" | "name" | "inbound" | "state">;
 
 type Ack = { ok: boolean; reason?: string };
 type LineageDecision = { identityId?: string; reason?: string };
-type Inflight = { conn: Conn; timer: NodeJS.Timeout; settle(a: Ack): void };
+type DeliveryAttempt = { recipientId: string | null; settle(status: MsgStatus): void };
+type Inflight = { conn: Conn; sessionId: string; timer: NodeJS.Timeout; settle(a: Ack): void };
 type PendingPing = {
   sessionId: string; requester: Conn; conn?: Conn; deadline: number; timer?: NodeJS.Timeout;
   settle(ping: PingStatus): void;
@@ -156,8 +157,9 @@ export class Daemon {
   private delivery = new Map<string, Conn>();
   private inflight = new Map<string, Inflight>();
   private flushing = new Set<string>();
+  private flushRequested = new Set<string>();
   /** Messages with a delivery attempt in progress; timers and sends must not write them twice. */
-  private delivering = new Set<string>();
+  private delivering = new Map<string, DeliveryAttempt>();
   private dupSeen = new Map<string, number>();
   private buckets = new Map<string, { tokens: number; at: number }>();
   private lastSeen = new Map<string, number>();
@@ -306,13 +308,20 @@ export class Daemon {
       id = p.as;
     } else if (p.op === "ack") {
       const recipient = typeof p.msgId === "string" ? this.store.msg(p.msgId)?.to_session : undefined;
-      if (recipient && (c.bound.has(recipient) || c.attached === recipient)) id = recipient;
+      id = this.implicitAckRecipient(c, recipient);
     } else if (c.bound.size === 1) {
       id = [...c.bound][0];
     } else if (c.bound.size === 0) {
       id = c.attached;
     }
     if (id && this.store.session(id)) this.touchContact(id);
+  }
+
+  private implicitAckRecipient(c: Conn, recipient: string | null | undefined): string | undefined {
+    if (!recipient || (!c.bound.has(recipient) && c.attached !== recipient)) return;
+    // Closed bindings stay attached, so an old unselected ACK could otherwise select a moved recipient.
+    for (const id of c.bound) if (this.delivery.get(id) !== c) return;
+    return recipient;
   }
 
   private touchContact(sessionId: string, claudeSessionId?: string): void {
@@ -389,6 +398,8 @@ export class Daemon {
       case "close":
         this.requireHuman(this.sender(c, p), "close sessions");
         return this.opClose(p);
+      case "replace":
+        return this.opReplace(this.sender(c, p), p);
       case "purge":
         this.requireHuman(this.sender(c, p), "purge archived conversations");
         return this.opPurge(p);
@@ -430,8 +441,14 @@ export class Daemon {
         const msgId = str(p, "msgId", true);
         const ack: Ack = { ok: p.ok === true, reason: str(p, "reason") };
         const f = this.inflight.get(msgId);
-        if (f) f.settle(ack);
-        else if (ack.ok && this.store.msg(msgId)?.status === "queued") this.setStatus(msgId, "delivered");
+        const row = this.store.msg(msgId);
+        const as = str(p, "as");
+        const recipientId = as ?? this.implicitAckRecipient(c, row?.to_session);
+        if (recipientId && row?.to_session === recipientId && c.bound.has(recipientId)
+          && this.delivery.get(recipientId) === c) {
+          if (f?.conn === c && f.sessionId === recipientId) f.settle(ack);
+          else if (!f && ack.ok && row.status === "queued") this.setStatus(msgId, "delivered");
+        }
         return {};
       }
       case "sync":
@@ -841,14 +858,64 @@ export class Daemon {
     const identity = this.store.identity(id);
     if (!identity) throw new AsenqError("no_session", `no retained session ${id}`);
     if (identity.closedAt !== undefined) return { session: identity };
-    const pending = this.store.db.all<MsgRow>(
-      "SELECT * FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY ord", id,
-    );
     const channels = this.store.db.all<{ channel: string }>(
       "SELECT channel FROM channel_members WHERE session_id=? ORDER BY channel", id,
-    );
-    this.cancelPings(id);
+    ).map((row) => row.channel);
     const session = this.store.closeIdentity(id, this.now());
+    this.finishClose(session, channels);
+    return { session };
+  }
+
+  private replacementEndpoint(p: Params, endpoint: "from" | "to"): SessionIdentity {
+    const idKey = `${endpoint}Id`;
+    if ((p[endpoint] !== undefined) === (p[idKey] !== undefined)) {
+      throw new AsenqError("bad_request", `specify exactly one of "${endpoint}" or "${idKey}"`);
+    }
+    const selector = str(p, p[idKey] !== undefined ? idKey : endpoint, true);
+    const identity = p[idKey] !== undefined ? this.store.identity(selector) : this.store.identityByName(selector);
+    if (!identity) throw this.unknownTarget(selector);
+    if ("candidates" in identity) {
+      const candidates = identity.candidates.map((candidate) => ({
+        id: candidate.id, name: candidate.name, harness: candidate.harness, cwd: candidate.cwd,
+        ...(candidate.removedAt === undefined ? { createdAt: candidate.createdAt } : { removedAt: candidate.removedAt }),
+      }));
+      throw new AsenqError("ambiguous_target", `ambiguous session "${selector}"; retry by stable id: ${JSON.stringify(candidates)}`);
+    }
+    if (identity.closedAt !== undefined) throw this.unknownTarget(selector);
+    return identity;
+  }
+
+  private opReplace(actor: Sender, p: Params): ReplacementResult {
+    const from = this.replacementEndpoint(p, "from");
+    const to = this.replacementEndpoint(p, "to");
+    if (from.id === to.id) throw new AsenqError("bad_request", "replacement endpoints must be different sessions");
+    if (to.state !== "live" || this.store.session(to.id)?.state !== "live") {
+      throw new AsenqError("not_live", `replacement destination "${to.name}" is not live`);
+    }
+    this.requireHumanOrOrchestrator(actor, "only the human or a shared-channel orchestrator can replace sessions");
+    if (actor.kind === "agent" && !this.store.shareChannel(actor.session.id, from.id)) {
+      throw new AsenqError("not_permitted", "source does not share a channel with this orchestrator");
+    }
+    const result = this.store.replaceIdentity(from.id, to.id, this.now());
+    this.finishClose(result.from, result.channels);
+    this.emitSession("updated", this.store.session(to.id)!);
+    const movedIds = new Set(result.messages.map((message) => message.id));
+    for (const [envelopeId, msgId] of this.envelopeIds) {
+      if (movedIds.has(msgId)) this.envelopeIds.delete(envelopeId);
+    }
+    for (const message of result.messages) {
+      this.emit({ type: "message", msg: toStored(message), status: message.status,
+        failedCount: this.store.failedCount(), ...(message.reason ? { reason: message.reason } : {}) });
+    }
+    this.flushRequested.add(to.id);
+    void this.flush(to.id);
+    return { from: result.from, to: result.to, skippedNames: result.skippedNames };
+  }
+
+  /** Runs only after the durable close commits, including the replacement cutover. */
+  private finishClose(session: SessionIdentity, channels: string[]): void {
+    const id = session.id;
+    this.cancelPings(id);
     this.delivery.delete(id);
     this.lastSeen.delete(id);
     const replyServer = this.replyServers.get(id);
@@ -864,13 +931,19 @@ export class Daemon {
       ...(session.cwd ? { cwd: session.cwd } : {}), session,
     });
     for (const channel of channels) {
-      this.emit({ type: "channel", action: "updated", channel: this.store.channelSummary(channel.channel) });
+      this.emit({ type: "channel", action: "updated", channel: this.store.channelSummary(channel) });
     }
-    for (const message of pending) {
+    for (const message of this.store.db.all<MsgRow>(
+      "SELECT * FROM messages WHERE to_session=? AND status IN ('queued','held') ORDER BY ord", id,
+    )) {
       this.setStatus(message.id, "expired", "target session closed by user");
-      this.inflight.get(message.id)?.settle({ ok: false, reason: "target session closed by user" });
     }
-    return { session };
+    for (const [msgId, attempt] of this.delivering) {
+      if (attempt.recipientId !== id) continue;
+      this.delivering.delete(msgId);
+      this.inflight.get(msgId)?.settle({ ok: false, reason: "target session closed by user" });
+      attempt.settle(this.store.msg(msgId)?.status ?? "expired");
+    }
   }
 
   private opPurge(p: Params): Result {
@@ -1562,15 +1635,23 @@ export class Daemon {
   /** One delivery attempt for a queued message. Resolves with the message's resulting status. */
   async deliver(msgId: string): Promise<MsgStatus> {
     if (this.delivering.has(msgId)) return "queued";
-    this.delivering.add(msgId);
-    try {
-      return await this.attemptDelivery(msgId);
-    } finally {
+    const { promise, resolve, reject } = Promise.withResolvers<MsgStatus>();
+    const attempt: DeliveryAttempt = { recipientId: this.store.msg(msgId)?.to_session ?? null, settle: resolve };
+    this.delivering.set(msgId, attempt);
+    const finish = (): void => {
+      if (this.delivering.get(msgId) !== attempt) return;
       this.delivering.delete(msgId);
-    }
+      const id = attempt.recipientId;
+      if (id && this.flushRequested.has(id) && !this.flushing.has(id)) void this.flush(id);
+    };
+    void this.attemptDelivery(msgId, attempt).then(
+      (status) => { finish(); resolve(status); },
+      (error: unknown) => { finish(); reject(error); },
+    );
+    return promise;
   }
 
-  private async attemptDelivery(msgId: string): Promise<MsgStatus> {
+  private async attemptDelivery(msgId: string, attempt: DeliveryAttempt): Promise<MsgStatus> {
     const row = this.store.msg(msgId);
     if (!row || row.status !== "queued") return row?.status ?? "failed";
     if (this.expireQueued(row)) return "expired";
@@ -1591,6 +1672,7 @@ export class Daemon {
       }
       const r = await writeLine(target.claude_socket, claudeFrame(text, envelope));
       const current = this.store.msg(row.id);
+      if (this.delivering.get(msgId) !== attempt || current?.to_session !== row.to_session) return current?.status ?? "expired";
       if (!current || current.status !== "queued") return current?.status ?? "expired";
       if (this.expireQueued(current)) return "expired";
       if (r === "ok") {
@@ -1609,18 +1691,19 @@ export class Daemon {
     if (!conn) return "queued";
     const { promise, resolve } = Promise.withResolvers<Ack>();
     const settle = (a: Ack): void => {
-      const f = this.inflight.get(row.id);
-      if (!f) return;
-      clearTimeout(f.timer);
+      if (this.inflight.get(row.id) !== inflight) return;
+      clearTimeout(inflight.timer);
       this.inflight.delete(row.id);
       resolve(a);
     };
     const timer = setTimeout(() => settle({ ok: false, reason: "ack timeout" }), this.ackTimeoutMs);
-    this.inflight.set(row.id, { conn, timer, settle });
+    const inflight: Inflight = { conn, sessionId: target.id, timer, settle };
+    this.inflight.set(row.id, inflight);
     const push: Push = { push: "deliver", msg: message, text, session: target.id, key: target.key };
     conn.write(push);
     const ack = await promise;
     const current = this.store.msg(row.id);
+    if (this.delivering.get(msgId) !== attempt || current?.to_session !== row.to_session) return current?.status ?? "expired";
     if (!current || current.status !== "queued") return current?.status ?? "expired";
     if (this.expireQueued(current)) return "expired";
     if (ack.ok) {
@@ -1635,15 +1718,27 @@ export class Daemon {
   async flush(sessionId: string): Promise<void> {
     if (this.flushing.has(sessionId)) return;
     this.flushing.add(sessionId);
+    const requested = this.flushRequested.delete(sessionId);
     try {
       for (const m of this.store.queuedFor(sessionId)) {
         if (this.store.session(sessionId)?.state !== "live") break;
+        if (requested && this.delivering.has(m.id)) {
+          this.flushRequested.add(sessionId);
+          break;
+        }
         if ((await this.deliver(m.id)) === "queued") break;
       }
     } catch (e) {
       this.log(`flush ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       this.flushing.delete(sessionId);
+      if (this.flushRequested.has(sessionId) && !this.closing) {
+        let busy = false;
+        for (const attempt of this.delivering.values()) {
+          if (attempt.recipientId === sessionId) { busy = true; break; }
+        }
+        if (!busy) void this.flush(sessionId);
+      }
     }
   }
 

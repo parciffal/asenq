@@ -2240,3 +2240,371 @@ test("compact agent bodies remain fully reachable and latest hint never reads th
   assert.equal(await unread(human, alpha.session.id), 0, "only reaching the actual human tail clears its reminder");
   assertWithin(ui);
 });
+
+async function startReplace(ui: Console, source: string, destination: string): Promise<void> {
+  await paletteAction(ui, "Replace session");
+  await ui.type(source);
+  await ui.press("ENTER");
+  await ui.type(destination);
+  await ui.press("ENTER");
+}
+
+test("replace picker offers non-closed sources and live-only destinations, and can replace an archive", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "replace-source-key", "old-orch");
+  await env.adapter("omp", "replace-dest-key", "new-live");
+  await env.adapter("omp", "replace-peer-key", "peer");
+  const gone = await env.adapter("omp", "replace-gone-key", "offline-one");
+  const goneEvent = await env.watch((event) => event.type === "session" && event.action === "gone" && event.session.id === gone.session.id);
+  gone.client.close();
+  await goneEvent.event;
+  const archived = await env.adapter("omp", "replace-archive-key", "old-archive");
+  await archived.client.request("unregister");
+  const closed = await env.adapter("omp", "replace-closed-key", "old-closed");
+  await human.request("close", { identity: closed.session.id });
+
+  const ui = await startConsole(120, 34);
+  const picker = (): string => ui.rows().join("\n");
+  await ui.press("?");
+  assert.ok(ui.rows().some((row) => row.includes("Replace session")), "the action label remains Replace session");
+  await ui.type("Replace session");
+  await ui.press("ENTER");
+  assert.ok(picker().includes("old-orch") && picker().includes("new-live"), "live sessions are offered as sources");
+  assert.ok(picker().includes("old-archive"), "a non-closed archive can be the source");
+  assert.ok(!picker().includes("old-closed"), "an explicitly closed identity is not offered");
+  await ui.press("ESCAPE");
+
+  await paletteAction(ui, "Replace session");
+  await ui.type("old-orch");
+  await ui.press("ENTER");
+  assert.ok(picker().includes("new-live"), "a live destination is offered");
+  assert.ok(!picker().includes("old-orch"), "the captured source is not a destination");
+  assert.ok(!picker().includes("offline-one"), "a disconnected session is not a live destination");
+  assert.ok(!picker().includes("old-archive") && !picker().includes("old-closed"), "archived and closed identities are not destinations");
+  await ui.press("ESCAPE");
+
+  await startReplace(ui, "old-orch", "new-live");
+  assert.ok(ui.rows().some((row) => row.includes("Replace old-orch with new-live? old-orch will be closed.")), "the confirmation states exactly what happens");
+  await ui.press("ENTER");
+  await ui.paste("y");
+  await ui.press(" ");
+  assert.equal((await human.sync()).sessions.find((session) => session.id === source.session.id)!.closedAt, undefined, "Enter, paste and other keys cannot confirm");
+  await ui.press("n");
+  const snapshot = await human.sync();
+  assert.equal(snapshot.sessions.find((session) => session.id === source.session.id)!.closedAt, undefined, "cancel leaves the source open");
+  assert.notEqual(snapshot.sessions.find((session) => session.id === closed.session.id)!.closedAt, undefined, "cancel leaves the closed identity closed");
+  assert.equal(snapshot.sessions.find((session) => session.id === archived.session.id)!.closedAt, undefined, "cancel leaves the archive unclosed");
+  await startReplace(ui, "old-archive", "new-live");
+  await ui.press("y");
+  await ui.until(async () => (await human.sync()).sessions.find((session) => session.id === archived.session.id)!.closedAt !== undefined, "automatically removed source is replaced");
+  assert.equal((await human.sync()).sessions.find((session) => session.id === source.session.id)!.closedAt, undefined, "the cancelled live source remains open");
+  assertWithin(ui);
+});
+
+test("replace session moves role, channel membership and held messages onto the live target and archives the source", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "move-source-key", "old-orch");
+  const dest = await env.adapter("omp", "move-dest-key", "new-live");
+  const peer = await env.adapter("omp", "move-peer-key", "peer");
+  await human.request("set_role", { name: "old-orch", role: "orchestrator" });
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "old-orch" });
+  const [history] = ((await peer.client.request("send", { to: "old-orch", text: "src-history-marker" })).results as SendResult[]);
+  assert.equal(history.status, "delivered");
+  await human.request("set_inbound", { name: "old-orch", mode: "hold" });
+  const [heldSend] = ((await peer.client.request("send", { to: "old-orch", text: "held-moved-marker" })).results as SendResult[]);
+  assert.equal(heldSend.status, "held");
+
+  const ui = await startConsole(120, 34);
+  await startReplace(ui, "old-orch", "new-live");
+  await ui.press("y");
+  await ui.until(async () => (await human.sync()).sessions.find((session) => session.id === source.session.id)!.closedAt !== undefined, "source archived");
+  const snapshot = await human.sync();
+  assert.equal(snapshot.sessions.find((session) => session.id === dest.session.id)!.role, "orchestrator", "the source role moves to the destination");
+  const members = (await human.request("channel_members", { channel: "work" })).members as SessionIdentity[];
+  assert.deepEqual(members.map((member) => member.id), [dest.session.id], "channel membership moves and the closed source leaves the roster");
+  const held = (await human.request("held")).messages as StoredMessage[];
+  assert.deepEqual(held.map((message) => [message.id, message.toSessionId, message.status]), [[heldSend.msgId, dest.session.id, "held"]], "the held message moves to the destination identity");
+
+  await selectSession(ui, "new-live");
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("held-moved-marker")), "the destination shows its moved held message");
+  assert.ok(!ui.rows().some((row) => row.includes("src-history-marker")), "the destination conversation does not gain the source's delivered history");
+  await ui.press("r");
+  await ui.until(() => dest.deliveries.length === 1, "release delivers the moved message to the destination");
+  assert.equal((await dest.nextDelivery()).msg.text, "held-moved-marker");
+  assert.deepEqual((await human.request("held")).messages, [], "release removes the moved message from the held set");
+  assertWithin(ui);
+});
+
+test("external replacement reconciles loaded source and destination conversations without losing their UI state", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "external-replace-source-key", "cache-old-source");
+  const dest = await env.adapter("omp", "external-replace-dest-key", "cache-new-dest");
+  const peer = await env.adapter("omp", "external-replace-peer-key", "cache-peer");
+  const sourceBody = [
+    "source-anchor-first-row",
+    ...Array.from({ length: 36 }, (_, index) => `source-history-row-${index + 1}`),
+    "source-outbound-archive",
+  ].join("\n");
+  const [sourceHistory] = (await source.client.request("send", { to: "cache-peer", text: sourceBody })).results as SendResult[];
+  await source.client.request("send", { to: "human", text: "source-read-history" });
+  const [destinationOriginal] = (await dest.client.request("send", { to: "human", text: "destination-history" })).results as SendResult[];
+  await human.request("set_inbound", { name: "cache-old-source", mode: "hold" });
+  const [moved] = (await peer.client.request("send", { to: "cache-old-source", text: "moved-held-ownership" })).results as SendResult[];
+  assert.equal(moved.status, "held");
+
+  const ui = await startConsole(120, 32);
+  await quickJump(ui, "cache-old-source", "source-outbound-archive");
+  await ui.press("HOME");
+  const firstRow = ui.rows().findIndex((row) => row.includes("source-anchor-first-row"));
+  assert.ok(firstRow >= 0, "the source viewport can be positioned on its archived history");
+  const conversationX = (paneWidths(ui.size.columns)?.list ?? 0) + 2;
+  await ui.click(conversationX, firstRow);
+  const sourceHistorySelected = (): boolean => {
+    const row = ui.rows().findIndex((line) => line.includes("cache-old-source") && line.includes("cache-peer"));
+    return row >= 0 && normalizeTerminalLine(ui.frame().lines[row], ui.size.columns).some((span) => span.style?.inverse);
+  };
+  assert.ok(sourceHistorySelected(), "the selected source history remains selected");
+  await ui.press("c");
+  await ui.type("source-only-draft");
+  await ui.press("ESCAPE");
+  await ui.until(async () => await unread(human, source.session.id) === 0, "source read marker reaches its history");
+
+  await quickJump(ui, "cache-new-dest", "destination-history");
+  await ui.until(async () => await unread(human, dest.session.id) === 0, "destination read marker reaches its history");
+  await ui.press("c");
+  await ui.type("destination-only-draft");
+  await ui.press("ESCAPE");
+  await source.client.request("send", { to: "human", text: "source-unread-history" });
+  await ui.until(async () => await unread(human, source.session.id) === 1, "source receives a separate unread message");
+
+  await human.request("replace", { fromId: source.session.id, toId: dest.session.id });
+  await ui.until(() => ui.rows().some((row) => row.includes("moved-held-ownership")), "the loaded destination receives the moved message event");
+  const destHistory = await human.historyPage({ scope: "session", sessionId: dest.session.id });
+  assert.deepEqual(
+    destHistory.messages.filter((message) => message.id === moved.msgId).map(({ id, toSessionId, text, status }) => ({ id, toSessionId, text, status })),
+    [{ id: moved.msgId, toSessionId: dest.session.id, text: "moved-held-ownership", status: "held" }],
+    "the destination history contains the original moved message",
+  );
+  const archived = await human.historyPage({ scope: "session", sessionId: source.session.id });
+  assert.ok(archived.messages.some((message) => message.id === sourceHistory.msgId), "genuine outgoing source history stays archived");
+  assert.ok(!archived.messages.some((message) => message.id === moved.msgId), "the moved incoming message leaves the old owner history");
+  assert.ok(ui.rows().some((row) => row.includes("destination-only-draft")), "the destination draft remains in its own composer");
+  assert.ok(!ui.rows().some((row) => row.includes("source-only-draft")), "the archived source draft is not adopted by the destination");
+  assert.equal(await unread(human, source.session.id), 1, "replacement preserves the source read marker without reading it");
+  assert.equal(await unread(human, dest.session.id), 0, "replacement leaves the destination read marker unchanged");
+
+  const openArchivedSource = async (visible: string): Promise<void> => {
+    await ui.press("CTRL_K");
+    await ui.type("cache-old-source");
+    await ui.press("DOWN");
+    await ui.press("ENTER");
+    await ui.until(() => ui.rows().some((row) => row.includes(visible)), "the cached source archive retains its previous viewport");
+  };
+  await openArchivedSource("source-anchor-first-row");
+  assert.ok(sourceHistorySelected(), "replacement keeps the selected source message and cached viewport");
+  await ui.press("END");
+  await ui.until(() => ui.rows().some((row) => row.includes("source-unread-history")), "the archived source still has its own later history");
+  assert.ok(!ui.rows().some((row) => row.includes("moved-held-ownership")), "replacement immediately removes the moved message from the old source view");
+
+  const destinationAfterReplacement = await human.historyPage({ scope: "session", sessionId: dest.session.id });
+  assert.ok(destinationAfterReplacement.messages.some((message) => message.id === destinationOriginal.msgId), "the destination keeps its own history");
+  await quickJump(ui, "cache-new-dest", "destination-history");
+  await ui.until(() => ui.rows().some((row) => row.includes("moved-held-ownership")), "the destination still displays the moved message");
+  assert.ok(ui.rows().some((row) => row.includes("destination-only-draft")), "the destination draft survives switching cached conversations");
+
+  const delivered = await env.watch((event) => event.type === "message" && event.msg.id === moved.msgId && event.status === "delivered");
+  await ui.press("r");
+  await delivered.event;
+  const released = await human.historyPage({ scope: "session", sessionId: dest.session.id });
+  assert.equal(released.messages.find((message) => message.id === moved.msgId)?.status, "delivered", "release updates the destination's original message");
+
+  await openArchivedSource("source-unread-history");
+  assert.ok(!ui.rows().some((row) => row.includes("moved-held-ownership")), "delivering at the destination does not resurrect the message in the source archive");
+  assertWithin(ui);
+});
+
+test("external replacement refreshes archive order even when the old source conversation was not loaded", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "order-source-key", "order-source");
+  const target = await env.adapter("omp", "order-target-key", "order-target");
+  const middle = await env.adapter("omp", "order-middle-key", "order-middle");
+  const peer = await env.adapter("omp", "order-peer-key", "order-peer");
+  await source.client.request("send", { to: "human", text: "source retained oldest" });
+  await middle.client.request("send", { to: "human", text: "middle retained newer" });
+  await middle.client.request("unregister");
+  await target.client.request("send", { to: "human", text: "target retained latest" });
+  await human.request("set_inbound", { name: "order-source", mode: "hold" });
+  const ui = await startConsole(120, 32);
+  await ui.until(() => ui.rows().some((row) => row.includes("target retained latest")), "the destination conversation is loaded");
+  const sidebar = (): string[] => ui.rows().map((row) => truncateTerminalText(row, paneWidths(ui.size.columns)!.list));
+  const indexOf = (name: string): number => sidebar().findIndex((row) => row.includes(name));
+  await peer.client.request("send", { to: "order-source", text: "moved newest inbound" });
+  await ui.until(() => indexOf("order-source") >= 0 && indexOf("order-source") < indexOf("order-target"), "the source's incoming message advances its cached order");
+  await paletteAction(ui, "Toggle archive");
+  await ui.until(() => indexOf("order-middle") >= 0, "the existing archive is visible");
+
+  await human.request("replace", { fromId: source.session.id, toId: target.session.id });
+  await ui.until(() => {
+    const archive = sidebar().findIndex((row) => /\barchive\b/i.test(row));
+    return archive >= 0 && indexOf("order-source") > archive && indexOf("order-middle") > archive;
+  }, "the source has joined the archived conversations");
+  const snapshot = await human.sync();
+  assert.ok(snapshot.sessionLastOrders[middle.session.id] > snapshot.sessionLastOrders[source.session.id], "the source's remaining history is older than the other archive");
+  assert.ok(indexOf("order-middle") < indexOf("order-source"), "an already-open console uses authoritative archive order after ownership moves");
+  assertWithin(ui);
+});
+
+
+test("replace session binds captured identities across destination rename and source name reuse", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "bind-source-key", "bind-src");
+  const dest = await env.adapter("omp", "bind-dest-key", "bind-dst");
+  const ui = await startConsole(120, 32);
+
+  await paletteAction(ui, "Replace session");
+  await ui.type("bind-src");
+  await ui.press("ENTER");
+  await ui.type("bind-dst");
+  await human.request("rename", { from: "bind-dst", name: "bind-dst-renamed" });
+  await ui.until(() => ui.rows().some((row) => row.includes("bind-dst-renamed")), "the rename refreshes the highlighted destination");
+  await source.client.request("unregister");
+  await ui.until(async () => (await human.sync()).sessions.find((session) => session.id === source.session.id)!.state === "removed", "the captured source leaves the live list");
+  const reused = await env.adapter("omp", "bind-reuse-key", "bind-src");
+  assert.notEqual(reused.session.id, source.session.id, "a fresh identity reuses the removed name");
+
+  await ui.press("ENTER");
+  assert.ok(ui.rows().some((row) => row.includes("Replace bind-src with bind-dst-renamed? bind-src will be closed.")), "the confirmation keeps the captured identities and current names");
+  await ui.press("y");
+  await ui.until(async () => (await human.sync()).sessions.find((session) => session.id === source.session.id)!.closedAt !== undefined, "the captured source is closed");
+  const snapshot = await human.sync();
+  assert.equal(snapshot.sessions.find((session) => session.id === dest.session.id)!.state, "live", "the renamed destination stays live");
+  assert.equal(snapshot.sessions.find((session) => session.id === dest.session.id)!.name, "bind-dst-renamed");
+  assert.equal(snapshot.sessions.find((session) => session.id === reused.session.id)!.state, "live", "the identity reusing the source's name is untouched");
+  assert.equal(snapshot.sessions.find((session) => session.id === reused.session.id)!.closedAt, undefined);
+  assertWithin(ui);
+});
+
+test("replace session refuses when the captured destination stops being live", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "stale-source-key", "stale-src");
+  const dest = await env.adapter("omp", "stale-dest-key", "stale-dst");
+  const ui = await startConsole(120, 32);
+  await startReplace(ui, "stale-src", "stale-dst");
+  await human.request("close", { identity: dest.session.id });
+  await ui.press("y");
+  const snapshot = await human.sync();
+  assert.equal(snapshot.sessions.find((session) => session.id === source.session.id)!.closedAt, undefined, "no replacement happens for a stale destination");
+  assert.equal(snapshot.sessions.find((session) => session.id === dest.session.id)!.state, "removed");
+  assertWithin(ui);
+});
+
+test("replace destination picker does not silently choose another identity when its selection goes offline", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "picker-source-key", "picker-source");
+  const offline = await env.adapter("omp", "picker-offline-key", "picker-offline");
+  await env.adapter("omp", "picker-live-key", "picker-live");
+  const ui = await startConsole(120, 32);
+  const destinationRows = () => ui.rows().filter((row) => row.includes("picker-live") || row.includes("picker-offline"));
+  const selectedDestination = (): string | undefined => {
+    const rows = ui.rows();
+    const selectedIndex = rows.findIndex((row, index) =>
+      (row.includes("picker-live") || row.includes("picker-offline"))
+      && normalizeTerminalLine(ui.frame().lines[index], ui.size.columns).some((span) => span.style?.inverse));
+    const row = rows[selectedIndex];
+    return row?.includes("picker-live") ? "picker-live" : row?.includes("picker-offline") ? "picker-offline" : undefined;
+  };
+
+  await paletteAction(ui, "Replace session");
+  await ui.type("picker-source");
+  await ui.press("ENTER");
+  await ui.type("picker");
+  await ui.press("DOWN");
+  assert.equal(selectedDestination(), "picker-offline", "the rendered selection identifies the offline destination");
+  const removed = await env.watch((event) => event.type === "session" && event.action === "removed" && event.session.id === offline.session.id);
+  await offline.client.request("unregister");
+  await removed.event;
+  await ui.until(() => destinationRows().length === 1 && destinationRows()[0].includes("picker-live"), "the other live destination remains available");
+  assert.equal(selectedDestination(), undefined, "the removed selection does not move to the other result");
+
+  await ui.press("ENTER");
+  assert.equal(selectedDestination(), undefined, "Enter does not redirect the removed selection");
+  assert.ok(!ui.rows().some((row) => row.includes("Replace picker-source with picker-live? picker-source will be closed.")), "Enter does not open confirmation for the other identity");
+  assert.equal(destinationRows().length, 1, "the remaining result stays available");
+  assert.ok(destinationRows()[0].includes("picker-live"));
+  assert.equal((await human.sync()).sessions.find((session) => session.id === source.session.id)!.closedAt, undefined, "the source remains open");
+
+  assertWithin(ui);
+});
+
+test("replace session reports skipped names without claiming they forward", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const third = await env.adapter("omp", "skip-third-key", "foo");
+  await third.client.request("unregister");
+  const source = await env.adapter("omp", "skip-source-key", "foo");
+  await human.request("rename", { from: "foo", name: "src-main" });
+  const revived = await env.adapter("omp", "skip-third-key", "ignored");
+  assert.deepEqual([revived.session.name, revived.session.id], ["foo-2", third.session.id], "the third identity revives behind the source's former name");
+  const dest = await env.adapter("omp", "skip-dest-key", "skip-dest");
+
+  const ui = await startConsole(80, 32);
+  const listWidth = paneWidths(80)!.list;
+  await startReplace(ui, "src-main", "skip-dest");
+  await ui.press("y");
+  await ui.until(() => ui.rows().some((row) =>
+    /^foo$/.test(row.slice(truncateTerminalText(row, listWidth).length + 2, -1).trim())), "the complete skipped address is visible in the result panel");
+  const snapshot = await human.sync();
+  assert.equal(snapshot.sessions.find((session) => session.id === source.session.id)!.closedAt !== undefined, true, "the source still closes on partial success");
+  assert.deepEqual(snapshot.sessions.find((session) => session.id === dest.session.id)!.previousNames, ["src-main"], "the destination inherits only unreserved names");
+  assert.ok(snapshot.sessions.find((session) => session.id === third.session.id)!.previousNames.includes("foo"), "the third identity keeps the reserved name");
+  const [routed] = ((await human.request("send", { to: "foo", text: "reserved-address-delivery" })).results as SendResult[]);
+  assert.equal(routed.status, "delivered");
+  const received = await revived.nextDelivery();
+  assert.equal(received.session, third.session.id, "the reserved address still routes to the original identity");
+  assert.equal(received.msg.text, "reserved-address-delivery");
+  assert.equal(dest.deliveries.length, 0, "the skipped address does not forward to the replacement destination");
+  assertWithin(ui);
+});
+
+test("replace session keeps the destination's history, drafts and read marker separate from the archived source", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "iso-source-key", "iso-src");
+  const dest = await env.adapter("omp", "iso-dest-key", "iso-dst");
+  await source.client.request("send", { to: "human", text: "src-history-marker" });
+  await dest.client.request("send", { to: "human", text: "dst-history-marker" });
+
+  const ui = await startConsole(120, 32);
+  await quickJump(ui, "iso-src", "src-history-marker");
+  await ui.press("c");
+  await ui.type("source-draft");
+  await ui.press("ESCAPE");
+  await quickJump(ui, "iso-dst", "dst-history-marker");
+  await ui.press("c");
+  await ui.type("dest-draft");
+  await ui.press("ESCAPE");
+  await source.client.request("send", { to: "human", text: "src-unread-marker" });
+  assert.equal((await human.readState({ scope: "session", sessionId: source.session.id })).unread, 1, "the source holds one unread marker");
+
+  await startReplace(ui, "iso-src", "iso-dst");
+  await ui.press("y");
+  await ui.until(async () => (await human.sync()).sessions.find((session) => session.id === source.session.id)!.closedAt !== undefined, "source archived");
+  assert.equal((await human.readState({ scope: "session", sessionId: source.session.id })).unread, 1, "the archived source keeps its own read marker");
+
+  await ui.press("ESCAPE");
+  await quickJump(ui, "iso-dst", "dst-history-marker");
+  assert.ok(!ui.rows().some((row) => row.includes("src-history-marker")), "the destination conversation does not gain the source's history");
+  assert.ok(ui.rows().some((row) => row.includes("dest-draft")), "the destination keeps its own draft");
+  assert.ok(!ui.rows().some((row) => row.includes("source-draft")), "the source draft is not adopted by the destination");
+  assert.equal((await human.readState({ scope: "session", sessionId: source.session.id })).unread, 1, "opening the destination does not clear the source's marker");
+  assertWithin(ui);
+});
