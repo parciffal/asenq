@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { claudeHookInstalled, CLAUDE_EVENTS, claudeDir, hookCommand, ompAgentDir, opencodeDir, type Install } from "./setup/setup.js";
 import { isObj, readJson } from "./setup/jsonfile.js";
+import { inspectSkills, SKILL_NAMES, skillsSourceDir, type SkillState } from "./setup/skills.js";
 import { AsenqClient } from "./shared/client.js";
 import { readConfig } from "./shared/config.js";
 import { PROTOCOL } from "./shared/protocol.js";
@@ -39,6 +40,30 @@ export async function doctor(): Promise<number> {
   const line = (level: Level, msg: string): void => {
     if (level === "fail") failed = true;
     process.stdout.write(`${level.padEnd(4)} ${msg}\n`);
+  };
+
+  /** Reports whether the skills asenq ships are installed and current in one harness. */
+  const reportSkills = (harness: string, base: string, detected: boolean): void => {
+    if (!detected) {
+      line("ok", `${harness} skills: skipped (${harness} not installed)`);
+      return;
+    }
+    const shippedMissing = SKILL_NAMES.filter((name) => !existsSync(join(skillsSourceDir(), name, "SKILL.md")));
+    if (shippedMissing.length) {
+      line("fail", `${harness} skills: shipped skills missing ${shippedMissing.join(", ")} from this asenq install; reinstall asenq`);
+      return;
+    }
+    const states = inspectSkills(join(base, "skills"));
+    const names = (state: SkillState): string => states.filter((s) => s.state === state).map((s) => s.name).join(", ");
+    const missing = names("missing");
+    const outdated = names("outdated");
+    const edited = names("edited");
+    const unowned = names("unowned");
+    if (missing) line("fail", `${harness} skills: missing ${missing}; run: asenq setup`);
+    if (outdated) line("fail", `${harness} skills: outdated ${outdated}; run: asenq setup`);
+    if (edited) line("warn", `${harness} skills: edited ${edited}; run: asenq setup to update (your copy will be backed up)`);
+    if (unowned) line("warn", `${harness} skills: unowned ${unowned}; not installed by asenq`);
+    if (states.every((s) => s.state === "current")) line("ok", `${harness} skills: current`);
   };
 
   const [major, minor] = process.versions.node.split(".").map(Number);
@@ -92,6 +117,7 @@ export async function doctor(): Promise<number> {
       } else line("ok", "claude.envelope enabled");
     }
   } else line("ok", "claude: not installed, skipped");
+  reportSkills("claude", claudeDir(), existsSync(claudeDir()));
 
   if (existsSync(opencodeDir())) {
     const v = versionOf("opencode");
@@ -102,6 +128,7 @@ export async function doctor(): Promise<number> {
     else if (existsSync(join(opencodeDir(), "plugins", "messenger.js"))) line("fail", "legacy ~/.config/opencode/plugins/messenger.js still present; run: asenq setup");
     else line("ok", `opencode ${v ?? "?"} plugin installed`);
   } else line("ok", "opencode: not installed, skipped");
+  reportSkills("opencode", opencodeDir(), existsSync(opencodeDir()));
 
   if (existsSync(ompAgentDir())) {
     const v = versionOf("omp");
@@ -111,6 +138,7 @@ export async function doctor(): Promise<number> {
     else if (!target || !existsSync(target)) line("fail", `omp shim points to missing ${target || "(unparseable)"}; run: asenq setup`);
     else line("ok", `omp ${v ?? "?"} extension installed`);
   } else line("ok", "omp: not installed, skipped");
+  reportSkills("omp", ompAgentDir(), existsSync(ompAgentDir()));
 
   if (sessions) {
     const live = sessions.filter((s) => s.state === "live" || s.state === "stale");
