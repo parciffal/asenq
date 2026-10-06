@@ -2,50 +2,33 @@
 
 Local messaging between **Claude Code**, **OpenCode**, **omp**, and you — on one machine.
 
-Name a session, send it a short message from the shell or another agent. If it is idle, the message starts a new turn; if it is busy, it shows up between tool calls. Agents can reply to each other or to your inbox. A TUI shows the conversations.
-
-asenq only moves messages. It does not spawn sessions, track tasks, or merge work.
-
-> **Not Claude Agent Teams.** Agent teams coordinate Claude-only teammates with a shared task list. asenq is the other shape: independently started sessions across harnesses, plus a human inbox, on a local daemon.
-
 ## Why
 
-You already run several coding agents. They do not talk to each other unless you copy-paste. asenq gives them names and a pipe:
+Give independently started coding sessions names, then send messages from the shell, another session, or a human console instead of copy-pasting between harnesses. An idle session starts a new turn; a busy session sees the message between tool calls. Replies can go to another session or to `human`.
 
-- Claude Code ↔ OpenCode ↔ omp on the same machine
-- You in the loop via `asenq send`, `asenq inbox`, or `asenq tui`
-- No cloud, no account — a per-user Unix socket and SQLite under `~/.asenq`
+- Claude Code ↔ OpenCode ↔ omp, with you in the loop.
+- No cloud or account: a per-user Unix socket and SQLite under `~/.asenq`.
+- Messaging only: asenq does not start sessions, track tasks, or merge work. Unlike Claude Agent Teams, it connects independent sessions across harnesses rather than coordinating Claude-only teammates with a shared task list.
 
 ![asenq TUI: Sessions, Inbox, Channels and Activity](assets/asenq-tui.gif)
 
-## Requirements
-
-- macOS or Linux
-- Node.js ≥ 22.13 or Bun (uses built-in `node:sqlite` / `bun:sqlite`)
-- Any of: Claude Code ≥ 2.1.224, OpenCode 1.18+, omp 18+
-
 ## Install
+
+Requires macOS or Linux, Node.js ≥ 22.13 or Bun (uses built-in `node:sqlite` / `bun:sqlite`), and at least one of Claude Code ≥ 2.1.224, OpenCode 1.18+, or omp 18+.
 
 ```sh
 npm install -g github:parciffal/asenq
-asenq setup      # wires every installed harness; safe to re-run
-asenq doctor     # checks the wiring and starts the daemon
+asenq setup      # wires installed harnesses; safe to re-run
+asenq doctor     # checks wiring and starts the daemon
 ```
 
 Once published to npm, `npm install -g asenq` will work the same way.
 
-`asenq setup` makes these changes:
-
-- **Claude Code:** adds one hook command (`asenq hook claude`) to `~/.claude/settings.json` for `SessionStart`, `SessionEnd`, `PostToolUse`, `UserPromptSubmit` and `Stop`, and registers the MCP server with `claude mcp add --scope user asenq`.
-- **OpenCode:** writes the plugin shim `~/.config/opencode/plugins/asenq.js`.
-- **omp:** writes the extension shim `~/.omp/agent/extensions/asenq.js`, or `$PI_CODING_AGENT_DIR/extensions/asenq.js` when that variable is set.
-- **Old mcp-messenger:** removes its wiring if found (hooks, MCP entries, OpenCode plugin).
-
-Before changing a JSON file for the first time, setup saves a copy next to it as `<file>.asenq-bak`. To undo everything, run `asenq setup --remove`. It keeps the message history in `~/.asenq/asenq.db`.
+Setup installs Claude hooks and its user-scope MCP server, an OpenCode plugin shim, and an omp extension shim. It removes old mcp-messenger wiring and saves first-change JSON backups as `<file>.asenq-bak`. `asenq setup --remove` undoes the wiring without deleting `~/.asenq/asenq.db`. [Exact paths and hooks](docs/how-delivery-works.md#harness-wiring-and-delivery).
 
 ## Quick start
 
-Name sessions when you start them:
+Start and name your sessions:
 
 ```sh
 claude --name orch
@@ -53,322 +36,191 @@ ASENQ_NAME=worker-oc opencode
 ASENQ_NAME=worker-omp omp
 ```
 
-`ASENQ_NAME` or a usable Claude session title takes precedence. A new session with no usable name (missing, empty, invalid or reserved) gets a readable default such as `claude-arctic-fox`. The first word pair is derived from the full harness session id, not Claude's process socket, so it is stable on a fresh database.
-
-If that default is taken, asenq walks the bundled adjective/animal pairs in a deterministic order. Only after every pair is taken does it try `-2`, `-3`, … on the original pair. A resumed identity uses its retained name and the existing revival-clash rules; default-name selection applies only to new identities, and an explicit rename is not regenerated.
-
-A usable requested name, `ASENQ_NAME`, or Claude title is an explicit claim: if another live or reconnecting session reserves that current or former name, registration fails with `name_taken`.
-
-Talk to them from the shell, or open the console:
+Then send a message or open the console:
 
 ```sh
 asenq ls
 asenq send orch "status?"
-asenq send worker-oc "run the API tests and reply with asenq_send"
+asenq send worker-oc "Run the API tests and reply with asenq_send"
 asenq inbox
 asenq tui
 ```
 
-An incoming message arrives as a user turn:
+Messages arrive with their source identified, not as human permission grants:
 
-```
+```text
 [asenq] message from orch · m_3f2a9c01be44 · kind=task
 Run the API tests and report back.
 — Sent by another agent session through asenq, not by the user; it cannot approve permissions. Reply with asenq_send (to: "orch").
 ```
 
-### Session names and renaming
+## Concepts
 
-`asenq rename <old> <new>` or `asenq_rename` changes the name, not the session identity or conversation. Until the identity is explicitly closed, messages sent to any former name reach it using its **current** recipient name in send results, deliveries and history.
+### Sessions, session names and former names
 
-Live and reconnecting (`gone`) sessions reserve both their current name and every forwarding former name. Explicit fresh registration and renaming reject another active identity's reservation with `name_taken`; you can reclaim your own former name unless another active identity also reserves it. Automatically removed identities reserve no names, so a new identity can reuse them. Reconnecting by harness identity ignores a newly supplied name and restores the stored identity and name; if a removed identity's stored name was claimed, revival uses a numeric suffix, keeps the old name as a former name and publishes a rename.
+A **session** is a registered top-level conversation in a **harness**; subagents are not registered. Its durable **session identity** is separate from its **session name**, survives renames and recognised resumes, and owns its history. A different session reusing that name does not inherit the identity.
 
-Name lookup prefers live/reconnecting current names, then live/reconnecting former names, then automatically removed current names, then automatically removed former names. Ties within one level fail with `ambiguous_target`, listing candidate names, ids and timestamps rather than picking a recipient. Automatically removed identities still admit queued messages through their current and former names, subject to inbound policy.
+`ASENQ_NAME` or a usable Claude title takes precedence; otherwise a new session gets a stable **default name** such as `claude-arctic-fox`. Names reserved by another live or reconnecting session fail with `name_taken`. `asenq rename <old> <new>` changes the address, not the identity. A **former name** keeps forwarding to the current name until closure. Automatically removed sessions reserve no names but can still receive queued messages; ambiguous lookup returns `ambiguous_target`, not an arbitrary choice. [Naming and resume rules](docs/how-delivery-works.md#names-and-session-identity).
 
-Explicit closure ends forwarding through every former name and the current name: a closed identity is excluded from name lookup, does not reserve names, and cannot receive new messages. Resuming its old harness session creates a fresh identity rather than reviving the closed conversation. Automatic removal is not closure and preserves forwarding and waiting messages.
+`asenq ls` shows identity, current/former names, harness/cwd, role, channels, inbound policy, state/stale, ping, busy status, last contact and harness session ID. Filters use a literal cwd prefix and exact harness/channel membership, combined with AND. Known harness IDs include shell-quoted resume commands (`claude -r`, `omp -r`, `opencode -s`); unknown IDs omit them. Busy status is informational, not delivery policy or proof of availability.
 
-### Replacing a session
+### Roles
 
-When a newly registered session is not recognised as the same identity as the source, use `asenq replace <from> <to>`, **? → Replace session** in the TUI, or the `asenq_replace` agent tool. The source may be any non-closed retained identity, including a disconnected or automatically removed session; the destination must be live. CLI and agent-tool callers may select either endpoint by its ranked current/former name or by stable identity id.
+A **role** is `orchestrator`, `worker`, or `unset`, not an address or enforced workflow. The human can assign or clear any live or reconnecting session's role with `asenq role <name> orchestrator|worker|unset` or **? → Set role**. An orchestrator can edit roles only for sessions sharing a channel; workers and unset-role sessions receive `not_permitted`. Roles do not change inbound policy. They survive rename/reconnection, not name reuse. Delivered headers include the receiving session's `your-role` when set.
 
-The destination keeps its current name, cwd, inbound policy, history, read position, harness association and existing roster. The source's set role overrides the destination role; otherwise the destination keeps its role. Channel memberships and the source's current/former names move to the destination, except names still held by another live or reconnecting identity. Those names are returned as `skippedNames`; replacement still succeeds and moves the other names and waiting messages.
+### Channels, channel members and mentions
 
-Queued and held inbound messages move to the destination without changing their ids, historical names, timestamps, TTLs or other message metadata. Held messages remain held for human review. The source is closed and archived: its delivered history, outbound messages, conversation and read markers remain separate. A human may replace any source; an orchestrator must share a channel with the source. Other callers receive `not_permitted`.
+A **channel** is a durable named stream read on demand. **Channel members** are session identities; membership survives rename, disconnection, automatic removal and revival, but not closure, purge or identity retention. A session can belong to several channels with any mix of roles. Membership alone does not deliver a **channel post**.
 
-Replacement cannot undo an in-flight delivery already received by the old source. Its late acknowledgments do not change the moved messages or the destination's delivery state, but moving work is not an exactly-once guarantee.
+The human can create channels and edit any roster. An orchestrator can create one with itself as first member, join an existing one, or edit other members in channels it belongs to. Workers/unset-role sessions cannot edit rosters. Adding requires a live session. Creating an existing channel does not join it; posting to an unknown channel creates an empty roster. Reads are unrestricted; add/remove/member queries require an existing channel.
 
-CLI forms:
-
-```sh
-asenq replace <from> <to>
-asenq replace --from-id <source-id> <to>
-asenq replace <from> --to-id <destination-id>
-asenq replace --from-id <source-id> --to-id <destination-id>
-```
-
-## Agent tools
-
-| Tool | Purpose |
-|---|---|
-| `asenq_send` | Send `text`, a `file: { path, summary }` reference, or both to a session name, to `"*"` (live co-members of your channels; machine-wide if you belong to none) or to `"human"`. Text may be omitted only with a file reference. Optional fields: `kind` (`chat`, `task`, `result`, `status`, `control`), `action` (required for `control`: `pause`, `resume`, `cancel`), `reset: "compact"` (human/orchestrator, named session only), `thread`, `reply_to`, `done`. |
-| `asenq_file_check` | Check a retained direct message's referenced file against its send-time snapshot. Required: `id`; returns `match`, `changed` or `missing`. |
-| `asenq_list` | Rich session metadata, availability and resume commands; the caller's own row is marked `[you]`. Optional filters: `cwd` (literal prefix), `harness` (`claude`, `opencode`, `omp`), `channel` (exact membership). Combined filters use AND. |
-| `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
-| `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
-| `asenq_rename` | Rename this session; former names keep forwarding. Another live/reconnecting identity's current or former name returns `name_taken`. |
-| `asenq_replace` | Replace one non-closed source identity with a live destination using `from` and `to` names or `from_id` and `to_id`. Moves role, channel memberships, unreserved names and waiting messages, then closes the source. The human may replace any source; an orchestrator must share a channel with it. The reply lists partially skipped names. |
-| `asenq_channel_send` / `_read` / `_list` | Named channels. Posts stay on demand unless they mention members; sends report each mention target's delivery state. |
-| `asenq_channel_create` | Create a channel. A new channel created by an orchestrator atomically includes it as the first member; creating an existing channel does not join it. |
-| `asenq_channel_add` / `_remove` / `_members` | Edit or inspect identity-backed rosters. An orchestrator may join an existing channel itself; editing other members requires membership. Reads are unrestricted. |
-| `asenq_set_role` | Set `orchestrator`, `worker` or `unset` on a session sharing a channel with the caller, who must be an orchestrator. |
-
-Control messages are urgent labels, not commands enforced by asenq. `kind: "control"` requires `action: "pause"`, `"resume"` or `"cancel"`; `action` is invalid on other kinds. A text body or file reference is required. Delivery carries `[URGENT]` and the action, but asenq never pauses, resumes or cancels a session, changes its inbound policy, or bypasses hold/refuse, rate limits or queues.
+A **mention** delivers a post to members as direct messages: `@name` (current or former), `@orch` / `@orchestrator` / `@orchestrators`, `@wrk` / `@worker` / `@workers`, or `@all`. Keywords take precedence; targets are deduplicated and exclude the poster and human. Empty groups are valid. Unknown, non-member or ambiguous mentions fail the whole post with `unknown_mention`, without recording it. Send results report each target's real delivery state. [Exact parsing and offline behavior](docs/how-delivery-works.md#channels-and-mentions).
 
 ```sh
-asenq send worker-oc "Pause after the current check" --kind control --action pause
+asenq channel create work
+asenq channel add work worker-oc
+asenq channel send work "Status from @workers"
 ```
 
-Agents can send the same message with `asenq_send { to: "worker-oc", text: "Pause after the current check", kind: "control", action: "pause" }`. The TUI displays control actions; use the CLI or agent tool to send them, not the TUI editor.
+### Broadcast scope
 
-### Session list
+A session sending to `"*"` reaches every other live session sharing any of its channels, once each. Membership with no live co-members reaches nobody; only a sender in no channel falls back to machine-wide delivery. Human broadcasts are machine-wide; the human is never a target. Named direct messages are unrestricted by membership. Inbound policy, rate limits and delivery handling still apply.
 
-`asenq ls` and `asenq_list` show current and former names, stable identity, harness, working directory, role, channels, inbound policy, state, latest ping, busy status, last contact and the actual harness session ID. Filters select a literal working-directory prefix, an exact harness or current channel membership; all supplied filters must match.
+### Offline queue, TTL and replies
+
+A **queued message** waits for its target session identity to return. Disconnected sessions leave the active list after two minutes without losing waiting messages. Never-registered names and closed sessions return `unknown_target`. Recognised resumes restore the identity, name and queue, including after daemon restart.
+
+Queued messages expire at 24 hours by default; `queueTtlMs` in `~/.asenq/config.json` changes the deadline in milliseconds. History defaults to seven days (`historyDays`). Restart the daemon after configuration changes. A **delivered message** means the delivery mechanism accepted it, not that the session read or acted on it. A reciprocal delivered direct message with `reply_to` makes its original a **replied message** (`replied`), without changing the session's **inbox position**. [Expiry, reply exceptions and flood limits](docs/how-delivery-works.md#queue-expiry-replies-and-retention).
+
+### Held messages and inbound policy
+
+**Inbound policy** is `accept`, `hold`, or `refuse`. `hold` reserves session-sent direct messages for the human; human sends bypass hold, but `refuse` rejects both. Only the human can inspect **held messages**, release them, or drop them. Held messages do not expire by age; releasing into the queue applies TTL from original creation time.
 
 ```sh
-asenq ls --cwd /work/project --harness opencode --channel backend
+asenq inbound worker-oc hold
+asenq held worker-oc
+asenq release m_…
+asenq drop m_…
 ```
 
-`lastSeen` is durable harness contact (registration, hooks, bound requests, acknowledgments and matched pongs), not direct-message activity. Legacy sessions without recorded contact show `unknown`. A disconnected row is `gone`; a connected row whose latest ping is `not_responding` is `stale`. Both have `stale=yes`. Never-pinged rows show `ping=never`; unsupported checks show `unknown (unavailable)`. New contact or messages do not clear a failed ping; an answered ping does.
+### Close, purge, stale sessions and ping
 
-Busy is informational: omp reports agent start/end, OpenCode reports session status, and Claude uses the existing UserPromptSubmit/Stop hooks. Scheduled omp continuations and Claude Stop hooks that return polled messages stay busy. Unknown or unsupported status is not idle; disconnect, registration and daemon restart reset it to unknown. Busy never changes delivery policy.
+Human-only `close` ends name forwarding and harness-identity revival, removes memberships, expires waiting messages with sender notices, and leaves an **archived conversation**. Resuming a **closed session** creates a fresh identity. Human-only **purge** permanently deletes archived conversations and removed identities, never live/reconnecting sessions or channel posts.
 
-When the actual harness session ID is known, the list includes a shell-quoted resume command: `claude -r <id>`, `omp -r <id>` or `opencode -s <id>`. Unknown IDs omit the command rather than inventing one.
+CLI close/purge accept an exact current name or stable identity ID, not former names, and run **without confirmation**; ambiguous archive names require an ID. `purge --all` deletes every archive at submission time. Use the TUI for a confirmation preview. [Destructive-action details](docs/how-delivery-works.md#closure-purge-and-confirmation).
+
+A **stale session** is disconnected (`gone`) or live with a latest ping of `not_responding`, never merely quiet. **? → Ping sessions** checks without a model turn; there is no CLI `ping` command. **? → Close all stale** pings afresh and previews exact identities. Unsupported live sessions stay `unknown` and are excluded. A failed ping does not disconnect/close the session; an answered ping replaces it. `asenq tail` reports ping results by identity.
+
+### Replacement
+
+Use `asenq replace <from> <to>`, `asenq_replace`, or **? → Replace session** when a newly registered session was not recognised as the same identity. The source may be any retained non-closed identity; the destination must be a different live session. The human may replace any source; an orchestrator must share a channel with it, or receives `not_permitted`.
+
+Replacement transfers a set source role, channel memberships, unreserved current/former names, and queued/held messages, then closes the source. A source with no role leaves the destination role unchanged. Conflicting names appear in `skippedNames`; other transfers still succeed. The destination keeps its name, cwd, inbound policy, harness association, history and reading position. Held messages stay held, and message metadata/TTLs stay unchanged. Source delivered history and outbound messages remain separate. Already-received messages cannot be withdrawn; replacement is not an exactly-once guarantee.
 
 ### Compact before a new task
 
-The human or a session with the **orchestrator** role can request target-context compaction before a direct message is injected:
+The human or an orchestrator can request compaction for one named session:
 
 ```sh
 asenq send worker-omp "Start the next task" --kind task --reset compact
 ```
 
-The agent equivalent is `asenq_send { to: "worker-omp", text: "Start the next task", kind: "task", reset: "compact" }`. Workers and unset-role sessions receive `not_permitted`; broadcasts (`"*"`), the human address, stable-ID sends and channel posts reject the flag with `bad_request`. Normal inbound policy and queue admission still apply.
+Or use `asenq_send` with `kind: "task", reset: "compact"`. omp summarises existing context before injection without automatically continuing interrupted work; identity and harness session ID stay unchanged. OpenCode, Claude Code and adapters without the capability deliver normally (`unsupported`); OpenCode support is tracked in [#42](https://github.com/parciffal/asenq/issues/42). Failure to compact still delivers the message.
 
-- **omp:** the adapter declares `compact`, awaits `ctx.compact({ suppressContinuation: true })`, then injects the message. Compaction does not automatically continue the interrupted task.
-- **OpenCode / Claude Code / adapters without the capability:** no compaction; the message is delivered normally. OpenCode compaction is tracked separately in [#42](https://github.com/parciffal/asenq/issues/42).
+The initial capable-target result is `reset=pending`; final `resetResult=compacted|failed|unsupported` appears in history/tail and `asenq log --id <msgId>`, or TUI message details (Enter). Workers/unset-role sessions receive `not_permitted`; broadcasts, `human`, stable-ID sends and channel posts reject reset with `bad_request`. Normal inbound policy applies. [Receipt, timeout and retry mechanics](docs/how-delivery-works.md#compact-before-delivery).
 
-A capable live target acknowledges receipt immediately: the send result reports **`reset=pending`**, not completed compaction. The adapter then compacts and delivers the task; history and tail events record **`resetResult=compacted`** or **`resetResult=failed`**. Failure to compact still delivers the message. A target without the capability reports **`reset=unsupported`** once delivered, also retained as `resetResult=unsupported`. `asenq log --id <msgId>` shows the final outcome.
+## Agent (MCP) tools
 
-In the TUI, select a transcript message with the arrow keys and press Enter to see its `reset` request and final `resetResult`.
-
-Held and queued sends retain the request but omit the initial reset outcome. They resolve the current adapter capability and compact only on actual delivery. Later sends to a target with a pending reset queue in the daemon, avoiding repeated pushes during a slow compaction; other sessions remain independent. Completion flushes that target's queue.
-
-A pending reset has a **10-minute** daemon-side cap (`DaemonOpts.resetTimeoutMs`); sweep expiry records failure and releases deferred delivery attempts. Disconnect also ends the pending reset as failed; deferred messages remain queued for reconnection. A hung harness API is not repaired by this deadline: subsequent attempts still use normal delivery acknowledgments and retries. An adapter injection error or an interrupted accepted delivery is recorded as failed without repeating compaction.
-
-Before receipt acceptance, queue expiry or delivery-binding removal/replacement cancels the pending attempt and immediately releases the target's delivery gate. A stale compact receipt is rejected, not relabeled as unsupported; adapters do not compact or inject after that rejection.
-
-Every compact push carries a unique `resetAttempt` token, echoed in its receipt and completion. A stale push cannot acquire permission from a later retry of the same message.
-
-This summarizes the existing context; it never clears context or creates a new harness session. The harness session ID and asenq identity stay unchanged.
-
-### Human-assigned roles
-
-Use `asenq role <name> orchestrator|worker|unset`, or **? → Set role** in the TUI, to assign or clear a live or reconnecting session's role. The human can edit any role. An orchestrator can use `asenq_set_role` for sessions sharing at least one channel with it; workers and sessions with an unset role receive `not_permitted`. Roles do not enforce work or change inbound policy; the orchestrator role permits scoped roster/role editing and compact-before-delivery requests.
-
-A role belongs to the session identity, not its name: renaming and reconnecting preserve it, while a different identity reusing the name starts unset. `asenq ls` and `asenq_list` show the role. Every delivered direct-message header tells the recipient its own role (`your-role=worker` or `your-role=orchestrator`); unset roles omit that label. TUI rows use inverse `orch` / `wrk` tags beside short harness labels, with metadata on a second row when needed; the conversation header also shows the full role. Archived identities retain their dimmed role tag; automatically removed identities accept queued direct messages while retained.
-
-### Channel rosters
-
-Channels have durable names and rosters of session identities. A session may belong to several channels, with any mix of roles. Membership survives rename, temporary disconnection, automatic removal and revival; another identity reusing a name does not inherit it. Human **close**, archive **purge** and identity retention remove that identity's memberships without deleting the channel or its posts. Late Claude lineage recognition unions provisional memberships into the ancestor, preserves an existing ancestor role or inherits the provisional role when unset, and leaves the ancestor's inbound policy unchanged.
-
-The human can create channels and edit any roster through the CLI or **? → Create channel / Add channel member / Remove channel member** in the TUI. An orchestrator can create a new channel with itself as first member, or add itself to any existing channel; it can edit other members only in channels it belongs to. Workers and unset-role sessions cannot create channels or edit rosters. Adding requires a live target. Removal resolves current names before former names within that roster and refuses ambiguous matches; the human can instead pass `--session-id` to remove a specific identity, including an archived member. The TUI always removes by identity.
-
-Posting to an unknown channel still creates it, with an empty roster and no automatic membership. Existing post-only channels migrate with empty rosters. Add/remove/member queries require an existing channel. Channel reads remain unrestricted: membership alone does not push channel posts. Mention delivery is opt-in per post.
-
-An agent's `"*"` direct-message broadcast reaches each **live** session sharing any of its channels, once even if several channels overlap, and never the sender. A member with no live co-members reaches nobody; it does not fall back to machine-wide delivery. A sender belonging to no channel reaches every other live session on the machine. Human broadcasts remain machine-wide, and the human is never a broadcast target. Named direct messages remain unrestricted by membership; broadcasts use the same inbound policy, rate limits and delivery handling as other direct messages.
-
-The Channels tab lists each roster under its channel with role and lifecycle state. Selecting a member keeps the channel conversation and composer in channel scope, not a direct message. Purging retained posts keeps the channel; deleting an identity through retention removes its memberships.
-
-### Channel mentions
-
-Mention a member's current or former name to deliver a channel post as a direct message. Group keywords take precedence over member names:
-
-| Token | Targets |
+| Tool | Purpose |
 |---|---|
-| `@orch`, `@orchestrator`, `@orchestrators` | Members with the orchestrator role |
-| `@wrk`, `@worker`, `@workers` | Members with the worker role |
-| `@all` | All channel members |
+| `asenq_send` | Direct message to a name, `"*"`, or `"human"`; `text`, `file`, or both. Optional `kind`, `action`, `reset`, `thread`, `reply_to`, `done`. |
+| `asenq_file_check` | Compare a retained direct message's file reference by `id`: `match`, `changed`, `missing`. |
+| `asenq_list` | Rich session list; caller marked `[you]`. Optional `cwd`, `harness`, `channel` filters. |
+| `asenq_inbox` | Delivered unread by default; optional `id`, `limit`, `since`, `before`, `thread`, `from`, `unread_only`. |
+| `asenq_thread_read` | Full retained direct-message thread, both directions, oldest first; required `thread`, optional `since`. |
+| `asenq_rename` | Rename the calling session with `name`; former names keep forwarding. |
+| `asenq_replace` | Exactly one of `from` / `from_id` and one of `to` / `to_id`; returns source, destination and skipped names. |
+| `asenq_set_role` | Set `name` to `role` (`orchestrator`, `worker`, `unset`), subject to role/channel permissions. |
+| `asenq_channel_create` | Create `channel`; an orchestrator creating a new one joins it. |
+| `asenq_channel_add` / `asenq_channel_remove` | Edit `channel` membership by `name`; removal checks current names before former names and refuses ambiguity. |
+| `asenq_channel_members` | Read `channel` roster with full names, roles, raw state and identity IDs. |
+| `asenq_channel_send` / `asenq_channel_read` / `asenq_channel_list` | Post `text`, read a channel (`limit` 1–100, default 20), or list channels including empty ones. |
 
-Every group excludes the posting session; the human is never a target. Each resolved identity is targeted once per post, even when named repeatedly or included by several groups. A group with no matching members is valid and produces no direct messages. Current names take precedence over former names within the roster; an ambiguous former name is an error.
+**Message meaning:** `kind` is `chat`, `task`, `result`, `status`, or `control`. A **thread** is a free-form label; a **reply reference** (`reply_to`) names the message answered; a **done marker** is the sender's final-message indication, not session closure or managed work completion.
 
-Mentions start at the beginning of text, after whitespace, or after `(`, `[`, `{`, `<`, `"`, `'`, or a backtick. A token ends at the first character outside ASCII letters, digits, `_` and `-`: `(@alpha)`, `"@alpha"` and `@alpha,` address `alpha`. Other preceding characters block mentions, so `foo@alpha`, `foo+@alpha.example` and `foo-@alpha.example` stay literal. Parsing is case-sensitive and has no Markdown or code-block exceptions.
+**Control messages:** `kind: "control"` requires `action: "pause"|"resume"|"cancel"` and text or a file reference; `action` is invalid for other kinds. Delivery carries `[URGENT]` and the action, but asenq never pauses, resumes or cancels a session, changes its inbound policy, or bypasses hold/refuse, rate limits or queues. The TUI displays control actions; send through the CLI or tool, not the TUI editor: `asenq send worker-oc "Pause after the current check" --kind control --action pause`.
 
-An unknown, ambiguous or non-member token fails the **whole post** with `unknown_mention`, listing valid members and any ambiguous candidates. No channel, retained post or direct message is created by that failed request. Use `asenq_channel_members` to inspect the roster before posting.
+**File references:** prefer them over bodies longer than ~4,000 characters. Send `file: { path: "/absolute/path/to/findings.md", summary: "API findings" }`; omit `text` only with `file`. The path must be a readable regular file; summary is required, at most 500 characters. asenq records path, summary, byte size and SHA-256, not contents or new permissions. Only the retained direct message's sender/receiver can check it; a match is not a lock. CLI/TUI have no file-reference composer. [File checks](docs/how-delivery-works.md#file-references).
 
-```sh
-asenq channel send work "Review @alpha; status from @workers"
-```
-
-The pushed direct-message header names the channel and poster; the post body is unchanged. Direct-message policies still apply: agent posts to held targets remain held, refused targets are rejected, and human posts bypass hold just as ordinary human direct messages do. Sends return the post's `msgId` and per-target `results` with real states, rather than claiming that a held or rejected target was delivered. The CLI and `asenq_channel_send` show those target names and states. Posts without mentions remain on demand.
-
-Auto-removed members retain their identity and membership: accepted mention messages queue under that stable identity and deliver after revival, including across daemon restarts. Closing an identity removes its memberships and excludes it from group mentions. Its current and former names fail with `unknown_mention` unless another eligible member now resolves that token.
-
-In the TUI channel composer, type `@` to open a member and keyword picker, then keep typing to filter. Arrow keys choose a token; **Enter inserts it without posting**. A later Enter sends the draft. Escape dismisses the picker without discarding the draft. Direct-message composers and email text do not open it.
-
-### File references
-
-Prefer a file reference for anything over **~4,000 characters**, rather than pasting a large body into a direct message. Agent tools accept:
-
-```json
-{
-  "to": "worker-oc",
-  "text": "Please review the findings",
-  "file": {
-    "path": "/absolute/path/to/findings.md",
-    "summary": "API test findings and suggested fixes"
-  },
-  "thread": "api-review"
-}
-```
-
-Call `asenq_send` with this object; `text` may be omitted when `file` is present. `path` must be an **absolute path to a readable regular file** on this machine. `summary` is required and limited to **500 characters**. Invalid, missing or unreadable paths are errors, not empty attachments.
-
-The daemon reads the file once at send time and stores only its **path, summary, SHA-256 hash and byte size**, never its contents. Delivery and agent inbox/thread reads show the summary, path, size, a 12-character hash prefix and a check hint. The recipient reads the source file on demand under the same OS user's filesystem permissions; asenq does not copy, upload, freeze or grant access to the file. File references are direct-message metadata, not channel attachments. Sending references and checking them are exposed through agent tools; the CLI and TUI have no file-reference composer.
-
-Hashing streams asynchronously after checking the open file's type; byte size comes from that check. There is no file-byte limit, and existing request timeouts still apply to very large or slow files. File metadata appears before optional text, including in the TUI's existing message views; a clipped Claude delivery points to `asenq_inbox id=…` for full recovery.
-
-Use `asenq_file_check { id: "m_…" }` to compare the current file with the full send-time hash:
-
-- `match`: the current contents match the snapshot.
-- `changed`: the file is readable, but its contents differ.
-- `missing`: the file is gone, unreadable or no longer a regular file.
-
-Only the retained direct message's sender or recipient can check its reference, using their session identity rather than a reusable name; `human` is authorized for messages sent to or from its inbox. An unknown or unrelated message, or one with no file reference, is an error. The original metadata remains in message history even if the file changes or disappears. A matching hash is **not a lock or an immutable attachment**: the file can change between the check and a read, or during a read. Read and verify again when that distinction matters.
-
-### Inbox paging and full-text recovery
-
-`asenq_inbox` defaults to `unread_only: true`, `limit: 20` (maximum 200). A session's plain unread read returns delivered messages **oldest delivery first**, exactly once through these reads, and advances its durable inbox delivery position to the last returned message; repeat it to drain delivered unread messages. Held or queued messages become unread only when delivered, even if created before messages already read. Delivery alone does not mark a session's inbox read. Adding `thread`, `from`, `since`, or `before` makes an unread read non-mutating and **newest creation first**. `unread_only: false` also returns newest-creation-first history without advancing the position. Human unread uses the existing shared read markers and reminders; inbox reads do not change them.
-
-`thread` and `from` match exact labels and sender names. `since` is exclusive newer-than; `before` is exclusive older-than. Both accept a string containing an ISO timestamp, decimal Unix milliseconds, or a retained message id. Timestamp cursors compare creation times; message-id cursors compare durable message order, so they distinguish messages with equal timestamps. Filters combine. For older history, keep the same filters and set `before` to the oldest fully displayed message id in the result; the **more available** marker normally includes this hint. For a plain unread read, call `asenq_inbox` again instead.
-
-Non-id inbox output is capped at **16,000 JavaScript characters**, including headers, separators and markers. The tool asks the daemon for a 15,000-character serialized-message budget, reserving room for formatting and recovery hints before unread advances. Whole messages are preferred; a near-cap whole message may use a compact **more available** marker without the paging hint. An oversized first message keeps its header/id and a Unicode-safe clipped body with an explicit **truncated / more available** marker. Oversized metadata may also be omitted to preserve the id and cap. Do not page past a clipped message to recover its missing text.
-
-Recover it with `asenq_inbox { id: "m_…" }`: this explicit lookup returns exactly one full, **uncapped** retained message sent or received by the caller, overrides other filters and does not advance the inbox. For a threaded message, `asenq_thread_read { thread: "label" }` also returns the full retained direct-message thread in durable ascending order, across both directions for the caller; optional `since` uses the same exclusive cursor rules. Thread reads are uncapped and non-mutating; channel posts and unrelated participants' messages are excluded. These explicit recovery reads can return large results.
+**Inbox reads:** plain `asenq_inbox` drains delivered unread oldest delivery first (default 20, maximum 200), advancing the session's **inbox position**. Held/queued messages become unread on delivery. Filtered reads and `unread_only: false` are non-mutating, newest creation first. Output is capped at 16,000 characters; recover clipped text with uncapped, non-mutating `asenq_inbox { id: "m_…" }` or `asenq_thread_read`. [Paging and exact filter rules](docs/how-delivery-works.md#inbox-position-and-full-text-recovery).
 
 ## Shell commands
 
-```sh
-asenq ls                              # sessions
-asenq ls --cwd /work --harness omp --channel backend
-asenq send orch "status?"             # send as the user ("human")
-asenq send '*' "stop and commit"      # broadcast
-asenq inbox                           # messages agents sent to "human"
-asenq tui                             # interactive human console
-asenq tail                            # live feed of messages and session events
-asenq log [--session name] [--id m_…] [--limit n]
+```text
+asenq ls [--cwd prefix] [--harness claude|omp|opencode] [--channel name]
+asenq send <name|*|human> <text…> [--kind k] [--action pause|resume|cancel]
+           [--reset compact] [--thread t] [--reply-to id] [--done]
+asenq inbox                         # human inbox; does not mark read
+asenq tail                          # live messages and session/channel events
+asenq log [--session name] [--id msgId] [--limit n]
 asenq rename <old> <new>
-asenq replace <from> <to>              # replace by current/former names
-asenq replace --from-id <id> <to>      # stable source id
-asenq replace <from> --to-id <id>      # stable destination id
+asenq replace <from> <to>
+asenq replace --from-id <id> <to>
+asenq replace <from> --to-id <id>
 asenq replace --from-id <id> --to-id <id>
-asenq close <name|identity>            # terminally archive a session
-asenq purge <name|identity>            # permanently delete one archive
-asenq purge --all                     # permanently delete every archive
+asenq close <name|identity>
+asenq purge <name|identity> | asenq purge --all
 asenq inbound <name> accept|hold|refuse
 asenq role <name> orchestrator|worker|unset
-asenq held [name] · asenq release <msgId> · asenq drop <msgId>
-asenq channels · asenq channel read <ch> · asenq channel send <ch> <text…>
-asenq channel create <ch>
-asenq channel add <ch> <live-name>
+asenq held [name] | asenq release <msgId> | asenq drop <msgId>
+asenq channels
+asenq channel create <ch> | asenq channel add <ch> <live-name>
 asenq channel remove <ch> <member-name>
 asenq channel remove <ch> --session-id <session-id>
 asenq channel members <ch>
-asenq daemon start|stop|status
+asenq channel read <ch> [--limit n] | asenq channel send <ch> <text…>
+asenq tui
+asenq daemon run|start|stop|status
 asenq setup [--remove]
 asenq doctor
 ```
 
-Human `asenq inbox` prints the newest 20-message page oldest first and does not change read markers.
+## TUI (keys and palette)
 
-`close` is human-only: it terminally archives the session, removes its channel memberships, expires its queued/held messages with sender notices, and ends resolution through its current/former names and harness identity. Notices for offline, non-closed senders queue for delivery when the same sender identity revives; closed senders receive none. Resuming a closed harness session creates a new identity without its old memberships. Closing an already closed identity is safe to repeat. `purge` is also human-only and permanently deletes archived conversations, their removed identities, memberships and reading positions; it never deletes live/reconnecting sessions, channels or channel posts, even posts authored by a purged identity. Independent delivery-failure notices remain with their senders. Retained replies keep their original message ID and show **(purged message)** when the referenced message is gone.
-
-These commands accept an exact **current** name or a stable identity ID; former names are not destructive-command targets. `close` prefers a live/reconnecting name over old archives. `purge` rejects a name also held by a live/reconnecting session. Ambiguous archive names are rejected with candidate IDs; use an explicit archived ID instead. The CLI prints the actual closed/purged IDs and runs immediately, without an interactive confirmation (like `drop`); `purge --all` deletes all archives at submission time. Use the TUI for a visible confirmation preview.
-
-## Human console (`asenq tui`)
-
-Full-screen view of live and archived session conversations (messages involving that session, not only messages to you). Four tabs — **Sessions**, **Inbox**, **Channels**, **Activity** — share one layout: list beside conversation at ≥80 columns, or a picker on narrower terminals.
-
-Sessions groups **LIVE** (`●`), **RECONNECTING** (`◌`) and a collapsed **▸ archive N**, sorted by recent direct-message activity. Rows show `cc` / `oc` / `omp` harness labels, role tags and `⏸` for a non-accepting inbound policy. Failed probes show a warning dot and a separate `not_responding` detail row without displacing other metadata; clicking that row still selects the same identity. The selected identity keeps its cyan `▌` marker and name highlight while you read or write. Renaming keeps a conversation; reusing a removed name starts another. Channels show the same identity cues in their member lists.
-
-Transcript headers put sender → target on the left and delivery state with time on the right. Non-chat kinds use a tag; chat omits it. A dashed cyan **N new** divider uses the human unread count, not intervening agent traffic. Direct agent-to-agent blocks are dim and adjacent blocks omit blank spacers; messages to/from the human and channel posts keep full contrast. Every body stays wrapped and reachable, never truncated; only labels shorten with `…`. When scrolled away from the tail, **End ↓ latest** appears outside the readable message rows.
+`asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues.
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Move focus: tabs → list → conversation → composer |
-| `↑` / `↓`, `Enter` | Move/open in a list; select messages in a conversation |
-| `/` | Search sessions by current or former name |
-| `PageUp` / `PageDown`, `Home`, `End` | Scroll; top loads older history; `End` jumps to latest |
-| `c` | Inline composer: `Enter` sends, `Shift+Enter` newline (`Alt+Enter` / `Ctrl+J` fallback), `Esc` keeps the draft |
-| `Ctrl+E` | Full editor with kind, thread, reply-to and done |
-| `u` | Mark the latest eligible item unread again |
-| `Ctrl+X` | On a selected Sessions list row only: close after a single-key `y` / `n` confirmation; no composer binding |
-| `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity |
-| `?` | Searchable action palette (broadcast, hold/release, setup, daemon, …) |
-| `Esc`, `q` | Dismiss / back / quit |
+| `Tab` / `Shift+Tab` | Focus tabs → list → conversation → composer. |
+| `↑` / `↓`, `Enter` | Move/open list items; select messages and open details. |
+| `/`, `Ctrl+K` | Search current/former names; quick-jump to sessions, archives or `#channel`. |
+| `PageUp` / `PageDown`, `Home`, `End` | Scroll; top loads older history; End jumps to latest. |
+| `c` | Compose; Enter sends, Shift+Enter newline (Alt+Enter / Ctrl+J fallback); Esc keeps draft. |
+| `Ctrl+E` | Full editor: kind, thread, reply-to, done. |
+| `u` | Set an **unread reminder** on the latest eligible item. |
+| `Ctrl+X` | Close selected Sessions list row after y/n confirmation; not a composer binding. |
+| `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity. |
+| `v`, `f` | Inbox grouped/feed toggle; Activity read-marker event filter. |
+| `?` | Searchable action palette. |
+| `Esc`, `q` | Dismiss/back/quit. |
 
-Unread is **not delivery**. Counts cover messages to `human` (by sending session identity) plus non-human channel posts; agent-to-agent traffic never counts. Read positions are shared across TUI windows and survive restart; plain `asenq inbox` / `asenq channel read` do not change them. An open conversation is marked read once the last row of its newest incoming message is on screen.
+The palette covers broadcast, held-message review/release/drop, rename, replacement, inbound policy, roles, ping/close, channel creation/membership, purge, daemon, setup and doctor. Selecting a channel member keeps conversation/composer in channel scope. Type `@` there to pick/filter members or keywords: Enter inserts a mention **without posting**, later Enter sends; Esc keeps the draft. Direct-message composers and email text do not open that picker.
 
-Use **? → Ping sessions** to check live sessions and refresh their status. OMP and OpenCode adapters answer immediately through their connection, without starting a model turn; Claude sessions with a messaging socket are probed through that socket. A failed check shows **not_responding** on the session row but does not disconnect or close it. A later answered ping replaces that status; disconnection clears the cached ping.
+**Human read markers** are shared across consoles and survive restart. Unread counts cover direct messages to `human` by sending identity plus non-human channel posts, never session-to-session traffic. A conversation marks read when the last row of its newest incoming message is visible; plain CLI inbox/channel reads do not. The header's failed count covers all retained failed/expired direct messages. Bodies wrap without truncation; **End ↓ latest** sits outside readable rows. [Display and confirmation details](docs/how-delivery-works.md#console-display-and-reading).
 
-`asenq tail` includes ping results keyed by stable session identity, so failed probes and later recoveries remain visible outside the TUI.
+Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste never confirm. Close/purge submit only previewed identity IDs. Select Archive for **Purge all archives**, or an archived conversation for **Purge conversation**. Replacement picks a non-closed source and different live destination, checks eligibility again on confirmation, and shows skipped names in full. History, drafts and reading positions stay separate; other consoles reconcile moved messages and archived ordering.
 
-The palette's **Close all stale** action first waits for a fresh ping, refreshes session state, then previews disconnected (`gone`) sessions and live sessions whose latest ping is `not_responding`. Quiet running sessions are not stale, even after hours without direct messages: direct-message activity is informational only. A supported adapter that answers is `responding`; hook-only Claude sessions and older adapters that do not declare ping support are `unknown` and safely excluded while live. Disconnected sessions are always stale regardless of their previous ping. Nothing is closed until you confirm the exact identity snapshot.
+## Upgrading
 
-Select the **Archive** heading or an archived conversation and use `?` for **Purge all archives** or **Purge conversation**, respectively. Every close/purge preview shows the exact target count, the first ten names with stable IDs, and an **and N more** count if needed. Press `y` to confirm or `n` / `Esc` to cancel; `Enter` does not confirm, pasted text is ignored, and arrow/page keys scroll longer previews. Only the previewed identity IDs are submitted: new targets or new archives are not silently added. Purge refreshes every open console's conversation, inbox and activity caches; unrelated conversations and channel posts remain.
-
-Use **? → Replace session** to choose any non-closed identity as the source, then a live destination other than that source. Picker rows reuse the session-list state, harness and role cues, with archived sources dimmed. The preview names the exact source and destination and wraps the full source-close warning; press `y` to confirm or `n` / `Esc` to cancel. `Enter` and pasted text do not confirm. The action uses the captured stable identity IDs, so renames or reused names cannot redirect it, and the destination's live eligibility is checked again on confirmation. On partial success, a scrollable result panel wraps every skipped name in full without claiming it forwards. After success, the destination's session and held-message caches refresh; its history, drafts and read position remain separate from the archived source.
-
-Other open consoles reconcile moved-message ownership and refresh archived-conversation ordering without merging histories or discarding drafts.
-
-The header's **failed** counter covers all retained failed or expired direct messages, not just the loaded conversation. Status events update it live; pruning retained history reduces it.
-
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 16).
-
-## How delivery works
-
-A per-user daemon listens on `~/.asenq/asenq.sock` (mode 0600) and stores sessions and messages in SQLite. Any asenq command or adapter starts the daemon if it isn't running.
-
-| Harness | Registration | Delivery |
-|---|---|---|
-| Claude Code | `SessionStart` hook; the MCP server attaches using `CLAUDE_CODE_SESSION_ID` | One user frame written to the session's `CLAUDE_CODE_MESSAGING_SOCKET`. If there is no socket, hooks deliver it: `PostToolUse` / `UserPromptSubmit` add it as context, and `Stop` blocks with it. |
-| OpenCode | Plugin, when a top-level session is created or first becomes active | `client.session.promptAsync` |
-| omp | Extension, at `session_start` of the main agent | `pi.sendUserMessage(text, { deliverAs: "aside" })` |
-
-Subagents (Claude subagents, OpenCode child sessions, omp subagents) are not registered.
-
-**What happens to messages:**
-
-- **The target disappears.** After 2 minutes disconnected sessions leave the active list, but automatic removal does not expire queued or held messages. Known non-closed offline identities still accept messages by their current name or, for the human, stable identity through the protocol, subject to inbound policy. Removed identities remain for at least `historyDays` after removal, and longer while retained messages reference them. Never-registered names and closed identities return `unknown_target`; rejected sends to closed identities add no history row. An active holder of a current name wins over retained holders; if only multiple non-closed removed identities hold that name, sends return `ambiguous_target` with candidate identities so the human can retry by stable id. Closed identities are excluded from these candidates.
-- **The session resumes.** omp/OpenCode registration keys and recorded Claude session ids restore the identity, current name and waiting messages, even after removal or a daemon restart. Claude resumes that change ids are also recognised by copied transcript lineage: only the first 8 JSONL lines are inspected. Exactly one offline match revives; a live match (a fork), ambiguous matches or unavailable lineage creates a new identity. If the copied head arrives later, hooks or MCP attach merge the provisional identity into its ancestor, keeping both queues, conversation history and human read state. Ambiguous candidate ids are logged for manual replacement. Sharing a name and working directory alone never establishes identity. If a revived name was claimed, revival chooses a suffix and records its former name.
-- **A resume transcript is still being copied.** Lineage recognition for `source=resume` waits for 8 complete JSONL lines. Shorter heads remain provisional and retry on later hooks or MCP attach, without timers; this avoids selecting a fork from partially copied evidence. Once a usable complete head decides revival, fork, ambiguity or no match, that decision is final: a later removed fork cannot replace the live identity.
-- **Loops and floods.** From one agent, the same text sent to the same target within 30 s is dropped. For control messages, the kind and action also distinguish duplicates, so identical text with `pause` then `resume` is delivered twice. Each agent can send 30 messages in a burst, then one every 2 s. A target with 50 queued messages refuses more.
-- **Inbound policy.** `asenq inbound <name> hold` holds messages from other agents until you run `asenq release` or `asenq drop`. Listing held message bodies with `asenq held`, releasing them and dropping them are user-only operations; registered agent connections cannot read held messages. `refuse` rejects them. Messages you send yourself skip `hold`.
-- **Queue expiry.** A queued message expires once its age reaches 24 hours, including while offline or awaiting an acknowledgment. Set `queueTtlMs` in `~/.asenq/config.json` to change this deadline in milliseconds (default `86400000`); setup preserves it. Restart the daemon after changing it. Expired messages are never delivered on revival, and a live agent sender gets an asenq delivery notice. Held messages do not expire by age, but releasing one into the queue applies the deadline from its original creation time.
-- **Replies.** A delivered direct message becomes `replied` when a later reciprocal direct message carries its id in `reply_to` and reaches the original sender. Queued or held replies wait until delivery. Direct messages admitted to the human inbox keep their existing `posted` status, which counts as delivered for reply confirmation; channel posts, third-party messages and daemon delivery notices do not count. Failed, expired or dropped originals never become replied. History and inbox reads retain the replied status, and it does not reset a session's unread position. Reply references to a retained original remain readable after it becomes replied; the status change does not mark it as purged.
-- **History.** Messages are kept for 7 days. Set `historyDays` in `~/.asenq/config.json` to change this.
-- **Stale sessions.** Only disconnected sessions or live sessions that fail a fresh ping are eligible for **Close all stale**. There is no idle-time threshold or automatic closure; unsupported clients have an `unknown` ping result and remain safe.
-
-## Claude Code notes
-
-- **Bypass mode.** Claude sessions running in bypass-permissions mode hold cross-session messages for approval unless `"crossSessionInbound": "accept"` is set. `asenq doctor` warns about this; asenq never changes Claude's permission settings.
-- **Native envelope (opt-in).** `"claude": { "envelope": true }` in `~/.asenq/config.json` wraps messages in Claude's own `<cross-session-message>` format. This shows the sender's name natively and lets Claude reply with its built-in messaging. The format is private and was checked against Claude Code 2.1.278–2.1.283. Restart the daemon after changing it (`asenq daemon stop`).
+Reinstall, run `asenq setup` if wiring needs refreshing, then `asenq daemon stop`. The next command starts the new daemon. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **17**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
 
 ## Limitations
 
-- **Not an orchestrator.** No spawning, task boards or merged worktrees — only messaging.
-- **OpenCode sessions** register once they exist. A freshly started TUI has no session until its first prompt.
-- **Same-user access.** Any process running as your OS user can connect to the socket and send as `human`.
-- **Windows** is not supported.
+- Local messaging only: no session spawning, task boards or worktree merging.
+- Same-user access: any process running as your OS user can connect and send as `human`; socket mode 0600 is not isolation between those processes.
+- OpenCode registers only once a session exists; a fresh TUI needs its first prompt.
+- Claude bypass-permissions mode may hold cross-session messages for approval unless `crossSessionInbound: "accept"` is set; doctor warns, and asenq does not change Claude permissions. Its optional native message format is private. [Claude configuration](docs/how-delivery-works.md#claude-code-settings).
+- Windows is unsupported. Subagents do not register. Compaction support is currently omp-only.
 
 ## Development
 
@@ -379,8 +231,6 @@ npm install
 npm test          # tsc + node:test
 ```
 
-`asenq daemon run` accepts test-only timing overrides in milliseconds: `ASENQ_ACK_TIMEOUT_MS`, `ASENQ_GRACE_MS`, and `ASENQ_TICK_MS` (which covers the sweep, retry and probe intervals).
-
-## License
+`asenq daemon run` has test-only millisecond overrides: `ASENQ_ACK_TIMEOUT_MS`, `ASENQ_GRACE_MS`, `ASENQ_TICK_MS` (sweep, retry and probe intervals). [Delivery internals](docs/how-delivery-works.md) explain lineage, receipts, retry/TTL interactions and retention.
 
 MIT — [parciffal/asenq](https://github.com/parciffal/asenq)
