@@ -87,6 +87,25 @@ Name lookup prefers live/reconnecting current names, then live/reconnecting form
 
 Explicit closure ends forwarding through every former name and the current name: a closed identity is excluded from name lookup, does not reserve names, and cannot receive new messages. Resuming its old harness session creates a fresh identity rather than reviving the closed conversation. Automatic removal is not closure and preserves forwarding and waiting messages.
 
+### Replacing a session
+
+When a newly registered session is not recognised as the same identity as the source, use `asenq replace <from> <to>`, **? → Replace session** in the TUI, or the `asenq_replace` agent tool. The source may be any non-closed retained identity, including a disconnected or automatically removed session; the destination must be live. CLI and agent-tool callers may select either endpoint by its ranked current/former name or by stable identity id.
+
+The destination keeps its current name, cwd, inbound policy, history, read position, harness association and existing roster. The source's set role overrides the destination role; otherwise the destination keeps its role. Channel memberships and the source's current/former names move to the destination, except names still held by another live or reconnecting identity. Those names are returned as `skippedNames`; replacement still succeeds and moves the other names and waiting messages.
+
+Queued and held inbound messages move to the destination without changing their ids, historical names, timestamps, TTLs or other message metadata. Held messages remain held for human review. The source is closed and archived: its delivered history, outbound messages, conversation and read markers remain separate. A human may replace any source; an orchestrator must share a channel with the source. Other callers receive `not_permitted`.
+
+Replacement cannot undo an in-flight delivery already received by the old source. Its late acknowledgments do not change the moved messages or the destination's delivery state, but moving work is not an exactly-once guarantee.
+
+CLI forms:
+
+```sh
+asenq replace <from> <to>
+asenq replace --from-id <source-id> <to>
+asenq replace <from> --to-id <destination-id>
+asenq replace --from-id <source-id> --to-id <destination-id>
+```
+
 ## Agent tools
 
 | Tool | Purpose |
@@ -97,6 +116,7 @@ Explicit closure ends forwarding through every former name and the current name:
 | `asenq_inbox` | Read unread direct messages (default) or recent history. Optional: `limit`, `since`, `before`, `thread`, `from`, `unread_only`, or `id` for full-text recovery. |
 | `asenq_thread_read` | Read the full retained thread involving the caller, sent and received, oldest first. Required: `thread`; optional: `since`. |
 | `asenq_rename` | Rename this session; former names keep forwarding. Another live/reconnecting identity's current or former name returns `name_taken`. |
+| `asenq_replace` | Replace one non-closed source identity with a live destination using `from` and `to` names or `from_id` and `to_id`. Moves role, channel memberships, unreserved names and waiting messages, then closes the source. The human may replace any source; an orchestrator must share a channel with it. The reply lists partially skipped names. |
 | `asenq_channel_send` / `_read` / `_list` | Named channels. Posts stay on demand unless they mention members; sends report each mention target's delivery state. |
 | `asenq_channel_create` | Create a channel. A new channel created by an orchestrator atomically includes it as the first member; creating an existing channel does not join it. |
 | `asenq_channel_add` / `_remove` / `_members` | Edit or inspect identity-backed rosters. An orchestrator may join an existing channel itself; editing other members requires membership. Reads are unrestricted. |
@@ -220,6 +240,10 @@ asenq tui                             # interactive human console
 asenq tail                            # live feed of messages and session events
 asenq log [--session name] [--id m_…] [--limit n]
 asenq rename <old> <new>
+asenq replace <from> <to>              # replace by current/former names
+asenq replace --from-id <id> <to>      # stable source id
+asenq replace <from> --to-id <id>      # stable destination id
+asenq replace --from-id <id> --to-id <id>
 asenq close <name|identity>            # terminally archive a session
 asenq purge <name|identity>            # permanently delete one archive
 asenq purge --all                     # permanently delete every archive
@@ -275,9 +299,13 @@ The palette's **Close all stale** action first waits for a fresh ping, refreshes
 
 Select the **Archive** heading or an archived conversation and use `?` for **Purge all archives** or **Purge conversation**, respectively. Every close/purge preview shows the exact target count, the first ten names with stable IDs, and an **and N more** count if needed. Press `y` to confirm or `n` / `Esc` to cancel; `Enter` does not confirm, pasted text is ignored, and arrow/page keys scroll longer previews. Only the previewed identity IDs are submitted: new targets or new archives are not silently added. Purge refreshes every open console's conversation, inbox and activity caches; unrelated conversations and channel posts remain.
 
+Use **? → Replace session** to choose any non-closed identity as the source, then a live destination other than that source. Picker rows reuse the session-list state, harness and role cues, with archived sources dimmed. The preview names the exact source and destination and wraps the full source-close warning; press `y` to confirm or `n` / `Esc` to cancel. `Enter` and pasted text do not confirm. The action uses the captured stable identity IDs, so renames or reused names cannot redirect it, and the destination's live eligibility is checked again on confirmation. On partial success, a scrollable result panel wraps every skipped name in full without claiming it forwards. After success, the destination's session and held-message caches refresh; its history, drafts and read position remain separate from the archived source.
+
+Other open consoles reconcile moved-message ownership and refresh archived-conversation ordering without merging histories or discarding drafts.
+
 The header's **failed** counter covers all retained failed or expired direct messages, not just the loaded conversation. Status events update it live; pruning retained history reduces it.
 
-Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 14).
+Needs a TTY on macOS/Linux under Node ≥ 22.13 or Bun. Keyboard works without mouse reporting. When upgrading, run `asenq daemon stop` and restart agent sessions whose asenq MCP/extension loaded the previous version (protocol revision is currently 16).
 
 ## How delivery works
 

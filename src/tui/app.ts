@@ -3,7 +3,7 @@ import { AsenqClient, type ClientOpts } from "../shared/client.js";
 import { KINDS, MENTION_KEYWORDS, hasMentionOpening } from "../shared/protocol.js";
 import { isStaleSession } from "../shared/sessions.js";
 import type {
-  ChannelSummary, HistoryScope, InboxSummary, PingStatus, PositionedEvent, ReadScope, ReadState, SendResult,
+  ChannelSummary, HistoryScope, InboxSummary, PingStatus, PositionedEvent, ReadScope, ReadState, ReplacementResult, SendResult,
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
 import { renderMessageBody } from "../shared/render.js";
@@ -42,7 +42,7 @@ const ACTION_GROUPS = [
   ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
-  ["Sessions", ["Rename session", "Inbound policy", "Set role", "Ping sessions", "Close session", "Close all stale"]],
+  ["Sessions", ["Rename session", "Replace session", "Inbound policy", "Set role", "Ping sessions", "Close session", "Close all stale"]],
   ["Channels", ["Create channel", "Add channel member", "Remove channel member"]],
   ["Archive", ["Purge conversation", "Purge all archives"]],
   ["Daemon", ["Daemon status", "Daemon start", "Daemon stop", "Reconnect", "Setup", "Remove setup", "Doctor"]],
@@ -66,6 +66,7 @@ const HELP = [
   "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
   "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
   "Session list: Ctrl+X closes the selected session after y/n confirmation. ? → Ping sessions refreshes responding status without a model turn. ? → Close all stale pings first and previews disconnected or not_responding sessions; quiet responding and unknown sessions are kept. Archive: ? → Purge conversation / Purge all archives permanently deletes only the confirmed identities.",
+  "Replace: ? → Replace session picks any non-closed source, then a live destination other than itself. The y/n preview uses the captured identities; role, channel memberships and waiting messages move to the destination, then the source is closed.",
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
@@ -125,6 +126,7 @@ type Pane = { rows: TerminalLine[]; cursor?: TerminalCursor };
 type JumpItem = { key: string; name: string; former?: string; session?: SessionIdentity; rank: number; state: number };
 type MentionItem = { key: string; name: string; former?: string; session?: SessionIdentity };
 type MentionPicker = { key: string; start: number; end: number; query: string; selected?: string; top: number };
+type FinderPurpose = "jump" | "replace-source" | "replace-target";
 
 /** Shift+Enter where the terminal reports it; Alt+Enter and Ctrl+J (iTerm's Shift+Enter) elsewhere. */
 const NEWLINE_KEYS: Record<string, true> = { SHIFT_ENTER: true, ALT_ENTER: true, CTRL_J: true };
@@ -155,6 +157,7 @@ export class ConsoleApp {
   private readonly client: AsenqClient;
   private sessions: SessionIdentity[] = [];
   private sessionOrders: Record<string, number> = {};
+  private sessionOrdersDirty = false;
   private sessionPings: Record<string, PingStatus> = {};
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
@@ -179,7 +182,7 @@ export class ConsoleApp {
   private panel?: Panel;
   private form?: Form;
   private palette?: { query: string; selected: number; top: number };
-  private finder?: { query: string; selected?: string; top: number };
+  private finder?: { query: string; selected?: string; top: number; purpose: FinderPurpose; replaceFrom?: string };
   private confirmation?: Confirmation;
   private mention?: MentionPicker;
   private notice?: Notice;
@@ -385,6 +388,7 @@ export class ConsoleApp {
   private applySnapshot(s: SyncResult): void {
     this.sessions = s.sessions;
     this.sessionOrders = { ...s.sessionLastOrders };
+    this.sessionOrdersDirty = false;
     this.sessionPings = { ...s.sessionPings };
     this.channels = s.channels;
     this.readStates = new Map(s.readStates.map((r) => [keyOf(r.scope), r]));
@@ -412,6 +416,12 @@ export class ConsoleApp {
       // Refresh only after relevant replay transitions; the held op is authoritative even
       // when a hold and its release both occurred between snapshots.
       if (this.heldDirty && !this.resync) await this.refreshHeld();
+      if (this.sessionOrdersDirty && !this.resync) {
+        // Closure may move the newest messages out of an identity. A loaded page cannot
+        // establish its remaining maximum; refresh orders without skipping replay events.
+        this.sessionOrders = (await this.client.sync()).sessionLastOrders;
+        this.sessionOrdersDirty = false;
+      }
     } catch (e) {
       this.connection = "offline";
       this.say(`Disconnected: ${stringify(e)} · reconnecting`, "error");
@@ -453,11 +463,28 @@ export class ConsoleApp {
         }
       }
       for (const [key, stream] of this.streams) {
+        if (!stream.loaded) continue;
+        const index = stream.messages.findIndex((x) => x.id === m.id);
         const matches = m.channel
           ? key === `c:${m.channel}`
           : key === `s:${m.fromSessionId}` || key === `s:${m.toSessionId}` || (key === "inbox" && m.to === "human");
-        if (!matches || !stream.loaded) continue;
-        const index = stream.messages.findIndex((x) => x.id === m.id);
+        if (!matches) {
+          if (index >= 0) {
+            const next = stream.messages[index + 1];
+            const previous = stream.messages[index - 1];
+            const neighbor = next ?? previous;
+            stream.messages.splice(index, 1);
+            stream.expanded.delete(m.id);
+            if (stream.selectedId === m.id) stream.selectedId = neighbor?.id;
+            const anchor = stream.viewport.anchor;
+            if (anchor?.id === m.id) {
+              if (next) stream.viewport = { ...stream.viewport, anchor: { id: next.id, row: 0 } };
+              else if (previous) stream.viewport = { ...stream.viewport, anchor: { id: previous.id, row: anchor.row } };
+              else stream.viewport = { follow: true };
+            }
+          }
+          continue;
+        }
         if (index >= 0) stream.messages[index] = m;
         else if (!stream.hasMore || !stream.messages.length || m.order > stream.messages[0].order) {
           stream.messages.push(m);
@@ -495,6 +522,7 @@ export class ConsoleApp {
       this.channels.sort((a, b) => b.lastOrder - a.lastOrder || a.name.localeCompare(b.name));
     } else if (e.type === "session") {
       const index = this.sessions.findIndex((s) => s.id === e.session.id);
+      if (e.session.closedAt !== undefined && this.sessions[index]?.closedAt === undefined) this.sessionOrdersDirty = true;
       if (index >= 0) this.sessions[index] = e.session;
       else this.sessions.push(e.session);
       for (const summary of this.summaries) if (summary.sessionId === e.session.id) summary.name = e.session.name;
@@ -829,13 +857,60 @@ export class ConsoleApp {
 
   private openFinder(): void {
     this.mention = undefined;
-    if (!this.finder) this.finder = { query: "", top: 0 };
+    if (!this.finder) this.finder = { query: "", top: 0, purpose: "jump" };
     this.render();
+  }
+
+  /** Any non-closed retained identity, including an automatically removed archive, may be replaced. */
+  private openReplaceSource(): void {
+    this.mention = undefined;
+    this.finder = { query: "", top: 0, purpose: "replace-source" };
+    this.render();
+  }
+
+  private beginReplaceTarget(sourceId: string): void {
+    this.finder = { query: "", top: 0, purpose: "replace-target", replaceFrom: sourceId };
+    this.render();
+  }
+
+  private replaceItems(): JumpItem[] {
+    const finder = this.finder!;
+    const query = finder.query.toLowerCase();
+    const items: JumpItem[] = [];
+    for (const session of this.sessions) {
+      const eligible = finder.purpose === "replace-source"
+        ? session.closedAt === undefined
+        : session.state === "live" && session.id !== finder.replaceFrom;
+      if (!eligible) continue;
+      let rank = jumpRank(session.name, query);
+      let former: string | undefined;
+      for (const name of session.previousNames) {
+        const previousRank = jumpRank(name, query);
+        if (previousRank < rank) {
+          rank = previousRank;
+          former = name;
+        }
+      }
+      if (rank !== Infinity) items.push({
+        key: `s:${session.id}`, name: session.name, session, rank,
+        state: session.state === "live" ? 0 : session.state === "gone" ? 1 : 2,
+        ...(former ? { former } : {}),
+      });
+    }
+    return items.sort((a, b) => a.rank - b.rank || a.state - b.state || a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+  }
+
+  private finderItems(): JumpItem[] {
+    return this.finder!.purpose === "jump" ? this.jumpItems() : this.replaceItems();
   }
 
   private finderIndex(items: JumpItem[]): number {
     const finder = this.finder!;
-    const index = Math.max(0, items.findIndex((item) => item.key === finder.selected));
+    const found = items.findIndex((item) => item.key === finder.selected);
+    if (found < 0 && finder.selected !== undefined && finder.purpose !== "jump") {
+      return -1;
+    }
+    const index = Math.max(0, found);
     finder.selected = items[index]?.key;
     return index;
   }
@@ -858,9 +933,64 @@ export class ConsoleApp {
     await this.opened();
   }
 
+  private async chooseFinderItem(key: string): Promise<void> {
+    const finder = this.finder!;
+    if (finder.purpose === "jump") return this.jumpTo(key);
+    if (finder.purpose === "replace-source") return this.beginReplaceTarget(key.slice(2));
+    if (!finder.replaceFrom) return this.render();
+    this.confirmReplace(finder.replaceFrom, key.slice(2));
+  }
+
+  private confirmReplace(fromId: string, toId: string): void {
+    this.finder = undefined;
+    const from = this.session(fromId);
+    const to = this.session(toId);
+    if (!from || !to) {
+      this.say("Replace picker target is no longer retained; reopen it.", "error");
+      return this.render();
+    }
+    const fromName = from.name;
+    const toName = to.name;
+    this.confirmation = {
+      title: "Replace session",
+      lines: [
+        `Replace ${fromName} with ${toName}? ${fromName} will be closed.`,
+        "",
+        "Role, channel memberships, former names and waiting messages move to the destination.",
+        "The source's existing conversation remains archived and readable.",
+        "y confirm · n cancel · Esc cancel",
+      ],
+      top: 0, height: 0, rows: 0, busy: false,
+      submit: async () => {
+        const snapshot = await this.client.sync();
+        const source = snapshot.sessions.find((session) => session.id === fromId);
+        const destination = snapshot.sessions.find((session) => session.id === toId);
+        if (!source || source.closedAt !== undefined) throw new Error(`source ${fromName} is no longer replaceable`);
+        if (!destination || destination.state !== "live" || destination.id === source.id) {
+          throw new Error(`destination ${toName} is no longer live`);
+        }
+        const result = await this.client.request("replace", { fromId, toId }) as ReplacementResult;
+        await this.hydrate();
+        if (result.skippedNames.length) {
+          this.showPanel("Replacement complete", {
+            lines: [
+              `Replaced ${result.from.name} with ${result.to.name}; ${result.from.name} is closed.`,
+              "",
+              "These names remain reserved by other live or reconnecting identities and do not forward to the destination:",
+              ...result.skippedNames,
+            ],
+          });
+        } else {
+          this.say(`Replaced ${result.from.name} with ${result.to.name}; ${result.from.name} is closed.`);
+        }
+      },
+    };
+    this.render();
+  }
+
   private async finderKey(k: KeyInput): Promise<void> {
     const finder = this.finder!;
-    const items = this.jumpItems();
+    const items = this.finderItems();
     const selected = this.finderIndex(items);
     if (k.name === "ESCAPE") this.finder = undefined;
     else if (k.name === "UP" || k.name === "DOWN") {
@@ -868,7 +998,7 @@ export class ConsoleApp {
       finder.selected = items[index]?.key;
     } else if (k.name === "ENTER" || k.name === "KP_ENTER") {
       const item = items[selected];
-      if (item) return this.jumpTo(item.key);
+      if (item) return this.chooseFinderItem(item.key);
     } else if (k.name === "BACKSPACE" || k.name === "CTRL_U") {
       finder.query = k.name === "CTRL_U" ? "" : finder.query.slice(0, stepGrapheme(finder.query, finder.query.length, -1));
       finder.selected = undefined;
@@ -883,13 +1013,14 @@ export class ConsoleApp {
 
   private finderPane(width: number, height: number, y0: number): Pane {
     const finder = this.finder!;
-    const items = this.jumpItems();
+    const items = this.finderItems();
     const selectedIndex = this.finderIndex(items);
     const boxed = width >= 6 && height >= 4;
     const inset = boxed ? 1 : 0;
     const innerWidth = Math.max(0, width - 2 * inset);
     const innerHeight = height - 2 * inset;
-    const title: TerminalLine = [{ text: "Quick jump", style: theme.accentBold }];
+    const title: TerminalLine = [{ text: finder.purpose === "jump" ? "Quick jump"
+      : finder.purpose === "replace-source" ? "Replace: source session" : "Replace: live destination", style: theme.accentBold }];
     const rows: TerminalLine[] = !boxed && innerHeight >= 2 ? [clipSpans(title, innerWidth)] : [];
     const queryRow = rows.length;
     const prompt = innerWidth >= 3 ? "› " : "";
@@ -903,18 +1034,41 @@ export class ConsoleApp {
     if (selectedIndex < finder.top) finder.top = selectedIndex;
     if (selectedIndex >= finder.top + available) finder.top = selectedIndex - available + 1;
     finder.top = Math.max(0, Math.min(finder.top, items.length - available));
-    if (!items.length && available) rows.push(clipSpans([{ text: "No matching sessions or channels", style: theme.dim }], innerWidth));
+    if (!items.length && available) {
+      const empty = finder.purpose === "jump" ? "No matching sessions or channels"
+        : finder.purpose === "replace-source" ? "No session available to replace" : "No other live session available";
+      rows.push(clipSpans([{ text: empty, style: theme.dim }], innerWidth));
+    }
     for (let index = finder.top; index < Math.min(items.length, finder.top + available); index++) {
       const item = items[index];
       const selected = item.key === finder.selected;
-      const left: TerminalSpan[] = [
-        this.marker(selected),
-        { text: item.session ? item.name : `#${item.name}`, style: selected ? theme.accentBold : theme.bold },
-        ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
-      ];
-      const right: TerminalSpan[] = item.session
-        ? [item.session.state === "gone" ? { text: "reconnecting", style: theme.warn } : this.stateLabel(item.session)]
-        : [{ text: "channel", style: theme.dim }];
+      let left: TerminalSpan[];
+      let right: TerminalSpan[];
+      if (item.session && finder.purpose !== "jump") {
+        const session = item.session;
+        const archived = session.state === "removed";
+        const failedPing = session.state === "live" && this.sessionPings[session.id] === "not_responding";
+        left = [
+          this.marker(selected, true),
+          { text: archived ? "  " : session.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || session.state === "gone" ? theme.warn : theme.ok },
+          { text: item.name, style: selected ? theme.brand : archived ? theme.dim : {} },
+          ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
+        ];
+        right = [{ text: harnessShortName(session.harness).padEnd(3), style: theme.dim }];
+        const role = session.role === "orchestrator" ? "orch" : session.role === "worker" ? "wrk" : "";
+        if (role) right.push({ text: " " }, { text: role, style: { ...theme.selected, ...(archived ? theme.dim : theme.bold) } });
+        if (session.inbound !== "accept") right.push({ text: " " }, { text: session.inbound === "hold" ? "⏸" : "refuse", style: session.inbound === "hold" ? theme.warn : theme.bad });
+        if (failedPing) right.push({ text: " " }, this.stateLabel(session));
+      } else {
+        left = [
+          this.marker(selected),
+          { text: item.session ? item.name : `#${item.name}`, style: selected ? theme.accentBold : theme.bold },
+          ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
+        ];
+        right = item.session
+          ? [item.session.state === "gone" ? { text: "reconnecting", style: theme.warn } : this.stateLabel(item.session)]
+          : [{ text: "channel", style: theme.dim }];
+      }
       this.hits.push({ row: y0 + inset + rows.length, start: inset, end: width - inset, target: { kind: "finder", key: item.key } });
       rows.push(justify(left, right, innerWidth, selected ? theme.selected : undefined));
     }
@@ -1043,7 +1197,7 @@ export class ConsoleApp {
 
   private footer(width: number): TerminalLine {
     let hints = this.confirmation ? (this.confirmation.busy ? "working…" : "y confirm · n cancel · Esc cancel · ↑↓ scroll")
-      : this.finder ? "type to filter · ↑↓ choose · Enter open · Esc close"
+      : this.finder ? (this.finder.purpose === "jump" ? "type to filter · ↑↓ choose · Enter open · Esc close" : "type to filter · ↑↓ choose · Enter select · Esc close")
       : this.palette ? "type to filter · ↑↓ · Enter run · Esc close · Ctrl+K jump"
       : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel · Ctrl+K jump"
       : this.searching ? "type name · ↑↓ · Enter keep · Esc clear · Ctrl+K jump"
@@ -1956,13 +2110,13 @@ export class ConsoleApp {
     const hit = this.hits.find((h) => h.row === m.row && m.column >= h.start && m.column < h.end);
     if (this.finder) {
       if (m.action === "wheel-up" || m.action === "wheel-down") {
-        const items = this.jumpItems();
+        const items = this.finderItems();
         const index = Math.max(0, Math.min(items.length - 1, this.finderIndex(items) + (m.action === "wheel-up" ? -1 : 1)));
         this.finder.selected = items[index]?.key;
         return this.render();
       }
       if (m.action === "press" && m.button === "left" && hit?.target.kind === "finder") {
-        return this.jumpTo(hit.target.key);
+        return this.chooseFinderItem(hit.target.key);
       }
       return;
     }
@@ -2292,6 +2446,7 @@ export class ConsoleApp {
             this.say(`${from} → ${String(reply.name)}`);
           }, [selected?.name ?? ""], ["Renaming keeps the same stable session identity and conversation."]);
           break;
+        case "Replace session": this.openReplaceSource(); break;
         case "Inbound policy":
           this.ask("Inbound policy", ["Session", "accept/hold/refuse"], async ([name, mode]) => {
             await this.client.request("set_inbound", { name, mode });

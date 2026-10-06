@@ -10,11 +10,11 @@ import { claudeFrame, parseEnvelopeReply, replyAddr } from "../src/daemon/claude
 import { Daemon } from "../src/daemon/daemon.js";
 import { AsenqClient } from "../src/shared/client.js";
 import { socketPath } from "../src/shared/paths.js";
-import { GRACE_MS, type SendResult, type SessionIdentity, type StoredMessage, type TailEvent } from "../src/shared/protocol.js";
+import { GRACE_MS, type ListedSession, type SendResult, type SessionIdentity, type StoredMessage, type SyncResult, type TailEvent } from "../src/shared/protocol.js";
 import { renderInbound } from "../src/shared/render.js";
 import { isStaleSession } from "../src/shared/sessions.js";
 import { openDb } from "../src/shared/sqlite.js";
-import { callTool } from "../src/shared/tools.js";
+import { callTool, isToolError } from "../src/shared/tools.js";
 import { isSession, isStatus, logOf, startEnv, type Delivery, type TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
@@ -5539,4 +5539,720 @@ test("channel mention delivery waits through the direct-message acknowledgment w
   } finally {
     t.mock.timers.reset();
   }
+});
+
+// ---------------------------------------------------------- session replacement (#10)
+
+type Replacement = { from: SessionIdentity; to: SessionIdentity; skippedNames: string[] };
+
+async function replace(c: AsenqClient, params: Record<string, unknown>): Promise<Replacement> {
+  return await c.request("replace", params) as unknown as Replacement;
+}
+
+function identityOf(snapshot: SyncResult, id: string): SessionIdentity {
+  const found = snapshot.sessions.find((session) => session.id === id);
+  assert.ok(found, `expected retained identity ${id}`);
+  return found;
+}
+
+type SemanticSnapshot = Pick<SyncResult, "watermark" | "eventFloor" | "sessions" | "channels" | "readStates">;
+
+async function semanticSnapshot(c: AsenqClient): Promise<SemanticSnapshot> {
+  const snapshot = await c.sync();
+  return {
+    watermark: snapshot.watermark,
+    eventFloor: snapshot.eventFloor,
+    sessions: snapshot.sessions,
+    channels: snapshot.channels,
+    readStates: snapshot.readStates,
+  };
+}
+
+test("replacing a removed source moves its identity, role, roster and queue to the live destination", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "tracer-sender", "sender");
+  const source = await env.adapter("omp", "tracer-source", "original");
+  await source.client.request("rename", { name: "middle" });
+  await source.client.request("rename", { name: "final" });
+  await human.request("set_role", { name: "final", role: "orchestrator" });
+  await human.request("channel_create", { channel: "work" });
+  await human.request("channel_add", { channel: "work", name: "final" });
+  const [delivered] = await send(sender.client, "final", "delivered before replacement");
+  const inbound = await source.nextDelivery();
+  assert.deepEqual([inbound.msg.id, inbound.msg.to], [delivered.msgId, "final"]);
+  const [outbound] = await send(source.client, "sender", "outbound from the source");
+  assert.equal(outbound.status, "delivered");
+  await sender.nextDelivery();
+
+  const gone = await env.watch(isSession("gone", "final"));
+  source.client.close();
+  await gone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const [queued] = await send(sender.client, "final", "queued for the moved identity");
+  assert.deepEqual([queued.to, queued.status], ["final", "queued"]);
+
+  const target = await env.adapter("omp", "tracer-target", "target");
+  const closedAt = env.clock.now();
+  const queuedDelivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const result = await replace(human, { fromId: source.session.id, toId: target.session.id });
+  assert.deepEqual([result.from.id, result.from.name, result.from.state, result.from.closedAt],
+    [source.session.id, "final", "removed", closedAt]);
+  assert.deepEqual([result.to.id, result.to.name, result.to.state, result.to.role],
+    [target.session.id, "target", "live", "orchestrator"]);
+  assert.deepEqual(result.skippedNames, []);
+  assert.deepEqual([...result.to.previousNames].sort(), ["final", "middle", "original"]);
+
+  const moved = await target.nextDelivery();
+  assert.deepEqual([moved.session, moved.msg.id, moved.msg.to], [target.session.id, queued.msgId, "final"]);
+  await queuedDelivered.event;
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: target.session.id })).messages.map(
+    (message) => [message.id, message.toSessionId, message.status],
+  ), [[queued.msgId, target.session.id, "delivered"]]);
+  for (const name of ["original", "middle", "final"]) {
+    const [forwarded] = await send(sender.client, name, `reach the moved identity via ${name}`);
+    assert.equal(forwarded.status, "delivered");
+    const delivery = await target.nextDelivery();
+    assert.deepEqual([delivery.session, delivery.msg.id, delivery.msg.to], [target.session.id, forwarded.msgId, "target"]);
+  }
+  const snapshot = await human.sync();
+  assert.equal(identityOf(snapshot, source.session.id).state, "removed");
+  assert.equal(identityOf(snapshot, target.session.id).role, "orchestrator");
+  assert.deepEqual((await human.request("channel_members", { channel: "work" })).members,
+    [identityOf(snapshot, target.session.id)]);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: source.session.id })).messages.map(
+    (message) => [message.id, message.status],
+  ), [[delivered.msgId, "delivered"], [outbound.msgId, "delivered"]]);
+});
+
+test("replacement authorizes a source-channel orchestrator and refuses workers, unset and destination-only orchestrators", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "perm-source", "source");
+  const target = await env.adapter("omp", "perm-target", "target");
+  const sourceOrch = await env.adapter("opencode", "perm-source-orch", "source-orch");
+  const destOrch = await env.adapter("opencode", "perm-dest-orch", "dest-orch");
+  const worker = await env.adapter("omp", "perm-worker", "worker");
+  const unset = await env.adapter("omp", "perm-unset", "unset");
+  await human.request("set_role", { name: "source-orch", role: "orchestrator" });
+  await human.request("set_role", { name: "dest-orch", role: "orchestrator" });
+  await human.request("set_role", { name: "worker", role: "worker" });
+  await human.request("channel_create", { channel: "shared" });
+  await human.request("channel_add", { channel: "shared", name: "source" });
+  await human.request("channel_add", { channel: "shared", name: "source-orch" });
+  await human.request("channel_create", { channel: "dest" });
+  await human.request("channel_add", { channel: "dest", name: "target" });
+  await human.request("channel_add", { channel: "dest", name: "dest-orch" });
+
+  const gone = await env.watch(isSession("gone", "source"));
+  source.client.close();
+  await gone.event;
+  const pending = await human.sendToSession(source.session.id, "waiting through replacement");
+  assert.equal(pending.status, "queued");
+
+  const before = await semanticSnapshot(human);
+  const historyBefore = (await human.historyPage({ scope: "session", sessionId: source.session.id })).messages;
+  const heldBefore = (await human.request("held")).messages as StoredMessage[];
+  const queuedBefore = await logOf(human, pending.msgId!);
+  for (const actor of [worker.client, unset.client, destOrch.client]) {
+    await assert.rejects(actor.request("replace", { fromId: source.session.id, toId: target.session.id }), { code: "not_permitted" });
+  }
+  assert.deepEqual(await semanticSnapshot(human), before);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: source.session.id })).messages, historyBefore);
+  assert.deepEqual((await human.request("held")).messages, heldBefore);
+  const queuedAfter = await logOf(human, pending.msgId!);
+  assert.deepEqual(queuedAfter, queuedBefore);
+  assert.deepEqual(target.deliveries, []);
+
+  const result = await replace(sourceOrch.client, { fromId: source.session.id, toId: target.session.id });
+  assert.deepEqual([result.from.closedAt !== undefined, result.to.id], [true, target.session.id]);
+  const delivery = await target.nextDelivery();
+  assert.deepEqual([delivery.session, delivery.msg.id], [target.session.id, pending.msgId]);
+});
+
+test("replacement transfers a set source role, preserves a destination role under an unset source, and unions rosters", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sourceA = await env.adapter("omp", "roster-source-a", "source-a");
+  const targetA = await env.adapter("omp", "roster-target-a", "target-a");
+  const sourceB = await env.adapter("omp", "roster-source-b", "source-b");
+  const targetB = await env.adapter("omp", "roster-target-b", "target-b");
+  await human.request("set_role", { name: "source-a", role: "orchestrator" });
+  await human.request("set_role", { name: "target-a", role: "worker" });
+  await human.request("set_role", { name: "target-b", role: "worker" });
+  for (const channel of ["overlap", "source-only", "target-only"]) await human.request("channel_create", { channel });
+  for (const [channel, name] of [
+    ["overlap", "source-a"], ["overlap", "target-a"], ["overlap", "source-b"], ["overlap", "target-b"],
+    ["source-only", "source-a"], ["target-only", "target-a"],
+  ] as const) await human.request("channel_add", { channel, name });
+
+  const resultA = await replace(human, { fromId: sourceA.session.id, toId: targetA.session.id });
+  assert.equal(resultA.to.role, "orchestrator");
+  const resultB = await replace(human, { fromId: sourceB.session.id, toId: targetB.session.id });
+  assert.equal(resultB.to.role, "worker");
+
+  const members = async (channel: string): Promise<string[]> =>
+    ((await human.request("channel_members", { channel })).members as SessionIdentity[]).map((session) => session.id);
+  assert.deepEqual((await members("overlap")).sort(), [targetA.session.id, targetB.session.id].sort());
+  assert.deepEqual(await members("source-only"), [targetA.session.id]);
+  assert.deepEqual(await members("target-only"), [targetA.session.id]);
+  const snapshot = await human.sync();
+  assert.deepEqual([identityOf(snapshot, targetA.session.id).role, identityOf(snapshot, targetB.session.id).role],
+    ["orchestrator", "worker"]);
+  assert.deepEqual([identityOf(snapshot, sourceA.session.id).closedAt !== undefined,
+    identityOf(snapshot, sourceB.session.id).closedAt !== undefined], [true, true]);
+});
+
+test("replacement skips names reserved by third identities and still transfers unreserved names and the queue", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "skip-sender", "sender");
+  // A removed holder keeps "foo" as a former name once it revives.
+  const holderFormer = await env.adapter("omp", "skip-holder-former", "foo");
+  let gone = await env.watch(isSession("gone", "foo"));
+  holderFormer.client.close();
+  await gone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const holderCurrent = await env.adapter("opencode", "skip-holder-current", "alpha");
+  gone = await env.watch(isSession("gone", "alpha"));
+  holderCurrent.client.close();
+  await gone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+
+  // The source claims both released names while the holders are removed, then renames onto "foo".
+  const source = await env.adapter("opencode", "skip-source", "fee");
+  await source.client.request("rename", { name: "alpha" });
+  await source.client.request("rename", { name: "foo" });
+  const revivedFormer = await env.adapter("omp", "skip-holder-former", "ignored");
+  assert.deepEqual(revivedFormer.session, { id: holderFormer.session.id, name: "foo-2" });
+  const revivedCurrent = await env.adapter("opencode", "skip-holder-current", "ignored");
+  assert.deepEqual(revivedCurrent.session, { id: holderCurrent.session.id, name: "alpha-2" });
+
+  const sourceGone = await env.watch(isSession("gone", "foo"));
+  source.client.close();
+  await sourceGone.event;
+  const moved = await human.sendToSession(source.session.id, "queued while the source is gone");
+  assert.equal(moved.status, "queued");
+
+  const target = await env.adapter("omp", "skip-target", "target-name");
+  await target.client.request("rename", { name: "target-current" });
+  const result = await replace(human, { fromId: source.session.id, toId: target.session.id });
+  assert.deepEqual([...result.skippedNames].sort(), ["alpha", "foo"]);
+  assert.equal(result.to.name, "target-current");
+  assert.deepEqual([...result.to.previousNames].sort(), ["fee", "target-name"]);
+
+  const movedDelivery = await target.nextDelivery();
+  assert.equal(movedDelivery.msg.id, moved.msgId);
+  const [viaUnreserved] = await send(sender.client, "fee", "fee is not reserved");
+  assert.equal((await target.nextDelivery()).msg.id, viaUnreserved.msgId);
+  const [viaOwnFormer] = await send(sender.client, "target-name", "the destination keeps its own former name");
+  assert.equal((await target.nextDelivery()).msg.id, viaOwnFormer.msgId);
+  const [viaReserved] = await send(sender.client, "foo", "foo still belongs to the third holder");
+  assert.equal((await revivedFormer.nextDelivery()).msg.id, viaReserved.msgId);
+  const [viaReservedCurrent] = await send(sender.client, "alpha", "alpha still belongs to its third holder");
+  assert.equal((await revivedCurrent.nextDelivery()).msg.id, viaReservedCurrent.msgId);
+  assert.deepEqual(target.deliveries.map((delivery) => delivery.msg.id), [moved.msgId, viaUnreserved.msgId, viaOwnFormer.msgId]);
+});
+
+test("replacement moves held messages without push or expiry, and the human acts on the exact id at the destination", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "held-sender", "sender");
+  const target = await env.adapter("omp", "held-target", "target");
+  const source = await env.adapter("omp", "held-source", "source");
+  await human.request("set_inbound", { name: "source", mode: "hold" });
+  const [first] = await send(sender.client, "source", "held for release");
+  const [second] = await send(sender.client, "source", "held for drop");
+  assert.deepEqual([first.status, second.status], ["held", "held"]);
+  assert.deepEqual(source.deliveries, []);
+
+  const result = await replace(human, { fromId: source.session.id, toId: target.session.id });
+  assert.equal(result.to.id, target.session.id);
+  assert.equal(target.deliveries.length, 0);
+  assert.deepEqual(((await human.request("held")).messages as StoredMessage[]).map(
+    (message) => [message.id, message.toSessionId, message.to, message.status],
+  ), [[first.msgId, target.session.id, "source", "held"], [second.msgId, target.session.id, "source", "held"]]);
+  assert.deepEqual(((await sender.client.request("inbox")).messages as StoredMessage[]).filter(
+    (message) => message.from === "asenq" && (message.replyTo === first.msgId || message.replyTo === second.msgId),
+  ), []);
+
+  // The destination forwards the source name; an unrelated identity must not receive this held action.
+  assert.ok(result.to.previousNames.includes("source"));
+  await assert.rejects(env.adapter("omp", "held-reused", "source"), { code: "name_taken" });
+  const unrelated = await env.adapter("omp", "held-unrelated", "unrelated");
+  assert.notEqual(unrelated.session.id, source.session.id);
+  const delivered = await env.watch(isStatus(first.msgId, "delivered"));
+  assert.equal((await human.request("release", { msgId: first.msgId })).status, "delivered");
+  const released = await target.nextDelivery();
+  await delivered.event;
+  assert.deepEqual([released.session, released.msg.id, released.msg.to], [target.session.id, first.msgId, "source"]);
+  assert.deepEqual(unrelated.deliveries, []);
+
+  env.clock.advance(86_400_000);
+  env.daemon.sweep();
+  assert.equal((await logOf(human, first.msgId!)).status, "delivered");
+  assert.equal((await logOf(human, second.msgId!)).status, "held");
+  assert.deepEqual(target.deliveries.map((delivery) => delivery.msg.id), [first.msgId]);
+  await human.request("drop", { msgId: second.msgId });
+  assert.equal((await logOf(human, second.msgId!)).status, "dropped");
+});
+
+test("replacement keeps the destination's inbound, cwd, history and consumed inbox positions", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "own-sender", "sender");
+  const source = await env.adapter("omp", "own-source", "source");
+  const target = await env.adapter("omp", "own-target", "target", { cwd: "/dst-cwd" });
+  await human.request("set_inbound", { name: "target", mode: "hold" });
+  const [consumed] = await send(human, "target", "already consumed");
+  await target.nextDelivery();
+  assert.deepEqual(((await target.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map(
+    (message) => message.id,
+  ), [consumed.msgId]);
+  assert.deepEqual((await target.client.request("inbox", { unread_only: true })).messages, []);
+  const [pending] = await send(human, "target", "still unread");
+  await target.nextDelivery();
+
+  const gone = await env.watch(isSession("gone", "source"));
+  source.client.close();
+  await gone.event;
+  const [moved] = await send(sender.client, "source", "queued to move");
+  assert.equal(moved.status, "queued");
+
+  const movedDelivered = await env.watch(isStatus(moved.msgId, "delivered"));
+  const result = await replace(human, { fromId: source.session.id, toId: target.session.id });
+  assert.deepEqual([result.to.id, result.to.name, result.to.cwd, result.to.inbound],
+    [target.session.id, "target", "/dst-cwd", "hold"]);
+  const movedPush = await target.nextDelivery();
+  assert.equal(movedPush.msg.id, moved.msgId);
+  await movedDelivered.event;
+  assert.deepEqual(((await target.client.request("inbox", { unread_only: true })).messages as StoredMessage[]).map(
+    (message) => message.id,
+  ), [pending.msgId, moved.msgId]);
+  assert.deepEqual((await target.client.request("inbox", { unread_only: true })).messages, []);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: target.session.id })).messages.map(
+    (message) => [message.id, message.status],
+  ), [[consumed.msgId, "delivered"], [pending.msgId, "delivered"], [moved.msgId, "delivered"]]);
+});
+
+test("a moved queue keeps its original deadline and metadata and expires once with a sender notice", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "ttl-sender", "sender");
+  const source = await env.adapter("omp", "ttl-source", "source");
+  const target = await env.adapter("omp", "ttl-target", "target", { autoAck: false });
+  const path = join(env.home, "ttl-report.txt");
+  writeFileSync(path, "abc");
+  const sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  const gone = await env.watch(isSession("gone", "source"));
+  source.client.close();
+  await gone.event;
+  const [fileMsg] = await send(sender.client, "source", "review the report", { file: { path, summary: "Report" } });
+  const [controlMsg] = await send(sender.client, "source", "pause the queue", { kind: "control", action: "pause" });
+  assert.deepEqual([fileMsg.status, controlMsg.status], ["queued", "queued"]);
+  const created = env.clock.now();
+  env.clock.advance(86_400_000 - 5000);
+  env.daemon.sweep();
+  assert.equal((await logOf(human, fileMsg.msgId!)).status, "queued");
+
+  rmSync(path);
+  const result = await replace(human, { fromId: source.session.id, toId: target.session.id });
+  assert.equal(result.to.id, target.session.id);
+  assert.equal((await target.nextDelivery()).msg.id, fileMsg.msgId);
+  assert.deepEqual((await logOf(human, fileMsg.msgId!)).file, { path, summary: "Report", sha256, size: 3 });
+  assert.equal((await logOf(human, controlMsg.msgId!)).action, "pause");
+  assert.deepEqual([(await logOf(human, fileMsg.msgId!)).createdAt, (await logOf(human, controlMsg.msgId!)).createdAt],
+    [created, created]);
+
+  const expired = await env.watch((event) => event.type === "message" && event.msg.id === fileMsg.msgId && event.status === "expired");
+  env.clock.advance(4999);
+  env.daemon.sweep();
+  assert.deepEqual([(await logOf(human, fileMsg.msgId!)).status, (await logOf(human, controlMsg.msgId!)).status],
+    ["queued", "queued"]);
+  env.clock.advance(1);
+  env.daemon.sweep();
+  await expired.event;
+  assert.deepEqual([(await logOf(human, fileMsg.msgId!)).status, (await logOf(human, controlMsg.msgId!)).status],
+    ["expired", "expired"]);
+  const notices = (await sender.client.request("inbox")).messages as StoredMessage[];
+  assert.deepEqual(notices.filter((message) => message.replyTo === fileMsg.msgId || message.replyTo === controlMsg.msgId)
+    .map((message) => [message.replyTo, message.from, message.kind, message.status]).sort(),
+  [[controlMsg.msgId, "asenq", "status", "delivered"], [fileMsg.msgId, "asenq", "status", "delivered"]].sort());
+  env.daemon.sweep();
+  await env.daemon.retry();
+  assert.equal(((await sender.client.request("inbox")).messages as StoredMessage[]).filter(
+    (message) => message.replyTo === fileMsg.msgId || message.replyTo === controlMsg.msgId,
+  ).length, 2);
+});
+
+test("moving a live source's inflight message retires its ACK ownership and resumes the destination's deferred flush", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "flight-sender", "sender");
+  const source = await env.adapter("omp", "flight-source", "source", { autoAck: false });
+  const target = await env.adapter("omp", "flight-target", "target", { autoAck: false });
+
+  const targetSending = send(sender.client, "target", "destination message already in flight");
+  void targetSending.catch(() => {});
+  const targetFirst = await target.nextDelivery();
+  const sourceSending = send(sender.client, "source", "source message in flight");
+  void sourceSending.catch(() => {});
+  const sourceFirst = await source.nextDelivery();
+  const movedId = sourceFirst.msg.id;
+
+  const result = await replace(human, { fromId: source.session.id, toId: target.session.id });
+  assert.equal(result.to.id, target.session.id);
+  await source.client.request("ack", { msgId: movedId, ok: true });
+  assert.equal((await logOf(human, movedId)).status, "queued");
+  assert.deepEqual(source.deliveries.map((delivery) => delivery.msg.id), [movedId]);
+
+  // Releasing the destination's own active attempt lets the deferred moved flush run.
+  await target.client.request("ack", { msgId: targetFirst.msg.id, ok: true });
+  const movedPush = await target.nextDelivery();
+  assert.deepEqual([movedPush.session, movedPush.msg.id], [target.session.id, movedId]);
+  assert.equal((await logOf(human, movedId)).status, "queued");
+  await source.client.request("ack", { msgId: movedId, ok: false, reason: "stale source rejected" });
+  assert.equal((await logOf(human, movedId)).status, "queued");
+  assert.deepEqual(target.deliveries.map((delivery) => delivery.msg.id), [targetFirst.msg.id, movedId]);
+
+  const delivered = await env.watch(isStatus(movedId, "delivered"));
+  await target.client.request("ack", { msgId: movedId, ok: true });
+  await delivered.event;
+  assert.equal((await logOf(human, movedId)).status, "delivered");
+  assert.equal((await sourceSending)[0].status, "queued");
+  assert.equal((await targetSending)[0].status, "delivered");
+});
+
+test("a shared OpenCode binding cannot acknowledge a moved message as its former source", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const shared = await env.adapter("opencode", "replace-shared-source", "source", { autoAck: false });
+  const target = (await shared.client.request("register", {
+    harness: "opencode", key: "replace-shared-target", name: "target",
+  })).session as { id: string; name: string };
+
+  const targetSending = send(human, "target", "the destination attempt already in flight");
+  void targetSending.catch(() => {});
+  const targetFirst = await shared.nextDelivery();
+  assert.equal(targetFirst.session, target.id);
+  const sourceSending = send(human, "source", "the source attempt moves while in flight");
+  void sourceSending.catch(() => {});
+  const oldSourcePush = await shared.nextDelivery();
+  const movedId = oldSourcePush.msg.id;
+  assert.equal(oldSourcePush.session, shared.session.id);
+
+  const result = await replace(human, { fromId: shared.session.id, toId: target.id });
+  assert.equal(result.to.id, target.id);
+  await assert.rejects(shared.client.request("held", { as: shared.session.id }), (error: { code?: string }) =>
+    error.code === "bad_request" || error.code === "not_registered");
+
+  await shared.client.request("ack", { msgId: targetFirst.msg.id, ok: true, as: target.id });
+  const movedPush = await shared.nextDelivery();
+  assert.deepEqual([movedPush.session, movedPush.msg.id], [target.id, movedId]);
+  assert.equal((await logOf(human, movedId)).status, "queued");
+  const contactBefore = ((await human.request("list")).sessions as ListedSession[]).find(
+    ({ id }) => id === target.id,
+  )!.lastSeen;
+  env.clock.advance(10);
+
+  await shared.client.request("ack", { msgId: movedId, ok: true, as: shared.session.id }).catch(() => {});
+  assert.equal((await logOf(human, movedId)).status, "queued");
+  await shared.client.request("ack", {
+    msgId: movedId, ok: false, reason: "stale source rejection", as: shared.session.id,
+  }).catch(() => {});
+  assert.equal((await logOf(human, movedId)).status, "queued");
+  await shared.client.request("ack", { msgId: movedId, ok: true }).catch(() => {});
+  assert.equal((await logOf(human, movedId)).status, "queued");
+  await shared.client.request("ack", {
+    msgId: movedId, ok: false, reason: "stale unselected rejection",
+  }).catch(() => {});
+  const afterOldAck = await logOf(human, movedId);
+  assert.deepEqual([afterOldAck.status, afterOldAck.reason], ["queued", undefined]);
+  assert.equal(((await human.request("list")).sessions as ListedSession[]).find(
+    ({ id }) => id === target.id,
+  )!.lastSeen, contactBefore);
+
+  assert.deepEqual(shared.deliveries.map((delivery) => [delivery.session, delivery.msg.id]), [
+    [target.id, targetFirst.msg.id], [shared.session.id, movedId], [target.id, movedId],
+  ]);
+  const delivered = await env.watch(isStatus(movedId, "delivered"));
+  await shared.client.request("ack", { msgId: movedId, ok: true, as: target.id });
+  await delivered.event;
+  assert.equal((await logOf(human, movedId)).status, "delivered");
+  const targetInbox = (await shared.client.request("inbox", { as: target.id })).messages as StoredMessage[];
+  assert.ok(targetInbox.some(({ id }) => id === movedId));
+  assert.deepEqual([(await sourceSending)[0].status, (await targetSending)[0].status], ["queued", "delivered"]);
+});
+
+test("late Claude envelope status and socket completion cannot change a moved delivery", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  env = await startEnv({ envelope: true });
+  const human = env.human();
+  const target = await env.adapter("opencode", "replace-claude-target", "target", { autoAck: false });
+  const sourcePath = join(env.home, "replace-source.sock");
+  const peerPath = join(env.home, "replace-peer.sock");
+  const sourceClaude = await fakeClaude(sourcePath);
+  const peerClaude = await fakeClaude(peerPath);
+
+  try {
+    const source = (await human.request("claude_hook", {
+      event: "start", key: sourcePath, socket: sourcePath, sessionId: "replace-source", name: "source",
+    })).session as { id: string; name: string };
+    const peer = (await human.request("claude_hook", {
+      event: "start", key: peerPath, socket: peerPath, sessionId: "replace-peer", name: "peer",
+    })).session as { id: string; name: string };
+    const oldSending = send(human, source.name, "pending Claude write moves to OpenCode");
+    void oldSending.catch(() => {});
+    const oldEnvelope = JSON.parse(await sourceClaude.nextLine()) as { msg_id: string };
+    const oldMessage = (await human.historyPage({ scope: "session", sessionId: source.id })).messages.find(
+      (message) => message.text === "pending Claude write moves to OpenCode",
+    )!;
+
+    const peerSending = send(human, peer.name, "peer status is an event barrier");
+    void peerSending.catch(() => {});
+    const peerEnvelope = JSON.parse(await peerClaude.nextLine()) as { msg_id: string };
+    const peerMessage = (await human.historyPage({ scope: "session", sessionId: peer.id })).messages.find(
+      (message) => message.text === "peer status is an event barrier",
+    )!;
+
+    await replace(human, { fromId: source.id, toId: target.session.id });
+    const movedPush = await target.nextDelivery();
+    assert.deepEqual([movedPush.session, movedPush.msg.id], [target.session.id, oldMessage.id]);
+    assert.equal((await logOf(human, oldMessage.id)).status, "queued");
+
+    const peerDelivered = await env.watch(isStatus(peerMessage.id, "delivered"));
+    const replyPath = decodeURIComponent(replyAddr(join(env.home, "r"), "human").slice(4));
+    const controls = [
+      { type: "control", action: "peer_message_status", msg_id: oldEnvelope.msg_id, status: "failed" },
+      { type: "control", action: "peer_message_status", msg_id: peerEnvelope.msg_id, status: "delivered" },
+    ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
+    const reply = net.createConnection(replyPath);
+    await new Promise<void>((resolve, reject) => {
+      reply.once("error", reject);
+      reply.once("connect", () => reply.end(controls, resolve));
+    });
+    await peerDelivered.event;
+    assert.equal((await logOf(human, oldMessage.id)).status, "queued");
+
+    context.mock.timers.tick(150);
+    assert.deepEqual([(await oldSending)[0].status, (await peerSending)[0].status], ["queued", "delivered"]);
+    assert.equal((await logOf(human, oldMessage.id)).status, "queued");
+
+    const delivered = await env.watch(isStatus(oldMessage.id, "delivered"));
+    await target.client.request("ack", { msgId: oldMessage.id, ok: true, as: target.session.id });
+    await delivered.event;
+    assert.equal((await logOf(human, oldMessage.id)).status, "delivered");
+  } finally {
+    context.mock.timers.tick(150);
+    await Promise.all([sourceClaude.stop(), peerClaude.stop()]);
+  }
+});
+
+test("replacement archives source history, outbound messages and human read state, changing only the waiting recipient", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const sender = await env.adapter("omp", "archive-sender", "sender");
+  const source = await env.adapter("omp", "archive-source", "source");
+  const target = await env.adapter("omp", "archive-target", "target");
+  const [question] = await send(sender.client, "source", "question to the source", { thread: "keep" });
+  await source.nextDelivery();
+  const [answer] = await send(source.client, "sender", "answer from the source", { replyTo: question.msgId });
+  await sender.nextDelivery();
+  assert.equal((await logOf(human, question.msgId!)).status, "replied");
+  const readScope = { scope: "session" as const, sessionId: source.session.id };
+  const readBefore = (await human.markUnread(readScope)).state;
+
+  const gone = await env.watch(isSession("gone", "source"));
+  source.client.close();
+  await gone.event;
+  const waiting = await human.sendToSession(source.session.id, "waiting while the source is gone");
+  env.clock.advance(1000);
+  const waitingCreated = (await logOf(human, waiting.msgId!)).createdAt;
+  const waitingDelivered = await env.watch(isStatus(waiting.msgId, "delivered"));
+
+  const result = await replace(human, { fromId: source.session.id, toId: target.session.id });
+  assert.deepEqual([result.from.state, result.from.closedAt !== undefined], ["removed", true]);
+  const sourceHistory = (await human.historyPage({ scope: "session", sessionId: source.session.id })).messages;
+  assert.deepEqual(sourceHistory.map((message) => [message.id, message.to, message.status]),
+    [[question.msgId, "source", "replied"], [answer.msgId, "sender", "delivered"]]);
+  assert.equal(sourceHistory.some((message) => message.id === waiting.msgId), false);
+  const sourceRead = await human.readState(readScope);
+  assert.deepEqual([sourceRead.position, sourceRead.reminder], [readBefore.position, readBefore.reminder]);
+  const waitingPush = await target.nextDelivery();
+  assert.deepEqual([waitingPush.session, waitingPush.msg.id, waitingPush.msg.text],
+    [target.session.id, waiting.msgId, "waiting while the source is gone"]);
+  await waitingDelivered.event;
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: target.session.id })).messages.map(
+    (message) => [message.id, message.to, message.toSessionId, message.createdAt, message.status],
+  ), [[waiting.msgId, "source", target.session.id, waitingCreated, "delivered"]]);
+});
+
+test("replacement rejects invalid, unknown, closed, non-live and ambiguous selectors without changing retained state", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const source = await env.adapter("omp", "err-source", "source");
+  const target = await env.adapter("omp", "err-target", "target");
+  for (const params of [
+    {},
+    { from: "source" },
+    { to: "target" },
+    { from: "source", fromId: source.session.id, to: "target" },
+    { from: "source", to: "target", toId: target.session.id },
+  ]) await assert.rejects(human.request("replace", params), { code: "bad_request" });
+  await assert.rejects(human.request("replace", { fromId: source.session.id, toId: source.session.id }), { code: "bad_request" });
+  await assert.rejects(human.request("replace", { from: "missing", toId: target.session.id }), { code: "unknown_target" });
+  await assert.rejects(human.request("replace", { fromId: source.session.id, to: "missing" }), { code: "unknown_target" });
+
+  const closed = await env.adapter("omp", "err-closed", "closed");
+  await human.request("close", { identity: closed.session.id });
+  await assert.rejects(human.request("replace", { fromId: closed.session.id, toId: target.session.id }), { code: "unknown_target" });
+  await assert.rejects(human.request("replace", { fromId: source.session.id, toId: closed.session.id }), { code: "unknown_target" });
+
+  const goneTarget = await env.adapter("omp", "err-gone", "gone-target");
+  const gone = await env.watch(isSession("gone", "gone-target"));
+  goneTarget.client.close();
+  await gone.event;
+  await assert.rejects(human.request("replace", { fromId: source.session.id, toId: goneTarget.session.id }), { code: "not_live" });
+  const removed = await env.watch(isSession("removed", "gone-target"));
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  await removed.event;
+  await assert.rejects(human.request("replace", { fromId: source.session.id, toId: goneTarget.session.id }), { code: "not_live" });
+
+  const first = await env.adapter("omp", "amb-one", "dup");
+  const firstGone = await env.watch(isSession("gone", "dup"));
+  first.client.close();
+  await firstGone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+  const second = await env.adapter("opencode", "amb-two", "dup");
+  const secondGone = await env.watch(isSession("gone", "dup"));
+  second.client.close();
+  await secondGone.event;
+  env.clock.advance(GRACE_MS);
+  env.daemon.sweep();
+
+  const before = await semanticSnapshot(human);
+  const beforeHistory = (await human.historyPage({ scope: "session", sessionId: source.session.id })).messages;
+  const targetHistoryBefore = (await human.historyPage({ scope: "session", sessionId: target.session.id })).messages;
+  const heldBefore = (await human.request("held")).messages as StoredMessage[];
+  await assert.rejects(human.request("replace", { from: "dup", toId: target.session.id }), (error: unknown) => {
+    const candidate = error as { code: string; message: string };
+    assert.equal(candidate.code, "ambiguous_target");
+    for (const detail of [first.session.id, second.session.id, "dup"]) assert.ok(candidate.message.includes(detail));
+    return true;
+  });
+  assert.deepEqual(await semanticSnapshot(human), before);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: source.session.id })).messages, beforeHistory);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: target.session.id })).messages, targetHistoryBefore);
+  assert.deepEqual((await human.request("held")).messages, heldBefore);
+  assert.deepEqual(target.deliveries, []);
+
+  const result = await replace(human, { fromId: first.session.id, toId: target.session.id });
+  assert.deepEqual([result.from.id, result.to.id], [first.session.id, target.session.id]);
+  const snapshot = await human.sync();
+  assert.equal(identityOf(snapshot, first.session.id).closedAt !== undefined, true);
+  assert.equal(identityOf(snapshot, second.session.id).closedAt, undefined);
+
+  const rankSource = await env.adapter("omp", "rank-source", "rank-src");
+  await rankSource.client.request("rename", { name: "rank-mid" });
+  const rankTarget = await env.adapter("omp", "rank-target", "rank-tgt");
+  await rankTarget.client.request("rename", { name: "rank-new" });
+  assert.equal((await replace(human, { from: "rank-mid", to: "rank-tgt" })).to.id, rankTarget.session.id);
+});
+
+test("replacement survives restart: the destination harness resumes its id while the closed source loses hooks and lineage", async () => {
+  env = await startEnv();
+  let human = env.human();
+  const sender = await env.adapter("omp", "life-sender", "sender");
+  const source = (await human.request("claude_hook", {
+    event: "start", key: "old-process", sessionId: "old-claude", name: "source", socket: null, cwd: "/source",
+  })).session as { id: string; name: string };
+  const target = await env.adapter("omp", "life-target", "target");
+  const [queued] = await send(sender.client, "source", "queued for the claude source");
+  assert.equal(queued.status, "queued");
+
+  const delivered = await env.watch(isStatus(queued.msgId, "delivered"));
+  const result = await replace(human, { fromId: source.id, toId: target.session.id });
+  assert.equal(result.to.id, target.session.id);
+  assert.equal((await target.nextDelivery()).msg.id, queued.msgId);
+  await delivered.event;
+
+  await env.restart();
+  human = env.human();
+  const resumed = await env.adapter("omp", "life-target", "ignored-after-restart");
+  assert.deepEqual(resumed.session, { id: target.session.id, name: "target" });
+  const [forwarded] = await send(human, "source", "former source name after restart");
+  assert.equal((await resumed.nextDelivery()).msg.id, forwarded.msgId);
+  const snapshot = await human.sync();
+  assert.deepEqual([identityOf(snapshot, target.session.id).harness, identityOf(snapshot, source.id).state,
+    identityOf(snapshot, source.id).closedAt !== undefined], ["omp", "removed", true]);
+  await assert.rejects(human.request("claude_attach", { sessionId: "old-claude" }), { code: "no_session" });
+  await human.request("claude_hook", { event: "end", sessionId: "old-claude" });
+  const fresh = (await human.request("claude_hook", {
+    event: "start", key: "new-process", sessionId: "old-claude", name: "fresh-source", socket: null,
+  })).session as { id: string; name: string };
+  assert.notEqual(fresh.id, source.id);
+  const after = await human.sync();
+  assert.deepEqual([identityOf(after, target.session.id).state, identityOf(after, target.session.id).harness], ["live", "omp"]);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: target.session.id })).messages.map(
+    (message) => [message.id, message.status],
+  ), [[queued.msgId, "delivered"], [forwarded.msgId, "delivered"]]);
+});
+
+test("asenq_replace changes real state for a source-channel orchestrator and refuses others without mutation", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const shared = await env.adapter("opencode", "mcp-alpha", "alpha");
+  const beta = (await shared.client.request("register", { harness: "opencode", key: "mcp-beta", name: "beta" }))
+    .session as { id: string; name: string };
+  const worker = await env.adapter("omp", "mcp-worker", "worker");
+  await human.request("set_role", { name: "alpha", role: "orchestrator" });
+  await human.request("set_role", { name: "beta", role: "orchestrator" });
+  await human.request("set_role", { name: "worker", role: "worker" });
+  await human.request("channel_create", { channel: "source-room" });
+  const source = await env.adapter("omp", "mcp-source", "source");
+  await human.request("channel_add", { channel: "source-room", name: "alpha" });
+  await human.request("channel_add", { channel: "source-room", name: "source" });
+  await human.request("channel_create", { channel: "dest-room" });
+  const target = await env.adapter("omp", "mcp-target", "target");
+  await human.request("channel_add", { channel: "dest-room", name: "beta" });
+  await human.request("channel_add", { channel: "dest-room", name: "target" });
+  const gone = await env.watch(isSession("gone", "source"));
+  source.client.close();
+  await gone.event;
+  const pending = await human.sendToSession(source.session.id, "mcp moves this");
+  assert.equal(pending.status, "queued");
+
+  const before = await semanticSnapshot(human);
+  const sourceHistoryBefore = (await human.historyPage({ scope: "session", sessionId: source.session.id })).messages;
+  const heldBefore = (await human.request("held")).messages as StoredMessage[];
+  const pendingBefore = await logOf(human, pending.msgId!);
+  assert.match(await callTool(shared.client, "asenq_replace", { from_id: source.session.id, to_id: target.session.id }),
+    /^asenq error \(bad_request\): /);
+  assert.match(await callTool(shared.client, "asenq_replace",
+    { from_id: source.session.id, to_id: target.session.id, as: beta.id, role: "orchestrator" }, beta.id),
+    /^asenq error \(not_permitted\): /);
+  assert.match(await callTool(worker.client, "asenq_replace", { from_id: source.session.id, to_id: target.session.id }),
+    /^asenq error \(not_permitted\): /);
+  assert.deepEqual(await semanticSnapshot(human), before);
+  assert.deepEqual(target.deliveries, []);
+  assert.deepEqual((await human.historyPage({ scope: "session", sessionId: source.session.id })).messages, sourceHistoryBefore);
+  assert.deepEqual((await human.request("held")).messages, heldBefore);
+  const pendingAfter = await logOf(human, pending.msgId!);
+  assert.deepEqual(pendingAfter, pendingBefore);
+
+  const output = await callTool(shared.client, "asenq_replace",
+    { from_id: source.session.id, to_id: target.session.id }, shared.session.id);
+  assert.ok(!isToolError(output));
+  assert.equal((await target.nextDelivery()).msg.id, pending.msgId);
+  const snapshot = await human.sync();
+  assert.equal(identityOf(snapshot, source.session.id).closedAt !== undefined, true);
+  const roomIds = ((await human.request("channel_members", { channel: "source-room" })).members as SessionIdentity[])
+    .map((member) => member.id);
+  assert.ok(roomIds.includes(target.session.id), "the destination inherits the source roster");
+  assert.ok(!roomIds.includes(source.session.id), "the closed source leaves its rosters");
 });

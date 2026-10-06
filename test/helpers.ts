@@ -71,7 +71,7 @@ export async function startEnv(opts: Partial<DaemonOpts> = {}, seed?: (db: Db) =
           if (p.push !== "deliver") return;
           deliveries.push(p);
           waiter?.();
-          if (o.autoAck !== false) void client.request("ack", { msgId: p.msg.id, ok: true }).catch(() => {});
+          if (o.autoAck !== false) void client.request("ack", { msgId: p.msg.id, ok: true, as: p.session }).catch(() => {});
         },
       }));
       const r: Reply = await client.request("register", {
