@@ -7,7 +7,7 @@ import {
   ACK_TIMEOUT_MS, AsenqError, CONTROL_ACTIONS, GRACE_MS, INBOUND, KINDS, MAX_ATTEMPTS, MAX_LINE, MAX_TEXT, MENTION_KEYWORDS, NAME_RE, PROBE_MS,
   PROTOCOL, QUEUE_TTL_MS, RESERVED, RETRY_MS, hasMentionOpening, slug,
   type ChannelSendResult, type ControlAction, type FileReference, type Harness, type HistoryPageRequest, type Inbound, type Kind, type ListedSession, type MsgStatus, type PositionedEvent,
-  type PingStatus, type Push, type ReadMutationResult, type ReadScope, type ReplacementResult, type Req, type SendResult, type SessionIdentity, type TailEvent,
+  type PingStatus, type Push, type ReadMutationResult, type ReadScope, type ReplacementResult, type Req, type ResetResult, type SendResult, type SessionIdentity, type TailEvent,
 } from "../shared/protocol.js";
 import { renderInbound } from "../shared/render.js";
 import { resumeCommand } from "../shared/resume.js";
@@ -35,6 +35,8 @@ export type DaemonOpts = {
   historyDays?: number;
   defaultNameWords?: DefaultNameWords;
   pingTimeoutMs?: number;
+  /** Maximum time after compact receipt before releasing the target's deferred queue (default 10 min). */
+  resetTimeoutMs?: number;
   log?: (line: string) => void;
 };
 
@@ -49,6 +51,7 @@ type Ack = { ok: boolean; reason?: string };
 type LineageDecision = { identityId?: string; reason?: string };
 type DeliveryAttempt = { recipientId: string | null; settle(status: MsgStatus): void };
 type Inflight = { conn: Conn; sessionId: string; timer: NodeJS.Timeout; settle(a: Ack): void };
+type PendingReset = { conn: Conn; sessionId: string; attempt: string; received: boolean; deadline: number };
 type PendingPing = {
   sessionId: string; requester: Conn; conn?: Conn; deadline: number; timer?: NodeJS.Timeout;
   settle(ping: PingStatus): void;
@@ -67,6 +70,7 @@ class Conn {
   /** Sessions whose delivery channel is this connection (OpenCode/omp; several per OpenCode plugin). */
   bound = new Set<string>();
   pingSupport = new Set<string>();
+  compactSupport = new Set<string>();
   /** Claude MCP connection: sender identity only, never a delivery channel. */
   attached?: string;
   tail = false;
@@ -156,6 +160,8 @@ export class Daemon {
   private conns = new Set<Conn>();
   private delivery = new Map<string, Conn>();
   private inflight = new Map<string, Inflight>();
+  private pendingResets = new Map<string, PendingReset>();
+  private resetting = new Set<string>();
   private flushing = new Set<string>();
   private flushRequested = new Set<string>();
   /** Messages with a delivery attempt in progress; timers and sends must not write them twice. */
@@ -173,6 +179,7 @@ export class Daemon {
   private readonly ackTimeoutMs: number;
   private readonly graceMs: number;
   private readonly pingTimeoutMs: number;
+  private readonly resetTimeoutMs: number;
   private readonly queueTtlMs: number;
   private readonly startedAt: number;
 
@@ -182,6 +189,7 @@ export class Daemon {
     this.ackTimeoutMs = opts.ackTimeoutMs ?? ACK_TIMEOUT_MS;
     this.graceMs = opts.graceMs ?? GRACE_MS;
     this.pingTimeoutMs = opts.pingTimeoutMs ?? 3000;
+    this.resetTimeoutMs = opts.resetTimeoutMs ?? 10 * 60_000;
     this.queueTtlMs = opts.queueTtlMs ?? QUEUE_TTL_MS;
     this.startedAt = this.now();
     this.store.db.run("UPDATE sessions SET busy=NULL");
@@ -189,6 +197,10 @@ export class Daemon {
     for (const row of this.store.db.all<SessionRow>(
       "SELECT * FROM sessions WHERE harness!='claude' AND state='live'",
     )) this.markGone(row);
+    // A receipt accepted by the previous process cannot be resumed or safely compacted twice.
+    for (const row of this.store.db.all<MsgRow>(
+      "SELECT * FROM messages WHERE reset='compact' AND reset_result IS NULL AND status IN ('delivered','replied')",
+    )) this.finishReset(row.id, "failed", false, "daemon restarted before compact delivery completed");
   }
 
   private log(line: string): void {
@@ -271,6 +283,7 @@ export class Daemon {
     if (this.closing) return; // sessions stay as they are; the next daemon start marks them gone
     for (const [msgId, f] of this.inflight) if (f.conn === c) f.settle({ ok: false, reason: "connection closed" });
     if (c.attached) this.store.setSessionBusy(c.attached, null);
+    this.cancelResets((pending) => pending.conn === c, "adapter disconnected before compact delivery completed");
     for (const id of c.bound) {
       if (this.delivery.get(id) !== c) continue;
       this.delivery.delete(id);
@@ -441,16 +454,41 @@ export class Daemon {
         const msgId = str(p, "msgId", true);
         const ack: Ack = { ok: p.ok === true, reason: str(p, "reason") };
         const f = this.inflight.get(msgId);
+        const reset = this.pendingResets.get(msgId);
+        if (p.reset !== undefined && (p.reset !== "pending" || !reset)) {
+          throw new AsenqError("bad_request", "compact receipt requires an active pending delivery");
+        }
+        if (reset) {
+          const actor = this.sender(c, p);
+          if (reset.conn !== c || actor.kind !== "agent" || actor.session.id !== reset.sessionId) {
+            throw new AsenqError("not_permitted", "only the target adapter may acknowledge compact delivery");
+          }
+          if (p.resetAttempt !== reset.attempt) throw new AsenqError("bad_request", "stale compact delivery attempt");
+          if (ack.ok && p.reset !== "pending") throw new AsenqError("bad_request", "compact receipt ack requires reset pending");
+          if (!reset.received && ack.ok) {
+            const row = this.store.msg(msgId);
+            if (!row || row.status !== "queued" || this.expireQueued(row)) {
+              f?.settle({ ok: false, reason: "compact message is no longer queued" });
+              throw new AsenqError("bad_request", "compact message is no longer queued");
+            }
+            reset.received = true;
+            reset.deadline = this.now() + this.resetTimeoutMs;
+            // Receipt is delivery acceptance; persist it before any queue-expiry sweep can run.
+            this.setStatus(msgId, "delivered");
+          }
+        }
         const row = this.store.msg(msgId);
         const as = str(p, "as");
         const recipientId = as ?? this.implicitAckRecipient(c, row?.to_session);
         if (recipientId && row?.to_session === recipientId && c.bound.has(recipientId)
           && this.delivery.get(recipientId) === c) {
           if (f?.conn === c && f.sessionId === recipientId) f.settle(ack);
-          else if (!f && ack.ok && row.status === "queued") this.setStatus(msgId, "delivered");
+          else if (!f && ack.ok && !reset && row.status === "queued") this.setStatus(msgId, "delivered");
         }
         return {};
       }
+      case "reset_result":
+        return this.opResetResult(c, p);
       case "sync":
         this.requireHuman(this.sender(c, p), "synchronize human state");
         return this.opSync(c);
@@ -916,6 +954,7 @@ export class Daemon {
   private finishClose(session: SessionIdentity, channels: string[]): void {
     const id = session.id;
     this.cancelPings(id);
+    this.cancelResets((reset) => reset.sessionId === id, "session closed during compaction");
     this.delivery.delete(id);
     this.lastSeen.delete(id);
     const replyServer = this.replyServers.get(id);
@@ -1169,8 +1208,11 @@ export class Daemon {
     const previous = this.delivery.get(row.id);
     this.cancelPings(row.id);
     if (previous && previous !== c) previous.bound.delete(row.id);
+    if (previous && previous !== c) this.cancelResets((pending) => pending.sessionId === row.id, "delivery binding replaced during compaction");
     c.bound.add(row.id);
     if (Array.isArray(p.caps) && p.caps.includes("ping")) c.pingSupport.add(row.id);
+    c.compactSupport.delete(row.id);
+    if (harness !== "claude" && Array.isArray(p.caps) && p.caps.includes("compact")) c.compactSupport.add(row.id);
     this.delivery.set(row.id, c);
     // After the response is written, so the adapter knows the binding before pushes arrive.
     setImmediate(() => void this.flush(row.id));
@@ -1190,6 +1232,7 @@ export class Daemon {
   /** Removes the transport while retaining identity and pending delivery for a later resume. */
   private removeSession(row: SessionRow): void {
     this.cancelPings(row.id);
+    this.cancelResets((pending) => pending.sessionId === row.id, "session removed during compaction");
     this.store.setIdentityState(row.id, "removed", this.now());
     this.store.db.run("DELETE FROM sessions WHERE id=?", row.id);
     this.delivery.delete(row.id);
@@ -1438,6 +1481,14 @@ export class Daemon {
   async send(s: Sender, p: Params): Promise<SendResult[]> {
     const targetSessionId = str(p, "toSessionId");
     let to = str(p, "to");
+    const reset = str(p, "reset");
+    if (reset !== undefined) {
+      if (reset !== "compact") throw new AsenqError("bad_request", 'reset must be "compact"');
+      this.requireHumanOrOrchestrator(s, "only the human or an orchestrator can compact a target");
+      if (!to || to === "*" || to === "human" || targetSessionId !== undefined) {
+        throw new AsenqError("bad_request", "reset requires a direct message to one named session");
+      }
+    }
     const file = await fileParam(p.file);
     const text = str(p, "text") ?? "";
     if (text.length === 0 && !file) throw new AsenqError("bad_request", "text is empty; provide text or a file reference");
@@ -1473,6 +1524,7 @@ export class Daemon {
       reply_to: str(p, "replyTo") ?? null, done: p.done === true ? 1 : 0, status: "queued", reason: null, attempts: 0,
       created_at: now, updated_at: now, ord: 0,
       file: file ? JSON.stringify(file) : null,
+      reset: reset === "compact" ? reset : null,
     };
     if (to === "human") {
       const row = { ...base, id: newId("m_"), to_name: "human", status: "posted" as const };
@@ -1508,7 +1560,7 @@ export class Daemon {
     };
     if (s.kind === "agent") {
       const bodyKey = row.kind === "control" ? `control\0${row.action}\0${row.text}` : `message\0${row.text}`;
-      const dupKey = `${s.session.id}\0${target.id}\0${bodyKey}\0${row.file ?? ""}${row.source_channel ? `\0channel\0${row.source_channel}` : ""}`;
+      const dupKey = `${s.session.id}\0${target.id}\0${bodyKey}\0${row.reset ?? ""}\0${row.file ?? ""}${row.source_channel ? `\0channel\0${row.source_channel}` : ""}`;
       const seen = this.dupSeen.get(dupKey);
       if (seen !== undefined && now - seen < DUP_WINDOW_MS) return finish("dropped", "duplicate");
       this.dupSeen.set(dupKey, now);
@@ -1525,8 +1577,11 @@ export class Daemon {
     this.insert({ ...row, status: "queued" });
     if (target.state !== "live") return { to: target.name, msgId: row.id, status: "queued" };
     return this.deliver(row.id).then((status) => {
-      const reason = this.store.msg(row.id)?.reason;
-      return { to: target.name, msgId: row.id, status, ...(reason && status !== "delivered" ? { reason } : {}) };
+      const retained = this.store.msg(row.id);
+      const reason = retained?.reason;
+      return { to: target.name, msgId: row.id, status, ...(reason && status !== "delivered" ? { reason } : {}),
+        ...(row.reset && (retained?.reset_result === "unsupported" || status === "delivered" || status === "replied")
+          ? { reset: retained?.reset_result === "unsupported" ? "unsupported" as const : "pending" as const } : {}) };
     });
   }
 
@@ -1553,6 +1608,65 @@ export class Daemon {
     this.confirmReplies(row);
   }
 
+  /** Final harness outcome follows an immediate receipt ack, independently of delivery timeouts. */
+  private opResetResult(c: Conn, p: Params): Result {
+    const actor = this.sender(c, p);
+    if (actor.kind !== "agent") throw new AsenqError("not_permitted", "only the target adapter may finish compact delivery");
+    const msgId = str(p, "msgId", true);
+    const reset = str(p, "reset", true) as ResetResult;
+    if (!["compacted", "unsupported", "failed"].includes(reset)) {
+      throw new AsenqError("bad_request", "reset outcome must be compacted, unsupported or failed");
+    }
+    const pending = this.pendingResets.get(msgId);
+    if (!pending) return {}; // Duplicate/late completion never overwrites retained state.
+    if (pending.conn !== c || pending.sessionId !== actor.session.id || this.delivery.get(actor.session.id) !== c) {
+      throw new AsenqError("not_permitted", "only the target delivery binding may finish compact delivery");
+    }
+    if (p.resetAttempt !== pending.attempt) throw new AsenqError("bad_request", "stale compact completion attempt");
+    if (!pending.received) throw new AsenqError("bad_request", "compact receipt must be acknowledged first");
+    if (typeof p.ok !== "boolean") throw new AsenqError("bad_request", "compact completion requires delivery acceptance");
+    const reason = str(p, "reason");
+    this.finishReset(msgId, reset, p.ok, reason);
+    return {};
+  }
+
+  private cancelReceipt(msgId: string, reason: string): void {
+    const pending = this.pendingResets.get(msgId);
+    if (!pending || pending.received) return;
+    this.inflight.get(msgId)?.settle({ ok: false, reason });
+    this.pendingResets.delete(msgId);
+    this.resetting.delete(pending.sessionId);
+    setImmediate(() => { if (!this.closing) void this.flush(pending.sessionId); });
+  }
+
+  private cancelResets(matches: (pending: PendingReset) => boolean, reason: string): void {
+    for (const [msgId, pending] of this.pendingResets) {
+      if (!matches(pending)) continue;
+      if (pending.received) this.finishReset(msgId, "failed", false, reason);
+      else this.cancelReceipt(msgId, "connection closed");
+    }
+  }
+
+  private finishReset(msgId: string, reset: ResetResult, ok: boolean, reason?: string): void {
+    const pending = this.pendingResets.get(msgId);
+    this.setStatus(msgId, "delivered");
+    this.pendingResets.delete(msgId);
+    const current = this.store.msg(msgId);
+    const targetId = pending?.sessionId ?? current?.to_session;
+    if (targetId) {
+      this.resetting.delete(targetId);
+      setImmediate(() => { if (!this.closing) void this.flush(targetId); });
+    }
+    if (!current || (current.status !== "delivered" && current.status !== "replied")) return;
+    const positioned = this.store.transaction(() => {
+      this.store.db.run("UPDATE messages SET reset_result=?, updated_at=? WHERE id=?", reset, this.now(), msgId);
+      const row = this.store.msg(msgId)!;
+      return this.store.appendEvent({ type: "message", msg: toStored(row), status: row.status, failedCount: this.store.failedCount() }, this.now());
+    });
+    this.publish(positioned);
+    if (!ok) this.setStatus(msgId, "failed", reason ?? "message injection failed after compaction");
+  }
+
   private setStatus(msgId: string, status: MsgStatus, reason?: string, notify = true): void {
     const current = this.store.msg(msgId);
     if (!current || current.status === "replied" || current.status === "failed" || current.status === "expired"
@@ -1563,6 +1677,9 @@ export class Daemon {
     if (current.status === status && current.reason === (reason ?? null)) return;
     const positioned = this.store.transaction(() => {
       this.store.db.run("UPDATE messages SET status=?, reason=?, updated_at=? WHERE id=?", status, reason ?? null, this.now(), msgId);
+      if (status === "delivered" && current.reset && !current.reset_result && !this.pendingResets.has(msgId)) {
+        this.store.db.run("UPDATE messages SET reset_result='unsupported' WHERE id=?", msgId);
+      }
       const row = this.store.msg(msgId);
       if (!row) return undefined;
       this.store.stampDelivery(row);
@@ -1577,6 +1694,9 @@ export class Daemon {
     });
     if (!positioned) return;
     this.publish(positioned);
+    if (current.status === "queued" && status !== "queued" && status !== "delivered") {
+      this.cancelReceipt(msgId, reason ?? status);
+    }
     const row = this.store.msg(msgId)!;
     if (notify && (status === "failed" || status === "expired")) this.notifyFailure(row, reason ?? status);
     if (status === "delivered") this.confirmReplies(row);
@@ -1641,6 +1761,11 @@ export class Daemon {
     const finish = (): void => {
       if (this.delivering.get(msgId) !== attempt) return;
       this.delivering.delete(msgId);
+      const pending = this.pendingResets.get(msgId);
+      if (pending && !pending.received) {
+        this.pendingResets.delete(msgId);
+        this.resetting.delete(pending.sessionId);
+      }
       const id = attempt.recipientId;
       if (id && this.flushRequested.has(id) && !this.flushing.has(id)) void this.flush(id);
     };
@@ -1657,6 +1782,7 @@ export class Daemon {
     if (this.expireQueued(row)) return "expired";
     const target = row.to_session ? this.store.session(row.to_session) : undefined;
     if (!target || target.state !== "live") return "queued";
+    if (this.resetting.has(target.id)) return "queued";
     const message = this.store.withReplyState(toWire(row), target.id);
     const text = renderInbound(message, this.store.identity(target.id)?.role ?? undefined);
 
@@ -1689,6 +1815,11 @@ export class Daemon {
 
     const conn = this.delivery.get(target.id);
     if (!conn) return "queued";
+    const resetAttempt = row.reset === "compact" && conn.compactSupport.has(target.id) ? randomUUID() : undefined;
+    if (resetAttempt) {
+      this.pendingResets.set(row.id, { conn, sessionId: target.id, attempt: resetAttempt, received: false, deadline: this.now() + this.resetTimeoutMs });
+      this.resetting.add(target.id);
+    }
     const { promise, resolve } = Promise.withResolvers<Ack>();
     const settle = (a: Ack): void => {
       if (this.inflight.get(row.id) !== inflight) return;
@@ -1699,7 +1830,7 @@ export class Daemon {
     const timer = setTimeout(() => settle({ ok: false, reason: "ack timeout" }), this.ackTimeoutMs);
     const inflight: Inflight = { conn, sessionId: target.id, timer, settle };
     this.inflight.set(row.id, inflight);
-    const push: Push = { push: "deliver", msg: message, text, session: target.id, key: target.key };
+    const push: Push = { push: "deliver", msg: message, text, session: target.id, key: target.key, ...(resetAttempt ? { reset: "compact", resetAttempt } : {}) };
     conn.write(push);
     const ack = await promise;
     const current = this.store.msg(row.id);
@@ -1709,6 +1840,10 @@ export class Daemon {
     if (ack.ok) {
       this.setStatus(row.id, "delivered");
       return this.store.msg(row.id)!.status;
+    }
+    if (resetAttempt) {
+      this.pendingResets.delete(row.id);
+      this.resetting.delete(target.id);
     }
     if (ack.reason === "connection closed") return "queued";
     return this.failAttempt(row, ack.reason ?? "rejected by adapter");
@@ -1756,6 +1891,9 @@ export class Daemon {
     const now = this.now();
     this.expirePings();
     this.expireQueues();
+    for (const [msgId, pending] of this.pendingResets) {
+      if (pending.received && now >= pending.deadline) this.finishReset(msgId, "failed", false, "compact delivery timed out");
+    }
     for (const s of this.store.db.all<SessionRow>("SELECT * FROM sessions WHERE state='gone' AND gone_at<=?", now - this.graceMs)) {
       this.removeSession(s);
     }
@@ -1861,6 +1999,7 @@ export class Daemon {
   }
 
   private async opChannelSend(s: Sender, p: Params): Promise<ChannelSendResult> {
+    if (p.reset !== undefined) throw new AsenqError("bad_request", "reset is not valid on channel posts");
     const channel = this.channelName(p);
     const text = str(p, "text", true);
     if (text.length === 0) throw new AsenqError("bad_request", "text is empty");

@@ -1,4 +1,4 @@
-export const PROTOCOL = 16;
+export const PROTOCOL = 17;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -39,12 +39,15 @@ export type Res =
 
 export type FileReference = { path: string; summary: string; sha256: string; size: number };
 
+export type ResetResult = "compacted" | "unsupported" | "failed";
+
 export type WireMsg = {
   id: string; from: string; to: string;
   kind?: Kind; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean;
   /** The reply target is no longer retained or is not readable by this caller. */
   replyToMissing?: boolean;
   text: string; file?: FileReference; createdAt: number; sourceChannel?: string;
+  reset?: "compact"; resetResult?: ResetResult;
 };
 
 export type MsgStatus =
@@ -177,13 +180,13 @@ export type ReplayResult = {
 
 export type ReadMutationResult = { applied: boolean; state: ReadState };
 
-/** `session`/`key` identify the target binding on connections that host several sessions. */
+/** `session`/`key` identify the target binding; a compact push requires a per-attempt `resetAttempt` receipt token. */
 export type Push =
-  | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string }
+  | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string; reset?: "compact"; resetAttempt?: string }
   | { push: "ping"; pingId: string }
   | { push: "event"; position: number; event: TailEvent };
 
-export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unknown_target"; reason?: string };
+export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unknown_target"; reason?: string; reset?: ResetResult | "pending" };
 export type ChannelSendResult = { msgId: string; results: SendResult[] };
 
 export type SendOptions = {
@@ -192,6 +195,7 @@ export type SendOptions = {
   thread?: string;
   replyTo?: string;
   done?: boolean;
+  reset?: "compact";
 };
 
 export class AsenqError extends Error {
