@@ -28,7 +28,8 @@
     "node": ">=22.13"
   },
   "files": [
-    "dist/src"
+    "dist/src",
+    "skills"
   ],
   "scripts": {
     "build": "tsc -p .",
