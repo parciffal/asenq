@@ -74,19 +74,19 @@ export function installSkills(skillsDir: string, source = skillsSourceDir()): vo
       if (tracked !== undefined && tracked === destHash) {
         writeFileSync(dest, content);
         manifest[name] = hash;
-        report("+", `${dest} (updated)`);
+        report("+", `${dest} (written; updated)`);
         continue;
       }
       const backup = keepBackup(dest);
       writeFileSync(dest, content);
       manifest[name] = hash;
-      report("!", `${backup} (kept your copy of ${dest})`);
+      report("+", `${dest} (written; backed up to ${backup})`);
       continue;
     }
     mkdirSync(join(skillsDir, name), { recursive: true });
     writeFileSync(dest, content);
     manifest[name] = hash;
-    report("+", dest);
+    report("+", `${dest} (written)`);
   }
   writeSkillManifest(skillsDir, manifest);
 }
@@ -101,7 +101,7 @@ export function removeSkills(skillsDir: string): void {
     const dest = skillFile(skillsDir, name);
     if (!existsSync(dest)) continue;
     if (digest(readFileSync(dest)) !== tracked) {
-      report("!", `${keepBackup(dest)} (kept your copy of ${dest})`);
+      report("+", `${keepBackup(dest)} (backed up from ${dest})`);
     }
     rmSync(dest);
     report("-", dest);
