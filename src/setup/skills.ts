@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isObj, report } from "./jsonfile.js";
@@ -92,7 +92,7 @@ export function removeSkills(skillsDir: string): void {
     rmSync(dest);
     report("-", dest);
     const dir = join(skillsDir, name);
-    if (existsSync(dir) && readdirSync(dir).length === 0) rmSync(dir);
+    if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir);
   }
   rmSync(join(skillsDir, MANIFEST));
 }

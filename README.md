@@ -234,3 +234,9 @@ npm test          # tsc + node:test
 `asenq daemon run` has test-only millisecond overrides: `ASENQ_ACK_TIMEOUT_MS`, `ASENQ_GRACE_MS`, `ASENQ_TICK_MS` (sweep, retry and probe intervals). [Delivery internals](docs/how-delivery-works.md) explain lineage, receipts, retry/TTL interactions and retention.
 
 MIT — [parciffal/asenq](https://github.com/parciffal/asenq)
+
+## Agent skills
+
+`asenq setup` installs `setup-asenq`, `asenq-worker`, `asenq-orchestrator` and `asenq-recover` into each installed harness: `~/.claude/skills/`, `~/.config/opencode/skills/` and `~/.omp/agent/skills/` (or `$PI_CODING_AGENT_DIR/skills/`). They cover installation, work received over direct messages, directing sessions and recovery.
+
+Setup updates these asenq-owned skills, backing up edited copies as `SKILL.md.asenq-bak`. `asenq doctor` checks them; `asenq setup --remove` removes only tracked copies. The repository-only `.claude/skills/asenq-dev/` skill is for changing asenq and is not installed.
