@@ -25,7 +25,7 @@ Once the package is published to npm, `npm install -g asenq` works the same way.
 
 `asenq setup` detects each harness by its config directory and makes these changes:
 
-- **Claude Code** (`~/.claude/`): adds one hook command (`asenq hook claude`) to `~/.claude/settings.json` for `SessionStart`, `SessionEnd`, `PostToolUse`, `UserPromptSubmit` and `Stop`, and registers the MCP server `asenq` with `claude mcp add --scope user`.
+- **Claude Code** (`~/.claude/`): adds one hook command (`asenq hook claude`) to `~/.claude/settings.json` for `SessionStart`, `SessionEnd`, `PostToolUse`, `UserPromptSubmit` and `Stop`, and registers the user-scoped MCP server `asenq` with stdio transport, using this install's runtime and CLI.
 - **OpenCode** (`~/.config/opencode/`): writes the plugin shim `~/.config/opencode/plugins/asenq.js`.
 - **omp** (`~/.omp/agent/`, or `$PI_CODING_AGENT_DIR/`): writes the extension shim `extensions/asenq.js`.
 - Removes old `mcp-messenger` wiring if found.
@@ -89,6 +89,7 @@ CLI errors print as `asenq: <message>`.
 | `asenq daemon not running (run: asenq daemon start)` | A client ran with auto-start disabled. Run `asenq daemon start`. |
 | `asenq daemon already running (pid N)` | Another live daemon holds `daemon.lock`. Use it, or `asenq daemon stop` first. A lock whose pid is dead is replaced automatically. |
 | `asenq daemon stop` prints `pid N did not stop` | The daemon ignored `SIGTERM` within ~3 s. Inspect that pid before retrying. |
+| `shipped skills missing ...; reinstall asenq` | The package is incomplete. Setup fails before changing wiring or config; doctor reports failure per detected harness. Reinstall the complete package, then run setup and doctor again. |
 
 `asenq daemon status` prints `running pid N` or `stopped`. `asenq daemon stop` is safe to repeat.
 
