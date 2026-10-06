@@ -55,16 +55,17 @@ Stop the daemon and back up both the database and the old build before replacing
 ```sh
 # 1. Record what to restore
 asenq --version
-cat ~/.asenq/config.json                     # runtime + cli of the installed build
+cat "$HOME/.asenq/config.json"               # runtime + cli of the installed build
 asenq ls                                     # keep each session's `resume=` command
 # 2. Save a rollback copy of the installed build and config
-mkdir -p ~/.asenq/rollback
-cp -R "$(npm root -g)/asenq" ~/.asenq/rollback/asenq-<old-version>
-cp ~/.asenq/config.json ~/.asenq/rollback/config.json
+OLD_VERSION="$(asenq --version)"
+mkdir -p "$HOME/.asenq/rollback"
+cp -R "$(npm root -g)/asenq" "$HOME/.asenq/rollback/asenq-$OLD_VERSION"
+cp "$HOME/.asenq/config.json" "$HOME/.asenq/rollback/config.json"
 # 3. Stop the daemon (required before touching the database)
 asenq daemon stop
 # 4. Back up the database with SQLite, not a raw copy of the live WAL
-sqlite3 ~/.asenq/asenq.db ".backup '$HOME/.asenq/rollback/asenq.db'"
+sqlite3 "$HOME/.asenq/asenq.db" ".backup '$HOME/.asenq/rollback/asenq.db'"
 # 5. Install the new build and rewire
 npm install -g github:parciffal/asenq
 asenq setup
@@ -93,14 +94,14 @@ CLI errors print as `asenq: <message>`.
 
 ## Rollback
 
-While the daemon is stopped: restore the saved database and build, then rewire. Restoring a database replaced by a newer revision is safe as long as the wire protocol did not change incompatibly; if it did, roll the daemon and sessions back together.
+Restore the saved database together with its matching old build, then rewire, with the daemon stopped. The snapshot holds only the messages present when it was taken, so any message created after the backup is permanently lost when you restore — confirm that is acceptable before rolling back. Use the version directory you saved in step 2 of the upgrade.
 
 ```sh
 asenq daemon stop
-npm install -g ~/.asenq/rollback/asenq-<old-version>
-cp ~/.asenq/rollback/asenq.db ~/.asenq/asenq.db
-rm -f ~/.asenq/asenq.db-wal ~/.asenq/asenq.db-shm
-cp ~/.asenq/rollback/config.json ~/.asenq/config.json
+npm install -g "$HOME/.asenq/rollback/asenq-<old-version>"
+cp "$HOME/.asenq/rollback/asenq.db" "$HOME/.asenq/asenq.db"
+rm -f "$HOME/.asenq/asenq.db-wal" "$HOME/.asenq/asenq.db-shm"
+cp "$HOME/.asenq/rollback/config.json" "$HOME/.asenq/config.json"
 asenq setup
 ```
 
@@ -120,7 +121,8 @@ Ownership and repair rules:
 
 - Setup records what it last wrote (an ownership manifest with a per-file hash) inside the harness's skills directory, so `setup --remove` can act without a config file.
 - Re-running setup leaves an unedited installed copy unchanged and updates an outdated one.
-- If the installed `SKILL.md` differs from the last-written hash — you edited it — setup saves it as `SKILL.md.asenq-bak` before overwriting. A pre-existing untracked file that collides with a skill is backed up the same way.
+- If the installed `SKILL.md` differs from the last-written hash — you edited it — setup saves your copy as `SKILL.md.asenq-bak` before overwriting. That name is fixed: a later update overwrites `SKILL.md.asenq-bak` with the newest edited copy, so only the most recent edit is kept. A pre-existing untracked file that collides with a skill is backed up the same way.
+- Removing an edited installed copy deletes the tracked `SKILL.md` only after saving your edit to `SKILL.md.asenq-bak`, so the edit is preserved.
 - `asenq setup --remove` deletes only the `SKILL.md` files asenq installed; unrelated files, directories and `.asenq-bak` backups are preserved.
 - `asenq doctor` reports, per harness, whether the skills are installed and current, or skipped and why, and whether a copy is missing, outdated, edited or unowned.
 

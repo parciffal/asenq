@@ -15,7 +15,7 @@ A session's **role** is `orchestrator`, `worker` or unset. The human assigns any
 
 ## Channels and members
 
-Channels are durable named rosters of session identities; a channel post reaches a member only when the post mentions it.
+Channels are durable, named shared streams of posts with a roster of session identities; a channel post reaches a member only when the post mentions it.
 
 - `asenq_channel_create { "channel": "backend" }` — the human or an orchestrator may create one; a channel an orchestrator creates atomically includes that orchestrator as its first member. Creating an existing channel is idempotent and does not join it.
 - `asenq_channel_add { "channel": "backend", "name": "worker-oc" }` — the human may add anyone; an orchestrator may add itself to any existing channel, or other live sessions only to channels it already belongs to.
@@ -23,7 +23,7 @@ Channels are durable named rosters of session identities; a channel post reaches
 - `asenq_channel_members { "channel": "backend" }` — reads are unrestricted.
 - `asenq_channel_read` / `asenq_channel_list` — read posts and list channels.
 
-Workers and unset-role sessions cannot create channels or edit rosters. Membership survives rename, disconnection, removal and revival; a name reused by a different identity does not inherit it.
+Workers and unset-role sessions cannot create channels or edit rosters. Membership survives rename, disconnection, automatic removal and revival; human `close` and archive `purge` remove it, and a name reused by a different identity does not inherit it.
 
 ## Mentions and their boundary rule
 
@@ -56,7 +56,7 @@ Request compaction of a target's context before its next task:
 - The human or an orchestrator only, to **one named session**; `"*"`, `"human"`, stable-id sends and channel posts reject the flag with `bad_request`.
 - omp adapters compact and then inject the message. OpenCode and Claude (and other adapters without the capability) deliver normally and report `reset=unsupported`; OpenCode compaction is tracked separately.
 - A capable live target acknowledges receipt immediately and the send result reports `reset=pending`, not finished compaction. History then records `resetResult=compacted` or `resetResult=failed`; **failure still delivers the message**. `asenq log --id <msgId>` shows the final outcome.
-- A pending reset has a 10-minute daemon-side cap; expiry or disconnect records failure, and deferred messages stay queued for reconnection. Held and queued sends keep the request and resolve capability only on actual delivery.
+- A pending reset has a 10-minute daemon-side cap. Expiry records failure and immediately releases the target's delivery gate, so deferred messages proceed even while the target stays live; disconnect ends the pending reset as failed and leaves deferred messages queued for reconnection. Held and queued sends keep the request and resolve capability only on actual delivery.
 
 ## Tracking work, held messages, handoff
 

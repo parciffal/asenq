@@ -15,7 +15,7 @@ The live daemon, MCP servers and hooks of a running machine execute from one che
 
 - Do all work in a separate git worktree of this repository on its own branch. Where dependencies are needed, provision them in the worktree (a symlink to the main checkout's `node_modules` is often enough), and verify provisioning before running anything.
 - Tools resolve paths from the session's working directory, not from a shell's `cd`. Use **absolute paths under your worktree** for every file read, edit and write, and pass an explicit working directory to shell commands.
-- Never restart, stop or start the machine's live daemon, and never run `asenq setup`, while developing here.
+- Never restart, stop or start the machine's live daemon, and never run `asenq setup` against the live home. `asenq setup` and `asenq doctor` are safe only against a temporary `HOME` and `ASENQ_HOME`.
 
 ## Wire protocol
 
@@ -26,7 +26,7 @@ If your change alters the wire protocol, bump `PROTOCOL` in `src/shared/protocol
 `npm test` (TypeScript build + `node --test`) is the gate; there is no CI. Test **external behavior** only.
 
 - **Daemon seam**: build the daemon with `startEnv()` (a temp `ASENQ_HOME`, an in-process daemon, a manual clock and background timers disabled). Advance time with `env.clock.advance(ms)` and drive sweeps and other timers by hand (`env.daemon.sweep()`); never sleep on a real clock.
-- **Delivery acknowledgment barrier**: an adapter's `nextDelivery()` proves the delivery was *received*, not that the daemon finished the delivery. Subscribe with `env.watch(isStatus(msgId, "delivered"))` before triggering the send, then await that event before asserting inbox, unread or queued state. A revival or retry is only durable once the delivered event lands.
+- **Delivery acknowledgment barrier**: an adapter's `nextDelivery()` proves the delivery was *received*, not that the daemon finished it. When the id is already known, subscribe with `env.watch(isStatus(msgId, "delivered"))` **before** triggering that delivery — a queued message or a revival is the usual case — then await the delivered event before asserting inbox, unread or queued state. For a fresh send, take `msgId` from the send result and subscribe before the next acknowledgment or delivery step, since the id does not exist until the send returns.
 - **Rendered TUI rows**: TUI tests render real frames and assert on visible rows and hit rows. A logical list entry may span several rows sharing one stable key; only the visible last row of the newest incoming message marks a conversation read — scrolled-away or hidden rows must not. Every frame row must fit the terminal width and height.
 - Assert through the public protocol (daemon requests, adapter pushes, rendered frames). Do not test implementation details, forward values, or bare non-throwing calls.
 
