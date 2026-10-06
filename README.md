@@ -159,6 +159,8 @@ The agent equivalent is `asenq_send { to: "worker-omp", text: "Start the next ta
 
 A capable live target acknowledges receipt immediately: the send result reports **`reset=pending`**, not completed compaction. The adapter then compacts and delivers the task; history and tail events record **`resetResult=compacted`** or **`resetResult=failed`**. Failure to compact still delivers the message. A target without the capability reports **`reset=unsupported`** once delivered, also retained as `resetResult=unsupported`. `asenq log --id <msgId>` shows the final outcome.
 
+In the TUI, select a transcript message with the arrow keys and press Enter to see its `reset` request and final `resetResult`.
+
 Held and queued sends retain the request but omit the initial reset outcome. They resolve the current adapter capability and compact only on actual delivery. Later sends to a target with a pending reset queue in the daemon, avoiding repeated pushes during a slow compaction; other sessions remain independent. Completion flushes that target's queue.
 
 A pending reset has a **10-minute** daemon-side cap (`DaemonOpts.resetTimeoutMs`); sweep expiry records failure and releases deferred delivery attempts. Disconnect also ends the pending reset as failed; deferred messages remain queued for reconnection. A hung harness API is not repaired by this deadline: subsequent attempts still use normal delivery acknowledgments and retries. An adapter injection error or an interrupted accepted delivery is recorded as failed without repeating compaction.

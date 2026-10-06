@@ -954,6 +954,7 @@ export class Daemon {
   private finishClose(session: SessionIdentity, channels: string[]): void {
     const id = session.id;
     this.cancelPings(id);
+    this.cancelResets((reset) => reset.sessionId === id, "session closed during compaction");
     this.delivery.delete(id);
     this.lastSeen.delete(id);
     const replyServer = this.replyServers.get(id);

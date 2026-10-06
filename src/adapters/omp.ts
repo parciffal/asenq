@@ -58,7 +58,7 @@ export default function asenq(pi: ExtensionAPI): void {
 
   /** Ordinary pushes ack after delivery, exactly as before reset support existed. */
   const ackDelivery = (p: Delivery, ok: boolean, reason?: string): void => {
-    client?.request("ack", { msgId: p.msg.id, ok, reason })
+    client?.request("ack", { as: p.session, msgId: p.msg.id, ok, reason })
       .catch((e: unknown) => warn(`ack ${p.msg.id} failed: ${String(e)}`));
   };
 

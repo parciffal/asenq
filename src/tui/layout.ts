@@ -206,6 +206,8 @@ function detailLines(message: StoredMessage): string[] {
     `from ${message.from}${message.fromSessionId ? ` (${message.fromSessionId})` : ""} → ${message.channel ? `#${message.channel}` : message.to}${message.toSessionId ? ` (${message.toSessionId})` : ""}`,
     `status ${message.status}${message.reason ? `: ${message.reason}` : ""} · order ${message.order} · ${new Date(message.createdAt).toLocaleString()}`,
   ];
+  if (message.reset) lines.push(`reset ${message.reset}`);
+  if (message.resetResult) lines.push(`resetResult ${message.resetResult}`);
   if (message.sourceChannel) lines.push(`via #${message.sourceChannel}`);
   if (message.thread) lines.push(`thread ${message.thread}`);
   if (message.replyTo) lines.push(`reply to ${message.replyTo}${message.replyToMissing ? " (purged message)" : ""}`);

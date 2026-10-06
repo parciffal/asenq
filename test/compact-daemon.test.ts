@@ -321,3 +321,44 @@ test("a stale compact push cannot acknowledge or finish a newer attempt on the s
   await target.client.request("reset_result", { as: current.session, msgId: current.msg.id, reset: "compacted", ok: true, resetAttempt: current.resetAttempt });
   assert.deepEqual([(await logOf(human, stale.msg.id)).status, (await logOf(human, stale.msg.id)).resetResult], ["delivered", "compacted"]);
 });
+
+test("closing a target finalizes its accepted reset immediately", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const target = await env.adapter("omp", "close-reset", "target", { autoAck: false });
+  await target.client.request("register", { harness: "omp", key: "close-reset", caps: ["compact"] });
+  const sending = human.request("send", { to: "target", text: "interrupted by close", reset: "compact" });
+  const push = await target.nextDelivery();
+  await target.client.request("ack", { as: push.session, msgId: push.msg.id, ok: true, reset: "pending", resetAttempt: push.resetAttempt });
+  await sending;
+  await human.request("close", { identity: target.session.id });
+  const retained = await logOf(human, push.msg.id);
+  assert.deepEqual([retained.status, retained.resetResult], ["failed", "failed"]);
+});
+
+test("replacement transfers an unreceived compact message without leaking the old delivery gate", async () => {
+  env = await startEnv({ ackTimeoutMs: 1000 });
+  const human = env.human();
+  const original = await env.adapter("omp", "compact-source", "source", { autoAck: false });
+  const replacement = await env.adapter("omp", "compact-destination", "destination", { autoAck: false });
+  await original.client.request("register", { harness: "omp", key: "compact-source", caps: ["compact"] });
+  await replacement.client.request("register", { harness: "omp", key: "compact-destination", caps: ["compact"] });
+  const sending = human.request("send", { to: "source", text: "task follows replacement", reset: "compact" });
+  void sending.catch(() => {});
+  const stale = await original.nextDelivery();
+  await human.request("replace", { fromId: original.session.id, toId: replacement.session.id });
+  const current = await replacement.nextDelivery();
+  await assert.rejects(original.client.request("ack", { as: stale.session, msgId: stale.msg.id, ok: true, reset: "pending", resetAttempt: stale.resetAttempt }));
+  assert.equal(current.msg.id, stale.msg.id);
+  assert.equal(current.session, replacement.session.id);
+  await replacement.client.request("ack", { as: current.session, msgId: current.msg.id, ok: true, reset: "pending", resetAttempt: current.resetAttempt });
+  await sending;
+  const [normal] = (await human.request("send", { to: "destination", text: "next task waits for moved reset" })).results as SendResult[];
+  assert.equal(normal.status, "queued");
+  await replacement.client.request("reset_result", { as: current.session, msgId: current.msg.id, reset: "compacted", resetAttempt: current.resetAttempt, ok: true });
+  const next = await replacement.nextDelivery();
+  assert.equal(next.msg.id, normal.msgId);
+  await replacement.client.request("ack", { as: next.session, msgId: next.msg.id, ok: true });
+  const retained = await logOf(human, current.msg.id);
+  assert.deepEqual([retained.status, retained.resetResult], ["delivered", "compacted"]);
+});
