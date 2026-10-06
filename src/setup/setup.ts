@@ -8,7 +8,7 @@ import { readConfig, writeConfig } from "../shared/config.js";
 import { configPath, dbPath } from "../shared/paths.js";
 import { QUEUE_TTL_MS } from "../shared/protocol.js";
 import { editJson, isObj, readJson, report, type Json } from "./jsonfile.js";
-import { installSkills, removeSkills, skillsSourceDir } from "./skills.js";
+import { installSkills, removeSkills, SKILL_NAMES, skillsSourceDir } from "./skills.js";
 
 export const CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "PostToolUse", "UserPromptSubmit", "Stop"] as const;
 export const ASENQ_HOOK_RE = /asenq.* hook claude$/;
@@ -235,6 +235,13 @@ export async function setup(argv: string[]): Promise<number> {
   if (argv.includes("--remove")) return remove();
   const i = install();
 
+  const source = skillsSourceDir();
+  const missing = SKILL_NAMES.filter((name) => !existsSync(join(source, name, "SKILL.md")));
+  if (missing.length) {
+    report("!", `shipped skills missing ${missing.join(", ")} from ${source}; reinstall asenq`);
+    return 1;
+  }
+
   const prev = readConfig();
   const cfg = {
     runtime: i.runtime, cli: i.cli, historyDays: prev?.historyDays ?? 7,
@@ -253,9 +260,7 @@ export async function setup(argv: string[]): Promise<number> {
   if (existsSync(ompAgentDir())) writeShim(join(ompAgentDir(), "extensions", "asenq.js"), ompShim(i));
   else process.stdout.write("skip omp: not installed\n");
 
-  const source = skillsSourceDir();
-  if (!existsSync(source)) report("!", `skills not found at ${source}; reinstall asenq`);
-  else for (const { base, detected } of skillTargets()) if (detected) installSkills(join(base, "skills"), source);
+  for (const { base, detected } of skillTargets()) if (detected) installSkills(join(base, "skills"), source);
 
   if (removeLegacy()) {
     process.stdout.write(

@@ -19,16 +19,28 @@ export const skillsSourceDir = (): string => fileURLToPath(new URL("../../../ski
 const digest = (content: Buffer | string): string => createHash("sha256").update(content).digest("hex");
 const skillFile = (skillsDir: string, name: string): string => join(skillsDir, name, "SKILL.md");
 
+const isHash = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+
+/** Reads the ownership record, keeping only shipped skill names with valid content hashes. */
 export function readSkillManifest(skillsDir: string): Manifest | undefined {
   const path = join(skillsDir, MANIFEST);
   if (!existsSync(path)) return undefined;
   const data = JSON.parse(readFileSync(path, "utf8")) as unknown;
-  return isObj(data) ? (data as Manifest) : {};
+  const manifest: Manifest = {};
+  if (isObj(data)) {
+    for (const name of SKILL_NAMES) {
+      const hash = data[name];
+      if (isHash(hash)) manifest[name] = hash;
+    }
+  }
+  return manifest;
 }
 
 function writeSkillManifest(skillsDir: string, manifest: Manifest): void {
+  const owned: Manifest = {};
+  for (const name of SKILL_NAMES) if (manifest[name]) owned[name] = manifest[name];
   const path = join(skillsDir, MANIFEST);
-  const text = JSON.stringify(manifest, null, 2) + "\n";
+  const text = JSON.stringify(owned, null, 2) + "\n";
   if (existsSync(path) && readFileSync(path, "utf8") === text) return;
   writeFileSync(path, text);
 }
@@ -83,10 +95,12 @@ export function installSkills(skillsDir: string, source = skillsSourceDir()): vo
 export function removeSkills(skillsDir: string): void {
   const manifest = readSkillManifest(skillsDir);
   if (!manifest) return;
-  for (const name of Object.keys(manifest)) {
+  for (const name of SKILL_NAMES) {
+    const tracked = manifest[name];
+    if (tracked === undefined) continue;
     const dest = skillFile(skillsDir, name);
     if (!existsSync(dest)) continue;
-    if (digest(readFileSync(dest)) !== manifest[name]) {
+    if (digest(readFileSync(dest)) !== tracked) {
       report("!", `${keepBackup(dest)} (kept your copy of ${dest})`);
     }
     rmSync(dest);

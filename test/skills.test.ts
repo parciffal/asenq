@@ -313,3 +313,129 @@ test("doctor reports a user-edited skill", () => {
   assert.equal(d.status, 0);
   assert.ok(d.out.includes("claude skills: edited asenq-recover"));
 });
+
+test("doctor warns about an unowned same-named skill and leaves it alone", () => {
+  const pkg = makePkg();
+  const home = makeHome({ claude: true });
+  run(pkg, home, "setup");
+  const root = skillsRoot(home, "claude");
+  rmSync(join(root, ".asenq-skills.json"));
+
+  const d = doctor(pkg, home);
+  assert.equal(d.status, 0);
+  assert.ok(d.out.includes("claude skills: unowned"));
+  assert.equal(readFileSync(skillFile(root, "asenq-worker"), "utf8"), shipped(pkg, "asenq-worker"));
+  assert.ok(!existsSync(join(root, ".asenq-skills.json")), "doctor does not adopt the files");
+});
+
+test("setup fails closed without touching anything when one shipped skill file is missing", () => {
+  const pkg = makePkg();
+  rmSync(join(pkg, "skills", "asenq-worker", "SKILL.md"));
+  const home = makeHome();
+
+  const r = run(pkg, home, "setup");
+  assert.equal(r.status, 1);
+  assert.ok(/reinstall/i.test(r.out), "actionable reinstall reason");
+  assert.ok(r.out.includes("asenq-worker"), "names the missing skill file");
+  assert.ok(!existsSync(join(home, ".asenq", "config.json")), "no config written");
+  assert.ok(!existsSync(join(home, ".claude", "settings.json")), "no hooks written");
+  assert.ok(!existsSync(join(home, ".config", "opencode", "plugins", "asenq.js")), "no opencode shim written");
+  assert.ok(!existsSync(join(home, ".omp", "agent", "extensions", "asenq.js")), "no omp shim written");
+  assert.ok(!existsSync(join(home, ".claude", "skills")), "no skills copied");
+});
+
+test("setup fails closed when the whole shipped skills directory is missing", () => {
+  const pkg = makePkg();
+  rmSync(join(pkg, "skills"), { recursive: true, force: true });
+  const home = makeHome();
+
+  const r = run(pkg, home, "setup");
+  assert.equal(r.status, 1);
+  assert.ok(/reinstall/i.test(r.out), "actionable reinstall reason");
+  assert.ok(!existsSync(join(home, ".asenq", "config.json")), "no config written");
+  assert.ok(!existsSync(join(home, ".claude", "settings.json")), "no hooks written");
+  assert.ok(!existsSync(join(home, ".claude", "skills")), "no skills copied");
+});
+
+test("doctor fails per harness when one shipped skill file is missing", () => {
+  const pkg = makePkg();
+  const home = makeHome({ claude: true, opencode: true });
+  run(pkg, home, "setup");
+
+  const broken = makePkg();
+  rmSync(join(broken, "skills", "asenq-worker", "SKILL.md"));
+
+  const d = doctor(broken, home);
+  assert.equal(d.status, 1);
+  assert.ok(d.out.includes("claude skills: shipped skills missing asenq-worker"));
+  assert.ok(d.out.includes("opencode skills: shipped skills missing asenq-worker"));
+  assert.ok(/reinstall/i.test(d.out));
+});
+
+test("doctor fails when the whole shipped skills directory is missing", () => {
+  const pkg = makePkg();
+  const home = makeHome({ claude: true });
+  run(pkg, home, "setup");
+
+  const broken = makePkg();
+  rmSync(join(broken, "skills"), { recursive: true, force: true });
+
+  const d = doctor(broken, home);
+  assert.equal(d.status, 1);
+  assert.ok(d.out.includes("claude skills: shipped skills missing setup-asenq, asenq-worker, asenq-orchestrator, asenq-recover"));
+  assert.ok(/reinstall/i.test(d.out));
+});
+
+test("setup --remove ignores foreign and traversing manifest keys", () => {
+  const pkg = makePkg();
+  const home = makeHome({ claude: true });
+  run(pkg, home, "setup");
+
+  const root = skillsRoot(home, "claude");
+  const foreign = join(root, "my-skill", "SKILL.md");
+  const escape = join(home, ".claude", "escape", "SKILL.md");
+  mkdirSync(join(root, "my-skill"), { recursive: true });
+  mkdirSync(join(home, ".claude", "escape"), { recursive: true });
+  writeFileSync(foreign, "foreign\n");
+  writeFileSync(escape, "traversal\n");
+  const manifest = JSON.parse(readFileSync(join(root, ".asenq-skills.json"), "utf8")) as Record<string, string>;
+  manifest["my-skill"] = "0".repeat(64);
+  manifest["../escape"] = "0".repeat(64);
+  writeFileSync(join(root, ".asenq-skills.json"), JSON.stringify(manifest, null, 2) + "\n");
+
+  const r = run(pkg, home, "setup", "--remove");
+  assert.equal(r.status, 0);
+  for (const name of SKILLS) assert.ok(!existsSync(skillFile(root, name)), `${name} removed`);
+  assert.equal(readFileSync(foreign, "utf8"), "foreign\n");
+  assert.equal(readFileSync(escape, "utf8"), "traversal\n");
+  assert.ok(!existsSync(join(root, "my-skill", "SKILL.md.asenq-bak")));
+});
+
+test("a setup rerun prunes foreign manifest keys and still preserves their files", () => {
+  const pkg = makePkg();
+  const home = makeHome({ claude: true });
+  run(pkg, home, "setup");
+
+  const root = skillsRoot(home, "claude");
+  const foreign = join(root, "my-skill", "SKILL.md");
+  const escape = join(home, ".claude", "escape", "SKILL.md");
+  mkdirSync(join(root, "my-skill"), { recursive: true });
+  mkdirSync(join(home, ".claude", "escape"), { recursive: true });
+  writeFileSync(foreign, "foreign\n");
+  writeFileSync(escape, "traversal\n");
+  const manifest = JSON.parse(readFileSync(join(root, ".asenq-skills.json"), "utf8")) as Record<string, string>;
+  manifest["my-skill"] = "0".repeat(64);
+  manifest["../escape"] = "0".repeat(64);
+  writeFileSync(join(root, ".asenq-skills.json"), JSON.stringify(manifest, null, 2) + "\n");
+
+  const r = run(pkg, home, "setup");
+  assert.equal(r.status, 0);
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(root, ".asenq-skills.json"), "utf8")) as Record<string, string>).sort(), [...SKILLS].sort());
+  assert.equal(readFileSync(foreign, "utf8"), "foreign\n");
+  assert.equal(readFileSync(escape, "utf8"), "traversal\n");
+
+  const removed = run(pkg, home, "setup", "--remove");
+  assert.equal(removed.status, 0);
+  assert.equal(readFileSync(foreign, "utf8"), "foreign\n");
+  assert.equal(readFileSync(escape, "utf8"), "traversal\n");
+});

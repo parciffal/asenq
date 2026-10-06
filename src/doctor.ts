@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { claudeHookInstalled, CLAUDE_EVENTS, claudeDir, hookCommand, ompAgentDir, opencodeDir, type Install } from "./setup/setup.js";
 import { isObj, readJson } from "./setup/jsonfile.js";
-import { inspectSkills, skillsSourceDir, type SkillState } from "./setup/skills.js";
+import { inspectSkills, SKILL_NAMES, skillsSourceDir, type SkillState } from "./setup/skills.js";
 import { AsenqClient } from "./shared/client.js";
 import { readConfig } from "./shared/config.js";
 import { PROTOCOL } from "./shared/protocol.js";
@@ -48,8 +48,9 @@ export async function doctor(): Promise<number> {
       line("ok", `${harness} skills: skipped (${harness} not installed)`);
       return;
     }
-    if (!existsSync(skillsSourceDir())) {
-      line("warn", `${harness} skills: shipped skills missing from this asenq install`);
+    const shippedMissing = SKILL_NAMES.filter((name) => !existsSync(join(skillsSourceDir(), name, "SKILL.md")));
+    if (shippedMissing.length) {
+      line("fail", `${harness} skills: shipped skills missing ${shippedMissing.join(", ")} from this asenq install; reinstall asenq`);
       return;
     }
     const states = inspectSkills(join(base, "skills"));
@@ -60,7 +61,7 @@ export async function doctor(): Promise<number> {
     const unowned = names("unowned");
     if (missing) line("fail", `${harness} skills: missing ${missing}; run: asenq setup`);
     if (outdated) line("fail", `${harness} skills: outdated ${outdated}; run: asenq setup`);
-    if (edited) line("warn", `${harness} skills: edited ${edited}; run: asenq setup to update (your copy is backed up)`);
+    if (edited) line("warn", `${harness} skills: edited ${edited}; run: asenq setup to update (your copy will be backed up)`);
     if (unowned) line("warn", `${harness} skills: unowned ${unowned}; not installed by asenq`);
     if (states.every((s) => s.state === "current")) line("ok", `${harness} skills: current`);
   };
