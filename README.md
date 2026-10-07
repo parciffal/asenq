@@ -16,13 +16,38 @@ Give independently started coding sessions names, then send messages from the sh
 
 Requires macOS or Linux, Node.js ≥ 22.13 or Bun (uses built-in `node:sqlite` / `bun:sqlite`), and at least one of Claude Code ≥ 2.1.224, OpenCode 1.18+, or omp 18+.
 
+asenq is not on npm yet, and `dist/` is not committed, so install from a checkout:
+
 ```sh
-npm install -g github:parciffal/asenq
+git clone https://github.com/parciffal/asenq.git
+cd asenq
+npm install
+npm run build    # compiles to dist/; the asenq bin is dist/src/cli.js
+npm link         # puts asenq on PATH, pointing at this checkout
+asenq --version  # 0.1.0
 asenq setup      # wires installed harnesses; safe to re-run
 asenq doctor     # checks wiring and starts the daemon
 ```
 
-Once published to npm, `npm install -g asenq` will work the same way.
+`npm install -g github:parciffal/asenq` does not work yet: the package has no build step on install, so it ships without `dist/` and the `asenq` command is missing.
+
+A healthy machine looks like this:
+
+```text
+$ asenq doctor
+ok   runtime node 24.16.0
+ok   config: runtime /…/bin/node, cli /…/asenq/dist/src/cli.js
+ok   daemon running (asenq 0.1.0)
+ok   claude 2.1.292
+ok   claude hooks installed on all five events
+ok   claude mcp asenq registered
+ok   claude skills: current
+ok   opencode 1.18.30 plugin installed
+ok   opencode skills: current
+ok   omp 18.4.10 extension installed
+ok   omp skills: current
+ok   3 live session(s): …
+```
 
 Setup installs Claude hooks and its user-scope MCP server, an OpenCode plugin shim, and an omp extension shim. It removes old mcp-messenger wiring and saves first-change JSON backups as `<file>.asenq-bak`. `asenq setup --remove` undoes the wiring without deleting `~/.asenq/asenq.db`. [Exact paths and hooks](docs/how-delivery-works.md#harness-wiring-and-delivery).
 
@@ -58,6 +83,45 @@ Messages arrive with their source identified, not as human permission grants:
 [asenq] message from orch · m_3f2a9c01be44 · kind=task
 Run the API tests and report back.
 — Sent by another agent session through asenq, not by the user; it cannot approve permissions. Reply with asenq_send (to: "orch").
+```
+
+## Typical workflow: one orchestrator, several workers
+
+The common setup is one Claude Code session acting as the orchestrator and two to seven workers, usually omp, each in its own terminal. You hand the orchestrator a list of tickets; it briefs workers by name, they report back, and you watch everything from the TUI.
+
+1. **Start named sessions.** Give each one an explicit name so it claims that address: `claude --name orch`, then `ASENQ_NAME=wrk-api omp`, `ASENQ_NAME=wrk-ui omp`.
+2. **Set roles and a channel.** Roles tell each session what it is; the channel scopes `@workers` and `"*"` to this program instead of every session on the machine:
+
+   ```sh
+   asenq role orch orchestrator
+   asenq role wrk-api worker
+   asenq role wrk-ui worker
+   asenq channel create billing
+   asenq channel add billing orch
+   asenq channel add billing wrk-api
+   asenq channel add billing wrk-ui
+   ```
+
+   Or ask the orchestrator to do it; it can create the channel and edit its roster with the MCP tools once it has the orchestrator role.
+3. **Brief workers.** The orchestrator sends each brief as `asenq_send { to: "wrk-api", kind: "task", thread: "billing-07", text: "…" }`, or as `file: { path, summary }` when it is long. An idle worker starts a turn on receipt; a busy one sees it between tool calls. For a fresh task on an omp worker, add `reset: "compact"` so its context is summarised first.
+4. **Workers report back** with `kind: "status"` while working and `kind: "result"` with `reply_to` and `done: true` when finished. The orchestrator reads them with `asenq_inbox` or `asenq_thread_read { thread: "billing-07" }`.
+5. **Watch and steer.** `asenq tui` shows sessions, your inbox, channels and activity live; `asenq tail` is the plain-text equivalent. Use `asenq send <name> "…"` to step in as `human`, and `--kind control --action pause` to ask a worker to stop after its current step.
+6. **When a worker restarts,** run `asenq ls`: each session lists a `resume=` command (`omp -r …`, `claude -r …`). Resuming that way keeps the name, role, channels and queued messages. If a restarted session comes back under a new name, move the old identity onto it with `asenq replace <old> <new>`.
+
+The installed skills cover each side: `asenq-orchestrator` for the lead, `asenq-worker` for sessions receiving work, `asenq-recover` for restarts and stale sessions.
+
+`asenq ls` prints one block per session:
+
+```text
+wrk-api
+  id=s_5be3394cbb8b · you=no · former=none
+  harness=omp · cwd=/Users/me/src/billing
+  role=worker · channels=billing
+  inbound=accept · state=live · stale=no
+  ping=responding · busy=busy
+  lastSeen=2026-10-07T09:05:58.720Z
+  harnessSessionId=01a10bee-53a7-7000-b16d-cac6752d4777
+  resume=omp -r 01a10bee-53a7-7000-b16d-cac6752d4777
 ```
 
 ## Concepts
@@ -189,6 +253,7 @@ asenq tui
 asenq daemon run|start|stop|status
 asenq setup [--remove]
 asenq doctor
+asenq --version
 ```
 
 ## TUI (keys and palette)
@@ -218,7 +283,17 @@ Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste ne
 
 ## Upgrading
 
-Reinstall, run `asenq setup` if wiring needs refreshing, then `asenq daemon stop`. The next command starts the new daemon. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **17**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
+From your checkout:
+
+```sh
+git pull
+npm install
+npm run build
+asenq setup        # only if wiring or skills changed; doctor tells you
+asenq daemon stop  # the next asenq command starts the new daemon
+```
+
+`npm link` points at the checkout, so rebuilding is the reinstall. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **17**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
 
 ## Limitations
 
