@@ -288,3 +288,13 @@ test("sprite art keeps a uniform width so links and plates line up", () => {
   for (const art of Object.values(WORKER_ART)) for (const row of [...art.rows, ...art.legs]) assert.equal(row.length, WORKER_W, row);
   for (const art of Object.values(ORCH_ART)) for (const row of [...art.rows, ...art.legs]) assert.equal(row.length, ORCH_W, row);
 });
+
+test("a wide-character cwd is shortened by display width and keeps its tail", () => {
+  const cwd = `/work/${"漢字".repeat(30)}/tail-dir`;
+  const w = small();
+  w.bugs = w.bugs.map((b) => (b.id === "o1" ? { ...b, cwd } : b));
+  const size = SIZES[0];
+  const rows = frameRows(w, ui({ selectedId: "o1" }), size);
+  for (const row of rows) assert.ok(terminalTextWidth(row) <= size.columns, row);
+  assert.ok(rows.some((row) => row.includes("CWD") && row.includes("tail-dir")));
+});

@@ -259,12 +259,18 @@ test("keyboard navigation selects bugs and Tab cycles through them", async () =>
     for (const n of selected()) seen.add(n);
   }
   assert.equal(seen.size, names.length, "Tab reaches every bug");
+  const first = target(viz);
+  await viz.press("TAB");
+  const second = target(viz);
+  assert.notEqual(second, first, "successive Tab changes the target");
   await viz.press("SHIFT_TAB");
-  await viz.press("j");
-  await viz.press("RIGHT");
-  await viz.press("ENTER"); // focus on
-  await viz.press("ENTER"); // focus off
-  assert.ok(has(viz, "boss-queen"), "navigation and focus never crash the scene");
+  assert.equal(target(viz), first, "Shift-Tab returns to the previous bug");
+  assert.ok(names.some((n) => first.includes(n)), "target names a bug");
+  const unfocused = viz.rows().join("\n");
+  await viz.press("ENTER");
+  assert.notEqual(viz.rows().join("\n"), unfocused, "focus changes the frame");
+  await viz.press("ENTER");
+  assert.equal(viz.rows().join("\n"), unfocused, "focus off restores the frame");
 });
 
 test("a detected codex process draws as codex-<pid> and u toggles feral bugs", async () => {

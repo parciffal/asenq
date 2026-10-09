@@ -85,5 +85,6 @@ export function buildWorld(input: WorldInput): World {
     if (leads.length) for (const o of leads) edges.push({ from: o.id, to: worker.id, via: "channel" });
     else edges.push({ from: human.id, to: worker.id, via: "human" });
   }
-  return { bugs: [human, ...orchestrators, ...workers, ...feralBugs(sessions, procs)], edges, feed, connection };
+  const visible = new Set(registered.map((b) => b.id));
+  return { bugs: [human, ...orchestrators, ...workers, ...feralBugs(sessions.filter((s) => visible.has(s.id)), procs)], edges, feed, connection };
 }

@@ -513,7 +513,15 @@ function shortenPath(path: string, width: number): string {
   const clean = cleanLabel(path).text;
   const short = home && (clean === home || clean.startsWith(`${home}/`)) ? `~${clean.slice(home.length)}` : clean;
   if (textWidth(short) <= width) return short;
-  const tail = [...short].slice(-(Math.max(1, width - 1))).join("");
+  const graphemes = [...GRAPHEMES.segment(short)].map((s) => s.segment);
+  let tail = "";
+  let used = 0;
+  for (let i = graphemes.length - 1; i >= 0; i--) {
+    const w = textWidth(graphemes[i]);
+    if (used + w > width - 1) break;
+    tail = graphemes[i] + tail;
+    used += w;
+  }
   return `…${tail}`;
 }
 

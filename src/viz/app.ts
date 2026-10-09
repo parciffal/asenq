@@ -69,6 +69,7 @@ export class VizApp {
   private lastScan = 0;
   private subscribed = false;
   private refreshing = false;
+  private loadSeq = 0;
   private refreshAgain = false;
   private scanning = false;
   private closed = false;
@@ -168,6 +169,8 @@ export class VizApp {
   /** Rebuilds the world from current inputs, drops a selection/filter-hidden bug and redraws. */
   private rebuild(): void {
     this.world = this.build();
+    this.reresolveFeed();
+    this.world = this.build();
     this.reconcile();
     this.render();
   }
@@ -197,14 +200,14 @@ export class VizApp {
 
   /** Subscribes (once per connection) then lists; any failure shows the SIGNAL LOST world and retries on the next poll. */
   private async load(): Promise<void> {
+    const attempt = ++this.loadSeq;
     try {
-      const reply = await within((async () => {
-        if (!this.subscribed) {
-          await this.client.sync();
-          this.subscribed = true;
-        }
-        return this.client.request("list");
-      })(), REQUEST_TIMEOUT_MS);
+      await this.client.connect();
+      if (!this.subscribed) {
+        await within(this.client.sync(), REQUEST_TIMEOUT_MS);
+        if (attempt === this.loadSeq) this.subscribed = true;
+      }
+      const reply = await within(this.client.request("list"), REQUEST_TIMEOUT_MS);
       this.sessions = reply.sessions as ListedSession[];
       this.connection = "connected";
     } catch {
@@ -237,9 +240,21 @@ export class VizApp {
   private endpoint(sessionId: string | undefined, name: string): Bug | undefined {
     const bugs = this.world.bugs;
     if (name === "human") return bugs.find((b) => b.id === "human");
-    if (sessionId) return bugs.find((b) => b.id === sessionId);
-    return bugs.find((b) => b.kind !== "human" && b.name === name)
+    return (sessionId ? bugs.find((b) => b.id === sessionId) : undefined)
+      ?? bugs.find((b) => b.kind !== "human" && b.name === name)
       ?? bugs.find((b) => b.kind !== "human" && b.previousNames.includes(name));
+  }
+
+  /** Resolves feed lines whose endpoint could not be found when they arrived (world not yet loaded). */
+  private reresolveFeed(): void {
+    if (!this.feed.some((l) => l.fromId === null || l.toId === null)) return;
+    this.feed = this.feed.map((l) => {
+      const from = l.fromId === null ? this.endpoint(undefined, l.from) : undefined;
+      const to = l.toId === null && !l.to.startsWith("#") ? this.endpoint(undefined, l.to) : undefined;
+      return from || to
+        ? { ...l, fromId: from?.id ?? l.fromId, toId: to?.id ?? l.toId, from: from?.name ?? l.from, to: to?.name ?? l.to }
+        : l;
+    });
   }
 
   private message(msg: StoredMessage): void {

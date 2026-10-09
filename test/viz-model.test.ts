@@ -155,6 +155,15 @@ test("id-matched sessions are subtracted before the per-harness count, and stale
   assert.deepEqual(w.bugs.filter((b) => b.kind === "feral").map((b) => b.id), ["proc:3"]);
 });
 
+test("an aged-out gone session no longer claims a process carrying its id", () => {
+  const id = "deadbeef-0000-4000-8000-000000000002";
+  const w = world(
+    [session({ id: "old", name: "old-one", harness: "omp", harnessSessionId: id, state: "gone", lastSeen: NOW - 31 * MIN })],
+    [proc({ pid: 21, command: `omp -r ${id}` })],
+  );
+  assert.deepEqual(w.bugs.filter((b) => b.kind === "feral").map((b) => b.id), ["proc:21"]);
+});
+
 test("short or missing harness session ids never match process command lines", () => {
   const w = world(
     [session({ id: "s1", name: "tiny", harness: "omp", harnessSessionId: "omp", state: "gone", lastSeen: NOW })],
