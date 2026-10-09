@@ -51,6 +51,10 @@ asenq doctor     # checks wiring and starts the daemon
 
 `npm install -g github:parciffal/asenq` does not work yet: the package has no build step on install. Setup installs Claude hooks and its user-scope MCP server, an OpenCode plugin shim and an omp extension shim, saving first-change JSON backups as `<file>.asenq-bak`. `asenq setup --remove` undoes the wiring without deleting `~/.asenq/asenq.db`. [Exact paths and hooks](docs/how-delivery-works.md#harness-wiring-and-delivery).
 
+### Claude Code mod
+
+`asenq setup` installs a Claude Code mod to `~/.claude/mods/asenq` and registers it in `CLAUDE_CODE_PLUGIN_DIRS`. The mod adds a status line showing your session's name, role and workers, and the `/asenq` slash command opens a pane with all sessions, their roles, channels and members. From the pane you can rename sessions and channels, and change roles. A live `tail` stream keeps the status line and pane current as sessions join, leave or change.
+
 ## Quick start
 
 Start and name your sessions, then send a message or open the console:

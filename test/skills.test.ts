@@ -49,6 +49,7 @@ function makePkg(): string {
   const root = mkdtempSync(join(tmp, "asenq-pkg-"));
   cpSync(join(repo, "dist", "src"), join(root, "dist", "src"), { recursive: true });
   cpSync(join(repo, "skills"), join(root, "skills"), { recursive: true });
+  if (existsSync(join(repo, "mods"))) cpSync(join(repo, "mods"), join(root, "mods"), { recursive: true });
   cpSync(join(repo, "package.json"), join(root, "package.json"));
   symlinkSync(join(repo, "node_modules"), join(root, "node_modules"), "dir");
   garbage.push(root);

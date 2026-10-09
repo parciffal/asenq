@@ -8,6 +8,7 @@ import { readConfig, writeConfig } from "../shared/config.js";
 import { configPath, dbPath } from "../shared/paths.js";
 import { QUEUE_TTL_MS } from "../shared/protocol.js";
 import { editJson, isObj, readJson, report, type Json } from "./jsonfile.js";
+import { installMod, removeMod, modsSourceDir } from "./mods.js";
 import { installSkills, removeSkills, SKILL_NAMES, skillsSourceDir } from "./skills.js";
 
 export const CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "PostToolUse", "UserPromptSubmit", "Stop"] as const;
@@ -224,6 +225,7 @@ async function remove(): Promise<number> {
   }
   removeFile(join(opencodeDir(), "plugins", "asenq.js"));
   removeFile(join(ompAgentDir(), "extensions", "asenq.js"));
+  if (existsSync(claudeDir())) removeMod(claudeDir());
   for (const { base, detected } of skillTargets()) if (detected) removeSkills(join(base, "skills"));
   await stopDaemon();
   removeFile(configPath());
@@ -253,8 +255,10 @@ export async function setup(argv: string[]): Promise<number> {
     report("+", `${configPath()}: runtime ${i.runtime}`);
   }
 
-  if (existsSync(claudeDir())) setupClaude(i);
-  else process.stdout.write("skip claude: not installed\n");
+  if (existsSync(claudeDir())) {
+    setupClaude(i);
+    installMod(claudeDir(), i.runtime, i.cli);
+  } else process.stdout.write("skip claude: not installed\n");
   if (existsSync(opencodeDir())) writeShim(join(opencodeDir(), "plugins", "asenq.js"), opencodeShim(i));
   else process.stdout.write("skip opencode: not installed\n");
   if (existsSync(ompAgentDir())) writeShim(join(ompAgentDir(), "extensions", "asenq.js"), ompShim(i));
