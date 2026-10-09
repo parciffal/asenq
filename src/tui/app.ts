@@ -3,7 +3,7 @@ import { AsenqClient, type ClientOpts } from "../shared/client.js";
 import { KINDS, MENTION_KEYWORDS, hasMentionOpening } from "../shared/protocol.js";
 import { isStaleSession } from "../shared/sessions.js";
 import type {
-  ChannelSummary, HistoryScope, InboxSummary, PingStatus, PositionedEvent, ReadScope, ReadState, ReplacementResult, SendResult,
+  ChannelSummary, HistoryScope, InboxSummary, ListedSession, PingStatus, PositionedEvent, ReadScope, ReadState, ReplacementResult, SendResult,
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
 import { renderMessageBody } from "../shared/render.js";
@@ -20,6 +20,10 @@ import {
 import { roundedPanel } from "./panel.js";
 import { hintSpans } from "./chrome.js";
 import { heldBar } from "./held.js";
+import { REQUEST_TIMEOUT_MS, TICK_MS, VizMap, within } from "../viz/map.js";
+import type { MapDue } from "../viz/map.js";
+import { scanProcesses } from "../viz/scan.js";
+import type { ProcInfo } from "../viz/scan.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -32,14 +36,20 @@ export interface Screen {
 export type ConsoleDeps = {
   client?(options: ClientOpts): AsenqClient;
   screen?(options: TerminalAdapterOptions): Screen;
+  /** Process detection for the Map tab; defaults to `ps`. */
+  scan?(): Promise<ProcInfo[]>;
+  /** Epoch ms for the Map tab's relative times; defaults to Date.now. */
+  now?(): number;
+  /** Repeating timer driving the Map tab's animation while it is shown; returns its canceller. Defaults to setInterval. */
+  schedule?(fn: () => void, ms: number): () => void;
 };
 
-const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"]] as const;
+const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"], ["map", "Map"]] as const;
 type Tab = typeof TABS[number][0];
 type Focus = "tabs" | "list" | "transcript" | "composer";
 
 const ACTION_GROUPS = [
-  ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
+  ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Map", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
   ["Sessions", ["Rename session", "Replace session", "Inbound policy", "Set role", "Ping sessions", "Close session", "Close all stale"]],
@@ -52,7 +62,7 @@ type Action = typeof ACTION_GROUPS[number][1][number];
 const ACTIONS: { group: string; label: Action }[] = ACTION_GROUPS.flatMap(([group, labels]) =>
   labels.map((label: Action) => ({ group, label })));
 const SHORTCUTS: Partial<Record<Action, string>> = {
-  Sessions: "s", Inbox: "i", Channels: "#", Activity: "a", "Quick jump": "Ctrl+K", "Search sessions": "/", "Toggle inbox feed": "v",
+  Sessions: "s", Inbox: "i", Channels: "#", Activity: "a", Map: "m", "Quick jump": "Ctrl+K", "Search sessions": "/", "Toggle inbox feed": "v",
   "Toggle activity filter": "f", "Compose / send": "c", "Full editor": "Ctrl+E", "Mark read": "End",
   "Close session": "Ctrl+X",
   "Mark latest unread": "u", Help: "?", Quit: "q",
@@ -61,7 +71,7 @@ const SHORTCUTS: Partial<Record<Action, string>> = {
 const HELP = [
   "asenq TUI",
   "",
-  "Tabs: s Sessions · i Inbox · # Channels · a Activity. Tab / Shift+Tab move focus between tabs, list, conversation and composer.",
+  "Tabs: s Sessions · i Inbox · # Channels · a Activity · m Map. Tab / Shift+Tab move focus between tabs, list, conversation and composer (on Map they select bugs instead, unless the tab bar has focus).",
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
   "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
   "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
@@ -70,6 +80,7 @@ const HELP = [
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
+  "Map: the live bug-map of sessions (same view as asenq viz). ←↑↓→ / h j k l / Tab select a bug · Enter focus its links · f harness filter · u feral processes · r rescan. It only polls while shown.",
   "? opens this action palette; type to filter. Esc dismisses errors, closes panels and returns to Sessions. q quits.",
   "CLI commands remain available in another terminal.",
 ];
@@ -138,6 +149,9 @@ const senderKey = (m: { fromSessionId?: string; from: string }): string =>
 const cleanInput = (text: string): string =>
   sanitizeTerminalText(text.replace(/\r\n?/g, "\n"), { multiline: true });
 
+/** Keys that still move the console's own focus when it rests on the tab bar, even on the Map tab. */
+const MAP_TAB_KEYS: Record<string, true> = { LEFT: true, RIGHT: true, UP: true, DOWN: true, ENTER: true, KP_ENTER: true, TAB: true, SHIFT_TAB: true };
+
 /** Exact and prefix matches precede case-insensitive ordered subsequences. */
 const jumpRank = (name: string, query: string): number => {
   const value = name.toLowerCase();
@@ -172,8 +186,8 @@ export class ConsoleApp {
   private activityFilter: ActivityFilter = "important";
   private tab: Tab = "sessions";
   private focus: Focus = "list";
-  private selection: Record<Tab, string | undefined> = { sessions: undefined, inbox: undefined, channels: undefined, activity: undefined };
-  private listTop: Record<Tab, number> = { sessions: 0, inbox: 0, channels: 0, activity: 0 };
+  private selection: Record<Tab, string | undefined> = { sessions: undefined, inbox: undefined, channels: undefined, activity: undefined, map: undefined };
+  private listTop: Record<Tab, number> = { sessions: 0, inbox: 0, channels: 0, activity: 0, map: 0 };
   private followActivity = true;
   private archiveOpen = false;
   private query = "";
@@ -205,6 +219,19 @@ export class ConsoleApp {
   /** Stream whose `u` reminder must survive until the user scrolls, presses End or reopens it. */
   private readHold?: string;
   private reading = false;
+  private readonly map: VizMap;
+  private readonly scan: () => Promise<ProcInfo[]>;
+  private readonly schedule: (fn: () => void, ms: number) => () => void;
+  private stopMapTicks?: () => void;
+  private mapLoading = false;
+  private mapAgain = false;
+  private mapScanning = false;
+  private scanAgain = false;
+  /** Bumped whenever the Map stops being active; fetches started before are discarded when they settle. */
+  private mapGen = 0;
+  /** Screen row and height of the map region, for translating clicks; height is 0 while it is not drawn. */
+  private mapTop = 0;
+  private mapHeight = 0;
   private resolve?: (code: number) => void;
 
   constructor(deps: ConsoleDeps = {}) {
@@ -226,6 +253,12 @@ export class ConsoleApp {
       onInterrupt: () => this.quit(),
     };
     this.screen = deps.screen ? deps.screen(screenOptions) : new TerminalAdapter(screenOptions);
+    this.scan = deps.scan ?? (() => scanProcesses());
+    this.map = new VizMap(deps.now, true);
+    this.schedule = deps.schedule ?? ((fn, ms) => {
+      const timer = setInterval(fn, ms);
+      return () => clearInterval(timer);
+    });
   }
 
   async run(): Promise<number> {
@@ -256,6 +289,7 @@ export class ConsoleApp {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.noticeTimer);
+    this.stopMapTicks?.();
     this.client.close();
     this.screen.cleanup();
     this.resolve?.(code);
@@ -371,6 +405,10 @@ export class ConsoleApp {
       this.activity = events;
       if (previous) this.watermark = previous; // replay missed events before trusting the new watermark
       this.connection = "connected";
+      if (this.mapActive()) {
+        this.map.refresh();
+        this.fetchMap(this.map.take());
+      }
       if (this.notice?.kind === "error" && this.notice.text.startsWith("Disconnected")) this.notice = undefined;
       this.ensureSelection();
       const scope = this.scope();
@@ -453,6 +491,7 @@ export class ConsoleApp {
     }
     const e = item.event;
     if (e.type === "message") {
+      this.map.onMessage(e.msg, this.mapActive());
       if (e.failedCount !== undefined) this.failedCount = e.failedCount;
       if (e.status === "held" || this.heldMessages.has(e.msg.id)) this.heldDirty = true;
       const m: StoredMessage = { ...e.msg, status: e.status, ...(e.reason ? { reason: e.reason } : {}) };
@@ -532,6 +571,7 @@ export class ConsoleApp {
     } else if (e.type === "retention") {
       this.resync = true;
     }
+    if (this.mapActive() && (e.type === "session" || e.type === "channel" || e.type === "ping")) this.track(this.refreshMap());
     if (this.tab === "activity" && this.followActivity) this.selection.activity = undefined;
   }
 
@@ -585,6 +625,7 @@ export class ConsoleApp {
   }
 
   private entries(tab: Tab): Entry[] {
+    if (tab === "map") return [];
     const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.dim }]] });
     const pick = (selected: boolean) => selected ? theme.selected : undefined;
     if (tab === "sessions") {
@@ -1093,6 +1134,8 @@ export class ConsoleApp {
     }
     const { columns: width, rows: height } = this.screen.size;
     this.hits = [];
+    this.mapHeight = 0;
+    this.syncMap();
     this.shown = undefined;
     this.shownHeldId = undefined;
     const top = height >= 4 ? 1 : 0;
@@ -1110,6 +1153,111 @@ export class ConsoleApp {
     if (shown && engaged && this.readStates.get(shown.key)?.unread && !this.reading && this.readHold !== shown.key) {
       this.track(this.readIfReached());
     }
+  }
+
+  // ------------------------------------------------------------------ map tab
+
+  /** True while the Map is on screen and owns keys and clicks: it is the shown tab and no overlay covers it. */
+  private mapActive(): boolean {
+    return this.tab === "map" && !this.confirmation && !this.finder && !this.palette && !this.form && !this.searching && !this.panel;
+  }
+
+  /**
+   * Starts the animation timer and fetching when the Map becomes active and stops the timer when it stops being
+   * (another tab or an overlay). Results of fetches begun before a stop are discarded. Idempotent.
+   */
+  private syncMap(): void {
+    const active = this.mapActive();
+    if (active === (this.stopMapTicks !== undefined)) return;
+    if (!active) {
+      this.stopMapTicks?.();
+      this.stopMapTicks = undefined;
+      this.mapGen++;
+      this.map.clearPackets();
+      return;
+    }
+    this.stopMapTicks = this.schedule(() => this.stepMap(), TICK_MS);
+    this.map.refresh();
+    this.fetchMap(this.map.take());
+  }
+
+  private stepMap(): void {
+    if (this.closed || !this.mapActive()) return;
+    this.fetchMap(this.map.step(TICK_MS));
+    this.render();
+  }
+
+  private fetchMap(due: MapDue): void {
+    if (due.list) this.track(this.refreshMap());
+    if (due.scan) this.track(this.rescanMap());
+  }
+
+  /** Lists sessions for the map; a request during a refresh schedules exactly one more pass. Failure shows SIGNAL LOST until the next poll. */
+  private async refreshMap(): Promise<void> {
+    if (this.closed || !this.mapActive()) return;
+    if (this.mapLoading) {
+      this.mapAgain = true;
+      return;
+    }
+    this.mapLoading = true;
+    try {
+      do {
+        this.mapAgain = false;
+        const gen = this.mapGen;
+        let sessions: ListedSession[] = [];
+        let connection: "connected" | "offline" = "offline";
+        try {
+          sessions = (await within(this.client.request("list"), REQUEST_TIMEOUT_MS)).sessions as ListedSession[];
+          connection = "connected";
+        } catch {
+          // the map shows SIGNAL LOST until a later poll succeeds
+        }
+        if (this.closed) return;
+        if (gen === this.mapGen) {
+          this.map.setSessions(sessions, connection);
+          this.render();
+        }
+      } while (this.mapAgain && this.mapActive());
+    } finally {
+      this.mapLoading = false;
+    }
+  }
+
+  /** Scans processes for the map; a request during a scan schedules exactly one more pass, none is dropped. */
+  private async rescanMap(): Promise<void> {
+    if (this.closed || !this.mapActive()) return;
+    if (this.mapScanning) {
+      this.scanAgain = true;
+      return;
+    }
+    this.mapScanning = true;
+    try {
+      do {
+        this.scanAgain = false;
+        const gen = this.mapGen;
+        let procs: ProcInfo[] | undefined;
+        try {
+          procs = await this.scan();
+        } catch {
+          // keep the previous scan
+        }
+        if (this.closed) return;
+        if (procs && gen === this.mapGen) {
+          this.map.setProcs(procs);
+          this.render();
+        }
+      } while (this.scanAgain && this.mapActive());
+    } finally {
+      this.mapScanning = false;
+    }
+  }
+
+  /** The scene fills the body exactly; its key hints and view flags are shown by the console footer. */
+  private mapPane(width: number, height: number, y0: number): Pane {
+    this.mapTop = y0;
+    this.mapHeight = height;
+    const lines = this.map.frame({ columns: width, rows: height }).slice(0, height);
+    return { rows: [...lines, ...Array<TerminalLine>(height - lines.length).fill("")] };
   }
 
   private tabBar(width: number): TerminalLine {
@@ -1184,7 +1332,7 @@ export class ConsoleApp {
         return [...left, { text: " ".repeat(gap) }, ...right];
       }
     }
-    // Below five cells there is no room for four mouse tabs plus the state symbol.
+    // Below six cells there is no room for five mouse tabs plus the state symbol.
     // Keyboard tab shortcuts and the palette remain available; show only the active target.
     if (width <= 1) return clipSpans([{ ...connection, text: connection.text.slice(0, 1) }], width);
     this.hits.push({ row: 0, start: 0, end: 1, target: { kind: "tab", tab: this.tab } });
@@ -1210,18 +1358,28 @@ export class ConsoleApp {
         ? this.session(this.selection.sessions.slice(2))?.state === "removed"
           ? "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? purge"
           : "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? menu"
+      : this.tab === "map" ? "←↑↓→/Tab select · Enter focus · f filter · u feral · r rescan · s sessions · ? menu"
       : "↑↓ move · Enter open · Tab focus · Ctrl+K jump · ? menu";
     if (this.shownHeldId && !this.confirmation && !this.finder && !this.palette && !this.form && !this.searching && this.focus !== "composer") {
       hints += " · r release · x drop";
     }
     const notice = this.notice;
-    if (!notice) return padSpans(hintSpans(hints, width), width);
+    const flags = this.mapActive() ? this.map.flags : "";
+    if (!notice) {
+      return flags
+        ? justify(hintSpans(hints, Math.max(0, width - flags.length - 1)), [{ text: flags, style: theme.warn }], width)
+        : padSpans(hintSpans(hints, width), width);
+    }
     const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
     const left: TerminalSpan[] = [
       { text: notice.kind === "error" ? "✖ " : notice.kind === "new" ? "● " : "· ", style },
       { text: notice.text, style },
     ];
-    const right = hintSpans(notice.kind === "error" ? `Esc dismiss · ${hints}` : hints, Math.floor(width / 2));
+    const half = Math.floor(width / 2);
+    const hintText = notice.kind === "error" ? `Esc dismiss · ${hints}` : hints;
+    const right = flags
+      ? [...hintSpans(hintText, Math.max(0, half - flags.length - 2)), { text: "  " }, { text: flags, style: theme.warn }]
+      : hintSpans(hintText, half);
     return justify(left, right, width);
   }
 
@@ -1231,6 +1389,7 @@ export class ConsoleApp {
     if (this.finder) return this.finderPane(width, height, y0);
     if (this.palette) return this.palettePane(width, height, y0);
     if (this.form) return this.formPane(width, height, y0);
+    if (this.tab === "map") return this.mapPane(width, height, y0);
     if (this.tab === "activity") return this.listPane(width, height, y0, 0);
     const panes = paneWidths(width);
     if (!panes) {
@@ -1926,6 +2085,10 @@ export class ConsoleApp {
     if (this.form) return this.formKey(k);
     if (this.searching) return this.searchKey(k);
     if (this.focus === "composer") return this.composerKey(k);
+    if (this.mapActive() && !(this.focus === "tabs" && MAP_TAB_KEYS[k.name]) && this.map.key(k)) {
+      this.fetchMap(this.map.take());
+      return this.render();
+    }
     if (this.shownHeldId && (k.text === "r" || k.text === "x")) {
       return this.heldAction(k.text === "r" ? "release" : "drop");
     }
@@ -1954,6 +2117,7 @@ export class ConsoleApp {
       case "i": return this.setTab("inbox");
       case "#": return this.setTab("channels");
       case "a": return this.setTab("activity");
+      case "m": return this.setTab("map");
       case "c": this.focusComposer(); return this.render();
       case "u": return this.markUnread();
       case "v": return this.action("Toggle inbox feed");
@@ -2130,6 +2294,11 @@ export class ConsoleApp {
         this.scrollTranscript(delta);
       }
       return this.render();
+    }
+    if (m.action === "press" && m.button === "left" && !hit && this.mapActive()) {
+      const row = m.row - this.mapTop;
+      if (row >= 0 && row < this.mapHeight && this.map.click(m.column, row)) this.render();
+      return;
     }
     if (m.action !== "press" || m.button !== "left" || !hit) return;
     const target = hit.target;
@@ -2331,7 +2500,7 @@ export class ConsoleApp {
 
   private showPanel(title: string, content: { lines?: string[]; messages?: StoredMessage[] }): void {
     this.panel = { title, ...content, top: 0, height: 1, rows: 0 };
-    if (this.tab === "activity") this.tab = "sessions";
+    if (this.tab === "activity" || this.tab === "map") this.tab = "sessions";
     this.focus = "transcript";
   }
 
@@ -2352,6 +2521,7 @@ export class ConsoleApp {
         case "Inbox": return this.setTab("inbox");
         case "Channels": return this.setTab("channels");
         case "Activity": return this.setTab("activity");
+        case "Map": return this.setTab("map");
         case "Quick jump": return this.openFinder();
         case "Search sessions":
           await this.setTab("sessions");

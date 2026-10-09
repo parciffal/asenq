@@ -250,6 +250,7 @@ asenq channel remove <ch> --session-id <session-id>
 asenq channel members <ch>
 asenq channel read <ch> [--limit n] | asenq channel send <ch> <text…>
 asenq tui
+asenq viz
 asenq daemon run|start|stop|status
 asenq setup [--remove]
 asenq doctor
@@ -258,11 +259,11 @@ asenq --version
 
 ## TUI (keys and palette)
 
-`asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues.
+`asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues. The fifth tab, **Map**, is the live [bug-map](#asenq-viz-live-bug-map) inside the console (see below).
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Focus tabs → list → conversation → composer. |
+| `Tab` / `Shift+Tab` | Focus tabs → list → conversation → composer (on **Map**: select the next / previous bug). |
 | `↑` / `↓`, `Enter` | Move/open list items; select messages and open details. |
 | `/`, `Ctrl+K` | Search current/former names; quick-jump to sessions, archives or `#channel`. |
 | `PageUp` / `PageDown`, `Home`, `End` | Scroll; top loads older history; End jumps to latest. |
@@ -270,8 +271,8 @@ asenq --version
 | `Ctrl+E` | Full editor: kind, thread, reply-to, done. |
 | `u` | Set an **unread reminder** on the latest eligible item. |
 | `Ctrl+X` | Close selected Sessions list row after y/n confirmation; not a composer binding. |
-| `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity. |
-| `v`, `f` | Inbox grouped/feed toggle; Activity read-marker event filter. |
+| `s`, `i`, `#`, `a`, `m` | Sessions, Inbox, Channels, Activity, Map. |
+| `v`, `f` | Inbox grouped/feed toggle; Activity read-marker event filter (on **Map**, `f` filters by harness). |
 | `?` | Searchable action palette. |
 | `Esc`, `q` | Dismiss/back/quit. |
 
@@ -280,6 +281,33 @@ The palette covers broadcast, held-message review/release/drop, rename, replacem
 **Human read markers** are shared across consoles and survive restart. Unread counts cover direct messages to `human` by sending identity plus non-human channel posts, never session-to-session traffic. A conversation marks read when the last row of its newest incoming message is visible; plain CLI inbox/channel reads do not. The header's failed count covers all retained failed/expired direct messages. Bodies wrap without truncation; **End ↓ latest** sits outside readable rows. [Display and confirmation details](docs/how-delivery-works.md#console-display-and-reading).
 
 Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste never confirm. Close/purge submit only previewed identity IDs. Select Archive for **Purge all archives**, or an archived conversation for **Purge conversation**. Replacement picks a non-closed source and different live destination, checks eligibility again on confirmation, and shows skipped names in full. History, drafts and reading positions stay separate; other consoles reconcile moved messages and archived ordering.
+
+### `asenq viz`: live bug-map
+
+`asenq viz` is a full-screen, read-only, animated cyberpunk view of everything running: the human is a yellow **netrunner** node, each orchestrator a large hive-queen bug, each worker a small bug. Links run human → orchestrators and orchestrator → workers (shared channel; a worker with no orchestrator hangs off the human), and direct messages travel along them as packets coloured by kind (task yellow, result green, status cyan, chat white, control red). A feed panel lists recent messages and a TARGET panel shows the selected bug. Needs a TTY; it never sends anything.
+
+The same view is the **Map** tab of `asenq tui` (`m`, or click the tab): it sits under the console's tab bar and above its footer, which carries the key hints and the active `FILTER:…`, `FOCUS` and `FERAL OFF` flags. It needs a region of at least 60×19 (a 60×21 terminal), otherwise it shows a too-small notice. On the Map tab the keys below apply (arrows, `h j k l`, `Tab`, `Enter`, `f`, `u`, `r` and a click on a bug) while no palette, form, finder or confirmation is open; `s i # a m`, `?`, `Ctrl+K`, `q` and `Esc` keep their console meaning (`Esc` returns to Sessions). With the tab bar focused, `←`/`→` still switch tabs. The Map tab only lists sessions, scans processes and animates while it is the shown, uncovered tab, never reads, marks or composes anything, and shows **SIGNAL LOST** while the daemon is unreachable. `asenq viz` is the standalone full-screen form of the same view.
+
+| Key | Action |
+|---|---|
+| `↑ ↓ ← →`, `h j k l` | Select the nearest bug in that direction. |
+| `Tab` / `Shift+Tab` | Next / previous bug. Mouse click also selects. |
+| `Enter` | Focus: dim everything but the selected bug and its links. |
+| `f` | Filter by harness: all → claude → omp → opencode → codex → all. |
+| `u` | Show / hide feral bugs. |
+| `r` | Rescan processes and refresh now. |
+| `q`, `Esc`, `Ctrl+C` | Quit (standalone `asenq viz` only; in the Map tab they keep their console meaning). |
+
+| Species | Harness | Colour |
+|---|---|---|
+| Scarab beetle | Claude Code | orange |
+| Spider | omp | cyan |
+| Mantis | OpenCode | acid green |
+| Moth | Codex | magenta |
+
+Working bugs scuttle and spark with a bright link, idle ones breathe, **lost** ones (stale or not answering pings) glitch with a `?`, and **dead** (gone) ones flatline grey; gone sessions disappear 30 minutes after last contact. Sessions with no role set are drawn like workers but labelled **UNASSIGNED** and counted as `UNSET`, never as workers.
+
+**Limits.** Codex has no asenq adapter, so it only appears as a **feral** bug found by scanning `ps` (macOS/Linux, processes with a controlling TTY; nothing on Windows). Feral detection is a heuristic: processes are matched to registered sessions by harness session id in their command line, and per harness any surplus of processes over live registered sessions (newest first) is drawn as feral, named `<harness>-<pid>`, working when CPU is at least 5%. A new agent can look feral until it registers (OpenCode only registers after its first prompt), and a helper process the classifier cannot tell apart may show as a bug. Feral bugs have no links or messages. Packets are drawn only for direct messages between two known bugs; channel posts appear in the feed only. If the daemon is unreachable the screen shows `SIGNAL LOST` and keeps retrying.
 
 ## Upgrading
 

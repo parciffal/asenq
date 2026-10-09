@@ -200,7 +200,7 @@ Other open consoles reconcile moved-message ownership and refresh archived-conve
 
 ## Console display and reading
 
-Full-screen view of live and archived session conversations (messages involving that session, not only messages to you). Four tabs — **Sessions**, **Inbox**, **Channels**, **Activity** — share one layout: list beside conversation at ≥80 columns, or a picker on narrower terminals.
+Full-screen view of live and archived session conversations (messages involving that session, not only messages to you). Four tabs — **Sessions**, **Inbox**, **Channels**, **Activity** — share one layout: list beside conversation at ≥80 columns, or a picker on narrower terminals. A fifth tab, **Map** (`m`), shows the live `asenq viz` bug-map instead; it has no conversation, composer or read marker, and only polls while shown.
 
 Sessions groups **LIVE** (`●`), **RECONNECTING** (`◌`) and a collapsed **▸ archive N**, sorted by recent direct-message activity. Rows show `cc` / `oc` / `omp` harness labels, role tags and `⏸` for a non-accepting inbound policy. Failed probes show a warning dot and a separate `not_responding` detail row without displacing other metadata; clicking that row still selects the same identity. The selected identity keeps its cyan `▌` marker and name highlight while you read or write. Renaming keeps a conversation; reusing a removed name starts another. Channels show the same identity cues in their member lists.
 

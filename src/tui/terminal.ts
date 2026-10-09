@@ -1,7 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 import terminalKit from "terminal-kit";
 
-export type TerminalColor =
+export type NamedColor =
   | "black"
   | "red"
   | "green"
@@ -18,6 +18,9 @@ export type TerminalColor =
   | "brightMagenta"
   | "brightCyan"
   | "brightWhite";
+
+/** A named 16-color or a `#rrggbb` color; hex degrades to the terminal's color depth. */
+export type TerminalColor = NamedColor | `#${string}`;
 
 export interface TerminalStyle {
   foreground?: TerminalColor;
@@ -241,23 +244,58 @@ export function terminalSupportsColor(): boolean {
   return typeof stdout.getColorDepth === "function" && stdout.getColorDepth() >= 4;
 }
 
-const SGR_COLORS: Record<TerminalColor, number> = {
+const SGR_COLORS: Record<NamedColor, number> = {
   black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35, cyan: 36, white: 37,
   brightBlack: 90, brightRed: 91, brightGreen: 92, brightYellow: 93,
   brightBlue: 94, brightMagenta: 95, brightCyan: 96, brightWhite: 97,
 };
+const HEX_COLOR = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i;
+/** RGB of the 16 named colors (xterm defaults), used to quantize hex colors on 16-color terminals. */
+const NAMED_RGB: readonly [number, number, number][] = [
+  [0, 0, 0], [205, 0, 0], [0, 205, 0], [205, 205, 0], [0, 0, 238], [205, 0, 205], [0, 205, 205], [229, 229, 229],
+  [127, 127, 127], [255, 0, 0], [0, 255, 0], [255, 255, 0], [92, 92, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255],
+];
+
+/** Terminal color depth in bits (4, 8 or 24); unknown output is treated as 16 colors. */
+function colorDepth(): number {
+  const stdout = process.stdout as NodeJS.WriteStream;
+  return typeof stdout.getColorDepth === "function" ? stdout.getColorDepth() : 4;
+}
+
+/** SGR parameters for one color; hex colors degrade to 256-color or 16-color codes by terminal depth. */
+function colorCodes(color: TerminalColor, background: boolean): string {
+  const named = (SGR_COLORS as Record<string, number | undefined>)[color];
+  if (named !== undefined) return String(named + (background ? 10 : 0));
+  const match = HEX_COLOR.exec(color);
+  if (!match) return "";
+  const [r, g, b] = [match[1], match[2], match[3]].map((part) => parseInt(part, 16));
+  const depth = colorDepth();
+  if (depth >= 24) return `${background ? 48 : 38};2;${r};${g};${b}`;
+  if (depth >= 8) {
+    const cube = (v: number): number => Math.round(v / 255 * 5);
+    return `${background ? 48 : 38};5;${16 + 36 * cube(r) + 6 * cube(g) + cube(b)}`;
+  }
+  let best = 0;
+  let bestDistance = Infinity;
+  NAMED_RGB.forEach(([nr, ng, nb], index) => {
+    const distance = (nr - r) ** 2 + (ng - g) ** 2 + (nb - b) ** 2;
+    if (distance < bestDistance) { best = index; bestDistance = distance; }
+  });
+  return String((best < 8 ? 30 + best : 82 + best) + (background ? 10 : 0));
+}
 
 function sgr(style: TerminalStyle | undefined): string {
   if (!style) return "";
-  const codes: number[] = [];
-  if (style.bold) codes.push(1);
-  if (style.dim) codes.push(2);
-  if (style.italic) codes.push(3);
-  if (style.underline) codes.push(4);
-  if (style.inverse) codes.push(7);
-  if (style.foreground) codes.push(SGR_COLORS[style.foreground]);
-  if (style.background) codes.push(SGR_COLORS[style.background] + 10);
-  return codes.length ? `\u001b[${codes.join(";")}m` : "";
+  const codes: string[] = [];
+  if (style.bold) codes.push("1");
+  if (style.dim) codes.push("2");
+  if (style.italic) codes.push("3");
+  if (style.underline) codes.push("4");
+  if (style.inverse) codes.push("7");
+  if (style.foreground) codes.push(colorCodes(style.foreground, false));
+  if (style.background) codes.push(colorCodes(style.background, true));
+  const joined = codes.filter(Boolean).join(";");
+  return joined ? `\u001b[${joined}m` : "";
 }
 
 /** Sanitized spans clipped to `columns` cells; colors are dropped when `color` is false. */
