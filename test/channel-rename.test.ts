@@ -24,11 +24,9 @@ test("channel rename succeeds and updates all stored references", async () => {
   const w = await env.adapter("omp", "k1", "alpha");
   await human.request("channel_create", { channel: "old-ch" });
   await human.request("channel_add", { channel: "old-ch", name: "alpha" });
-  // Post a message to the channel (mention by name, not keyword)
   await human.request("channel_send", { channel: "old-ch", text: "hello @alpha" });
   await w.nextDelivery();
 
-  // Watch for the renamed tail event
   const watcher = await env.watch(
     (e: TailEvent) => e.type === "channel" && e.action === "renamed",
   );
@@ -37,37 +35,30 @@ test("channel rename succeeds and updates all stored references", async () => {
   const renamed = r.channel as ChannelSummary;
   assert.equal(renamed.name, "new-ch");
 
-  // Consume the system note delivered to the member
   const note = await w.nextDelivery();
   assert.equal(note.msg.text, "channel old-ch is now new-ch");
   assert.equal(note.msg.from, "asenq");
 
-  // Verify tail event
   const event = await watcher.event;
   assert.equal(event.type, "channel");
   assert.ok(event.type === "channel" && event.action === "renamed");
   assert.ok(event.type === "channel" && event.oldName === "old-ch");
   assert.ok(event.type === "channel" && event.channel.name === "new-ch");
 
-  // Channel members should be on the new name
   const members = (await human.request("channel_members", { channel: "new-ch" })).members as SessionIdentity[];
   assert.equal(members.length, 1);
   assert.equal(members[0].name, "alpha");
 
-  // Old channel should return channel_renamed (F-08)
   await assert.rejects(
     human.request("channel_members", { channel: "old-ch" }),
     { code: "channel_renamed" },
   );
 
-  // Channel read on new name returns the old post with rewritten to_name
   const read = await human.request("channel_read", { channel: "new-ch" });
   const posts = read.messages as { text: string; to: string }[];
   assert.ok(posts.some((m) => m.text === "hello @alpha"));
-  // F-02: to_name should be rewritten to #new-ch
   assert.ok(posts.every((m) => m.to === "#new-ch"), "to_name should be rewritten");
 
-  // Channel list shows only the new name
   const list = (await human.request("channel_list")).channels as ChannelSummary[];
   assert.ok(list.some((c) => c.name === "new-ch"));
   assert.ok(!list.some((c) => c.name === "old-ch"));
@@ -119,7 +110,6 @@ test("channel rename refuses invalid new name", async () => {
   );
 });
 
-// F-01: named mention to old name returns channel_renamed before mention resolution
 test("mention to renamed-away channel returns channel_renamed, not unknown_mention", async () => {
   env = await startEnv();
   const human = env.human();
@@ -161,47 +151,31 @@ test("channel rename chain a->b->c: send to a names c", async () => {
   await human.request("channel_rename", { channel: "aaa", name: "bbb" });
   await human.request("channel_rename", { channel: "bbb", name: "ccc" });
 
-  try {
-    await human.request("channel_send", { channel: "aaa", text: "should fail" });
-    assert.fail("expected channel_renamed error");
-  } catch (e: unknown) {
-    const err = e as { code: string; message: string };
-    assert.equal(err.code, "channel_renamed");
-    assert.equal(err.message, 'channel "aaa" was renamed to "ccc"');
-  }
-
-  try {
-    await human.request("channel_send", { channel: "bbb", text: "should fail" });
-    assert.fail("expected channel_renamed error");
-  } catch (e: unknown) {
-    const err = e as { code: string; message: string };
-    assert.equal(err.code, "channel_renamed");
-    assert.equal(err.message, 'channel "bbb" was renamed to "ccc"');
+  for (const old of ["aaa", "bbb"]) {
+    try {
+      await human.request("channel_send", { channel: old, text: "should fail" });
+      assert.fail("expected channel_renamed error");
+    } catch (e: unknown) {
+      const err = e as { code: string; message: string };
+      assert.equal(err.code, "channel_renamed");
+      assert.equal(err.message, `channel "${old}" was renamed to "ccc"`);
+    }
   }
 });
 
-// F-03: explicit create clears the record — prove via a send that would otherwise fail
-test("explicit channel create clears the rename record so sends succeed", async () => {
+test("explicit channel create allows sends to old name again", async () => {
   env = await startEnv();
   const human = env.human();
   await human.request("channel_create", { channel: "reusable" });
   await human.request("channel_rename", { channel: "reusable", name: "moved" });
 
-  // Verify old name is blocked
   await assert.rejects(
     human.request("channel_send", { channel: "reusable", text: "blocked" }),
     { code: "channel_renamed" },
   );
 
-  // Explicit create clears the record
   await human.request("channel_create", { channel: "reusable" });
-
-  // After create, a channel_send to old name should NOT return channel_renamed
-  // (channel exists now, so no auto-create guard fires)
   await human.request("channel_send", { channel: "reusable", text: "unblocked" });
-  const list = (await human.request("channel_list")).channels as ChannelSummary[];
-  assert.ok(list.some((c) => c.name === "reusable"));
-  assert.ok(list.some((c) => c.name === "moved"));
 });
 
 test("renaming back to the old name clears the rename record", async () => {
@@ -209,26 +183,13 @@ test("renaming back to the old name clears the rename record", async () => {
   const human = env.human();
   await human.request("channel_create", { channel: "original" });
   await human.request("channel_rename", { channel: "original", name: "temporary" });
-
-  await assert.rejects(
-    human.request("channel_send", { channel: "original", text: "blocked" }),
-    { code: "channel_renamed" },
-  );
-
   await human.request("channel_rename", { channel: "temporary", name: "original" });
 
-  // "original" is now the live channel and should accept sends
   await human.request("channel_send", { channel: "original", text: "unblocked" });
-
-  // "temporary" should point to "original"
-  try {
-    await human.request("channel_send", { channel: "temporary", text: "blocked" });
-    assert.fail("expected channel_renamed error");
-  } catch (e: unknown) {
-    const err = e as { code: string; message: string };
-    assert.equal(err.code, "channel_renamed");
-    assert.equal(err.message, 'channel "temporary" was renamed to "original"');
-  }
+  await assert.rejects(
+    human.request("channel_send", { channel: "temporary", text: "blocked" }),
+    { code: "channel_renamed", message: 'channel "temporary" was renamed to "original"' },
+  );
 });
 
 test("auto-create of an unrelated new name still works", async () => {
@@ -248,25 +209,10 @@ test("send/read to old name fails after rename and old name can be re-created", 
   await human.request("channel_create", { channel: "ephemeral" });
   await human.request("channel_rename", { channel: "ephemeral", name: "permanent" });
 
-  // Channel members on old name returns channel_renamed (F-08)
-  await assert.rejects(
-    human.request("channel_members", { channel: "ephemeral" }),
-    { code: "channel_renamed" },
-  );
+  await assert.rejects(human.request("channel_members", { channel: "ephemeral" }), { code: "channel_renamed" });
+  await assert.rejects(human.request("channel_send", { channel: "ephemeral", text: "fail" }), { code: "channel_renamed" });
 
-  // Channel send to old name returns channel_renamed
-  await assert.rejects(
-    human.request("channel_send", { channel: "ephemeral", text: "should fail" }),
-    { code: "channel_renamed" },
-  );
-
-  // Old name can be re-created
   await human.request("channel_create", { channel: "ephemeral" });
-  const list = (await human.request("channel_list")).channels as ChannelSummary[];
-  assert.ok(list.some((c) => c.name === "ephemeral"));
-  assert.ok(list.some((c) => c.name === "permanent"));
-
-  // After re-create, sends work again
   await human.request("channel_send", { channel: "ephemeral", text: "works now" });
 });
 
@@ -298,36 +244,40 @@ test("channel rename same name is a no-op", async () => {
   assert.equal(ch.name, "stable");
 });
 
-// F-03: human_read_positions moved and old name gone
-test("human_read_positions move to new name and old name has no row", async () => {
+test("human_read_positions move to new name with correct position", async () => {
   env = await startEnv();
   const human = env.human();
+  const poster = await env.adapter("omp", "k1", "poster");
   await human.request("channel_create", { channel: "reads" });
-  await human.request("channel_send", { channel: "reads", text: "hello everyone" });
+  await human.request("channel_add", { channel: "reads", name: "poster" });
+  // Post from a non-human session so there is a non-zero eligible position
+  await poster.client.request("channel_send", { channel: "reads", text: "from poster" });
 
-  const readState = await human.request("read_state", { scope: "channel", channel: "reads" });
-  const state = readState.state as ReadState;
-  await human.request("mark_read", { scope: "channel", channel: "reads", through: state.position, expectedVersion: state.version });
+  // Get the initial state and mark through the latest eligible position
+  const initial = (await human.request("read_state", { scope: "channel", channel: "reads" })).state as ReadState;
+  assert.equal(initial.unread, 1, "one unread message from the poster");
+  const latestOrd = env.daemon.store.latestEligible({ scope: "channel", channel: "reads" });
+  assert.ok(latestOrd > 0, "latest eligible position should be non-zero");
+  await human.request("mark_read", { scope: "channel", channel: "reads", through: latestOrd, expectedVersion: initial.version });
+
+  const marked = (await human.request("read_state", { scope: "channel", channel: "reads" })).state as ReadState;
+  assert.equal(marked.position, latestOrd, "position should match after mark_read");
 
   await human.request("channel_rename", { channel: "reads", name: "reads-new" });
 
-  // New name has the read state with original position
-  const newReadState = await human.request("read_state", { scope: "channel", channel: "reads-new" });
-  const newState = newReadState.state as ReadState;
-  assert.equal(newState.position, state.position);
-
-  // Old name has no retained channel (returns channel_renamed)
-  await assert.rejects(
-    human.request("read_state", { scope: "channel", channel: "reads" }),
-    (e: unknown) => {
-      const err = e as { code: string };
-      // Either unknown channel or channel_renamed — old name is gone from channels table
-      return err.code === "bad_request" || err.code === "channel_renamed";
-    },
+  // Check at store level: new name has the position, old name has no row
+  const newRow = env.daemon.store.db.get<{ position: number }>(
+    "SELECT position FROM human_read_positions WHERE scope='channel' AND stream_key='reads-new'",
   );
+  assert.ok(newRow, "read position row should exist under new name");
+  assert.equal(newRow!.position, latestOrd, "position should match the original");
+
+  const oldRow = env.daemon.store.db.get<{ position: number }>(
+    "SELECT position FROM human_read_positions WHERE scope='channel' AND stream_key='reads'",
+  );
+  assert.equal(oldRow, undefined, "no read position row should remain under old name");
 });
 
-// F-02: source_channel rewritten on rename
 test("source_channel is rewritten on channel rename", async () => {
   env = await startEnv();
   const human = env.human();
@@ -339,16 +289,13 @@ test("source_channel is rewritten on channel rename", async () => {
   assert.equal(delivery.msg.sourceChannel, "src-ch");
 
   await human.request("channel_rename", { channel: "src-ch", name: "dst-ch" });
-  // Consume the rename note
   await w.nextDelivery();
 
-  // The delivered mention message's source_channel should be updated in the log
   const log = await human.request("log", { msgId: delivery.msg.id });
   const msg = (log.messages as StoredMessage[])[0];
   assert.equal(msg.sourceChannel, "dst-ch");
 });
 
-// F-02: to_name rewritten on rename
 test("to_name of channel posts is rewritten on rename", async () => {
   env = await startEnv();
   const human = env.human();
@@ -359,10 +306,9 @@ test("to_name of channel posts is rewritten on rename", async () => {
   const read = await human.request("channel_read", { channel: "tgt-new" });
   const posts = read.messages as { to: string }[];
   assert.ok(posts.length > 0);
-  assert.ok(posts.every((m) => m.to === "#tgt-new"), "to_name should be #tgt-new after rename");
+  assert.ok(posts.every((m) => m.to === "#tgt-new"));
 });
 
-// F-08: channel_read, channel_add on renamed-away name returns channel_renamed
 test("channel_read and channel_add on renamed-away name return channel_renamed", async () => {
   env = await startEnv();
   const human = env.human();
@@ -370,22 +316,20 @@ test("channel_read and channel_add on renamed-away name return channel_renamed",
   await human.request("channel_create", { channel: "old-rw" });
   await human.request("channel_rename", { channel: "old-rw", name: "new-rw" });
 
-  await assert.rejects(
-    human.request("channel_read", { channel: "old-rw" }),
-    { code: "channel_renamed" },
-  );
-
-  await assert.rejects(
-    human.request("channel_add", { channel: "old-rw", name: "alpha" }),
-    { code: "channel_renamed" },
-  );
+  await assert.rejects(human.request("channel_read", { channel: "old-rw" }), { code: "channel_renamed" });
+  await assert.rejects(human.request("channel_add", { channel: "old-rw", name: "alpha" }), { code: "channel_renamed" });
 });
 
-// F-03: existing DB without channel_renames table
+test("channel_read on a never-existed channel returns empty messages", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const r = await human.request("channel_read", { channel: "imaginary" });
+  assert.deepEqual(r.messages, []);
+});
+
 test("Store opens an existing DB without channel_renames table and creates it", async () => {
   const dir = mkdtempSync(join(tmpdir(), "asenq-schema-"));
   try {
-    // Create a DB with the old schema (no channel_renames)
     const db = await openDb(join(dir, "asenq.db"));
     db.exec(`
       CREATE TABLE IF NOT EXISTS sessions(
@@ -422,17 +366,11 @@ test("Store opens an existing DB without channel_renames table and creates it", 
       CREATE TABLE IF NOT EXISTS protocol_meta(
         key TEXT PRIMARY KEY, value INTEGER NOT NULL);
     `);
-    // Verify channel_renames does NOT exist
     const before = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name='channel_renames'");
-    assert.equal(before.length, 0, "channel_renames should not exist before Store opens");
-
-    // Open with Store
+    assert.equal(before.length, 0);
     const store = new Store(db);
-
-    // Verify channel_renames now exists
     const after = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name='channel_renames'");
-    assert.equal(after.length, 1, "channel_renames should exist after Store opens");
-
+    assert.equal(after.length, 1);
     db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

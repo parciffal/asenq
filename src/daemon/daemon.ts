@@ -542,7 +542,8 @@ export class Daemon {
         return this.opChannelSend(this.sender(c, p), p);
       case "channel_read": {
         const channel = str(p, "channel", true);
-        this.requireChannel(channel);
+        const renamedTo = !this.store.hasChannel(channel) ? this.store.channelRenamedTo(channel) : undefined;
+        if (renamedTo) throw new AsenqError("channel_renamed", `channel "${channel}" was renamed to "${renamedTo}"`);
         const rows = this.store.db.all<MsgRow>(
           "SELECT * FROM (SELECT * FROM messages WHERE channel=? ORDER BY ord DESC LIMIT ?) ORDER BY ord",
           channel, limitParam(p, 20, 100));
@@ -1959,10 +1960,7 @@ export class Daemon {
       const changed = action === "create" ? this.store.createChannel(name)
         : action === "add" ? this.store.addChannelMember(name, sessionId!)
         : this.store.removeChannelMember(name, sessionId!);
-      if (changed && action === "create") {
-        this.store.clearChannelRename(name);
-        if (sessionId !== undefined) this.store.addChannelMember(name, sessionId);
-      }
+      if (changed && action === "create" && sessionId !== undefined) this.store.addChannelMember(name, sessionId);
       const channel = this.store.channelSummary(name);
       const event = changed ? this.store.appendEvent({
         type: "channel", action: action === "create" ? "created" : "updated", channel,

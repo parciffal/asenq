@@ -578,7 +578,9 @@ export class ConsoleApp {
         if (this.readHold === oldKey) this.readHold = newKey;
         for (const item of this.activity) {
           const ev = item.event;
-          if (ev.type === "channel" && ev.channel.name === e.oldName) ev.channel.name = e.channel.name;
+          if (ev.type === "channel" && ev.channel.name === e.oldName) {
+            item.event = { ...ev, channel: { ...ev.channel, name: e.channel.name } };
+          }
         }
       }
       const index = this.channels.findIndex((c) => c.name === e.channel.name);

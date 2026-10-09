@@ -957,11 +957,6 @@ export class Store {
     return row?.new_name;
   }
 
-  /** Clears any rename record pointing away from `name`, allowing it to be reused. */
-  clearChannelRename(name: string): void {
-    this.db.run("DELETE FROM channel_renames WHERE old_name=?", name);
-  }
-
   channelSummary(name: string): ChannelSummary {
     const summary = this.db.get<{ count: number; lastAt: number; lastOrder: number }>(
       `SELECT count(*) AS count,COALESCE(max(created_at),0) AS lastAt,COALESCE(max(ord),0) AS lastOrder

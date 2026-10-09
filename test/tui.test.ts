@@ -3093,3 +3093,27 @@ test("the console footer carries the Map's filter, focus and feral flags", async
   await ui.press("s");
   assert.ok(!/FILTER|FOCUS|FERAL OFF/.test(footer()), "other tabs show no map flags");
 });
+
+test("channel rename updates the channel list and header in the TUI", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "rename-tui-poster", "poster");
+  await human.request("channel_create", { channel: "old-tui" });
+  await human.request("channel_add", { channel: "old-tui", name: "poster" });
+  await poster.client.request("channel_send", { channel: "old-tui", text: "tui-rename-msg" });
+  const ui = await startConsole(120, 28);
+  await ui.press("#");
+  await ui.until(() => ui.rows().some((row) => row.includes("#old-tui")), "old channel in list");
+  await ui.press("ENTER");
+  await ui.until(() => ui.rows().some((row) => row.includes("tui-rename-msg")), "message loaded");
+
+  // Rename the channel through the daemon
+  await human.request("channel_rename", { channel: "old-tui", name: "new-tui" });
+  // Consume the note delivery
+  await poster.nextDelivery();
+
+  await ui.until(() => ui.rows().some((row) => row.includes("#new-tui")), "channel list shows new name");
+  assert.ok(!ui.rows().some((row) => row.includes("#old-tui")), "old name is gone from the list");
+  assert.ok(ui.rows().some((row) => row.includes("tui-rename-msg")), "loaded message is still visible");
+  assertWithin(ui);
+});
