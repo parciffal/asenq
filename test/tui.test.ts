@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { AsenqClient } from "../src/shared/client.js";
 import type { ClientOpts } from "../src/shared/client.js";
-import { GRACE_MS, type SendResult, type SessionIdentity, type StoredMessage } from "../src/shared/protocol.js";
+import { GRACE_MS, type PositionedEvent, type SendResult, type SessionIdentity, type StoredMessage } from "../src/shared/protocol.js";
+import type { ProcInfo } from "../src/viz/scan.js";
 import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
@@ -2640,14 +2642,22 @@ function mapTimer() {
       return () => {
         state.running--;
         state.cancelled++;
-        if (state.fn === fn) state.fn = undefined;
       };
     },
-    /** Runs the last scheduled callback `count` times, even if it was cancelled (a stale timer must be inert). */
+    /** Runs the last scheduled callback `count` times, even after it was cancelled (a stale timer must be inert). */
     tick(count = 1): void {
       for (let i = 0; i < count; i++) state.fn?.();
     },
   };
+}
+
+/** Yields event-loop turns (no wall-clock wait) until `predicate` holds, for conditions that only need pending promises to run. */
+async function turns(predicate: () => boolean, what: string): Promise<void> {
+  for (let turn = 0; turn < 1000; turn++) {
+    if (predicate()) return;
+    await nextTurn();
+  }
+  assert.fail(`never reached: ${what}`);
 }
 
 type MapFleet = { boss: Adapter; alpha: Adapter };
@@ -2881,4 +2891,205 @@ test("the Map tab survives tiny terminals without throwing", async () => {
   }
   await ui.resize(160, 48);
   await ui.until(() => hasRow(ui, "NETWATCH"), "recovers at full size");
+});
+
+test("only traffic seen while the Map is on screen spawns packets; earlier traffic fills the feed without replaying", async () => {
+  env = await startEnv();
+  const { boss, alpha } = await mapFleet(env);
+  const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
+  // Packets are a few animated glyphs on a link, which a text frame cannot tell apart from the link art reliably,
+  // so the in-flight count (and the console's received events) are read from the controller instead.
+  const inner = ui.app as unknown as { map: { packetCount: number }; activity: PositionedEvent[] };
+  const received = (text: string): boolean => inner.activity.some((item) => item.event.type === "message" && item.event.msg.text === text);
+  await boss.client.request("send", { to: "wrk-alpha", text: "unseen traffic", kind: "task" });
+  await alpha.nextDelivery();
+  await ui.until(() => received("unseen traffic"), "console applied the hidden-tab message");
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "unseen traffic") && hasRow(ui, "wrk-alpha"), "feed row and sessions on opening");
+  assert.equal(inner.map.packetCount, 0, "no packet for a message that arrived while another tab was shown");
+  await boss.client.request("send", { to: "wrk-alpha", text: "live traffic", kind: "task" });
+  await ui.until(() => hasRow(ui, "live traffic"), "live feed row");
+  assert.equal(inner.map.packetCount, 1, "a message seen while the map is shown spawns one packet");
+  await ui.press("s");
+  assert.equal(inner.map.packetCount, 0, "leaving the tab drops in-flight packets");
+  await ui.press("m");
+  assert.equal(inner.map.packetCount, 0, "re-entering does not replay old packets");
+  assert.ok(hasRow(ui, "live traffic") && hasRow(ui, "unseen traffic"), "the feed keeps both lines");
+});
+
+test("an overlay over the Map stops its timer and polling, and closing it resumes with an immediate refresh", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const timer = mapTimer();
+  let lists = 0;
+  let scans = 0;
+  const counting = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient(options);
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      if (op === "list") lists++;
+      return request(op, params);
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, counting, { scan: async () => (scans++, []), schedule: timer.schedule });
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  for (const [open, close] of [["?", "ESCAPE"], ["CTRL_K", "ESCAPE"], ["CTRL_E", "ESCAPE"]]) {
+    const [list, scan, cancelled] = [lists, scans, timer.state.cancelled];
+    await ui.press(open);
+    assert.ok(!hasRow(ui, "NETWATCH"), `${open} covers the map`);
+    assert.deepEqual([timer.state.running, timer.state.cancelled], [0, cancelled + 1], `${open} stops the animation timer`);
+    timer.tick(100); // a stale tick (and a 2s/5s poll worth of them) must stay inert under the overlay
+    await ui.app.idle();
+    assert.deepEqual([lists, scans], [list, scan], `no polling under ${open}`);
+    await ui.press(close);
+    await ui.until(() => hasRow(ui, "NETWATCH") && lists === list + 1 && scans === scan + 1, `${open} closed: map resumes with a refresh`);
+    assert.equal(timer.state.running, 1, "one timer again");
+  }
+});
+
+test("a process scan requested during a scan runs right after it instead of being dropped", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const timer = mapTimer();
+  const pending: PromiseWithResolvers<ProcInfo[]>[] = [];
+  let scans = 0;
+  const scan = (): Promise<ProcInfo[]> => {
+    scans++;
+    if (scans === 1) return Promise.resolve([]);
+    pending.push(Promise.withResolvers<ProcInfo[]>());
+    return pending.at(-1)!.promise;
+  };
+  const ui = await startConsole(160, 48, undefined, { scan, schedule: timer.schedule });
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "wrk-alpha") && scans === 1, "initial scan done");
+  timer.tick(50); // the 5s poll starts scan #2, which stays in flight
+  assert.equal(scans, 2);
+  void ui.press("r"); // asks for a rescan while #2 is still running
+  assert.equal(scans, 2, "the request waits for the running scan");
+  pending[0].resolve([{ pid: 4242, harness: "codex", command: "codex", elapsedSec: 1, cpu: 0 }]);
+  await turns(() => scans === 3, "the requested scan to follow immediately");
+  pending[1].resolve([]);
+  await ui.app.idle();
+  assert.equal(scans, 3, "and nothing more is queued");
+  assert.ok(!hasRow(ui, "codex-4242"), "the newest result wins");
+});
+
+test("a list that fails after leaving the Map is discarded rather than painting SIGNAL LOST on re-entry", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const timer = mapTimer();
+  const gate: { hold?: PromiseWithResolvers<void>; lists: number } = { lists: 0 };
+  const gated = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient(options);
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      if (op === "list") {
+        gate.lists++;
+        if (gate.hold) await gate.hold.promise;
+      }
+      return request(op, params);
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, gated, { scan: async () => [], schedule: timer.schedule });
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "wrk-alpha") && hasRow(ui, "LINK ESTABLISHED"), "map loaded");
+  const first = Promise.withResolvers<void>();
+  first.promise.catch(() => {});
+  gate.hold = first;
+  const before = gate.lists;
+  timer.tick(20); // the 2s poll's list is now in flight
+  assert.equal(gate.lists, before + 1);
+  void ui.press("s"); // leave while it is pending
+  first.reject(new Error("daemon went away"));
+  await ui.app.idle(); // the failed list settles and must be discarded
+  const second = Promise.withResolvers<void>();
+  gate.hold = second;
+  void ui.press("m"); // re-enter; its own list is held, so only the retained state can be on screen
+  assert.ok(hasRow(ui, "wrk-alpha") && !hasRow(ui, "SIGNAL LOST"), `stale failure discarded:\n${ui.rows().join("\n")}`);
+  second.resolve();
+  await ui.app.idle();
+  assert.ok(hasRow(ui, "LINK ESTABLISHED"));
+});
+
+test("a reconnect while the Map shows SIGNAL LOST refreshes it without waiting for the next poll", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const timer = mapTimer();
+  let reconnect: (() => void) | undefined;
+  let outage = false;
+  const manual = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient({ ...options, autoStart: false, schedule: (fn) => { reconnect = fn; } });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      if (op === "list" && outage) throw new Error("daemon unreachable");
+      return request(op, params);
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, manual, { scan: async () => [], schedule: timer.schedule });
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  outage = true;
+  timer.tick(20);
+  await ui.until(() => hasRow(ui, "SIGNAL LOST"), "SIGNAL LOST during the outage");
+  await env.restart();
+  await ui.until(() => reconnect !== undefined, "console client noticed the lost connection");
+  outage = false;
+  reconnect!(); // no timer tick: only hydrate-on-reconnect can refresh the map
+  await ui.until(() => !hasRow(ui, "SIGNAL LOST") && hasRow(ui, "LINK ESTABLISHED"), "map refreshed by the reconnect");
+});
+
+test("the Map frames at exactly the body height: 60x20 is too small, 60x21 shows the scene", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await openMap(60, 20);
+  await ui.until(() => hasRow(ui, "TOO SMALL"), "notice at 60x20");
+  assert.ok(hasRow(ui, "need 60x19") && hasRow(ui, "have 60x18"), `the notice names the map region:\n${ui.rows().join("\n")}`);
+  assertWithin(ui);
+  await ui.resize(60, 21);
+  await ui.until(() => hasRow(ui, "NETWATCH") && hasRow(ui, "wrk-alpha") && hasRow(ui, "boss-queen"), "scene at 60x21");
+  assert.equal(ui.rows().length, 21, "tab bar + 19-row scene + footer");
+  assert.ok(!hasRow(ui, "TOO SMALL"));
+  assertWithin(ui);
+});
+
+test("clicking bugs selects them at small map heights, below the tab bar", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await openMap(100, 40);
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  for (const [columns, rows] of [[60, 21], [80, 24], [100, 30]]) {
+    await ui.resize(columns, rows);
+    for (const name of ["boss-queen", "wrk-alpha", "boss-queen"]) {
+      const row = ui.rows().findIndex((r) => r.includes(name)); // the plate sits above the HUD, which repeats the name
+      assert.ok(row > 0, `${name} drawn at ${columns}x${rows}`);
+      await ui.click(ui.rows()[row].indexOf(name) + 1, row);
+      assert.ok(mapTarget(ui).includes(name), `TARGET names ${name} at ${columns}x${rows}: ${mapTarget(ui)}`);
+    }
+  }
+});
+
+test("the console footer carries the Map's filter, focus and feral flags", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await openMap();
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  const footer = (): string => ui.rows().at(-1)!;
+  assert.ok(!/FILTER|FOCUS|FERAL OFF/.test(footer()), footer());
+  await ui.press("f");
+  assert.ok(footer().includes("FILTER:claude") && footer().includes("rescan"), footer());
+  await ui.press("u");
+  assert.ok(footer().includes("FERAL OFF"), footer());
+  await ui.press("TAB");
+  await ui.press("ENTER");
+  assert.ok(footer().includes("FOCUS"), footer());
+  await ui.press("c");
+  await ui.press("ENTER");
+  await ui.press("ESCAPE");
+  assert.ok(footer().includes("Message text is empty") && footer().includes("FOCUS") && footer().includes("FERAL OFF"), `flags survive an error notice: ${footer()}`);
+  await ui.press("s");
+  assert.ok(!/FILTER|FOCUS|FERAL OFF/.test(footer()), "other tabs show no map flags");
 });

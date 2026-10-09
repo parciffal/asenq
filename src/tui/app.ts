@@ -71,7 +71,7 @@ const SHORTCUTS: Partial<Record<Action, string>> = {
 const HELP = [
   "asenq TUI",
   "",
-  "Tabs: s Sessions · i Inbox · # Channels · a Activity · m Map. Tab / Shift+Tab move focus between tabs, list, conversation and composer.",
+  "Tabs: s Sessions · i Inbox · # Channels · a Activity · m Map. Tab / Shift+Tab move focus between tabs, list, conversation and composer (on Map they select bugs instead, unless the tab bar has focus).",
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
   "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
   "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
@@ -226,8 +226,12 @@ export class ConsoleApp {
   private mapLoading = false;
   private mapAgain = false;
   private mapScanning = false;
-  /** Screen row of the map region's first line, for translating clicks. */
+  private scanAgain = false;
+  /** Bumped whenever the Map stops being active; fetches started before are discarded when they settle. */
+  private mapGen = 0;
+  /** Screen row and height of the map region, for translating clicks; height is 0 while it is not drawn. */
   private mapTop = 0;
+  private mapHeight = 0;
   private resolve?: (code: number) => void;
 
   constructor(deps: ConsoleDeps = {}) {
@@ -250,7 +254,7 @@ export class ConsoleApp {
     };
     this.screen = deps.screen ? deps.screen(screenOptions) : new TerminalAdapter(screenOptions);
     this.scan = deps.scan ?? (() => scanProcesses());
-    this.map = new VizMap(deps.now);
+    this.map = new VizMap(deps.now, true);
     this.schedule = deps.schedule ?? ((fn, ms) => {
       const timer = setInterval(fn, ms);
       return () => clearInterval(timer);
@@ -401,6 +405,10 @@ export class ConsoleApp {
       this.activity = events;
       if (previous) this.watermark = previous; // replay missed events before trusting the new watermark
       this.connection = "connected";
+      if (this.mapActive()) {
+        this.map.refresh();
+        this.fetchMap(this.map.take());
+      }
       if (this.notice?.kind === "error" && this.notice.text.startsWith("Disconnected")) this.notice = undefined;
       this.ensureSelection();
       const scope = this.scope();
@@ -483,7 +491,7 @@ export class ConsoleApp {
     }
     const e = item.event;
     if (e.type === "message") {
-      this.map.onMessage(e.msg);
+      this.map.onMessage(e.msg, this.mapActive());
       if (e.failedCount !== undefined) this.failedCount = e.failedCount;
       if (e.status === "held" || this.heldMessages.has(e.msg.id)) this.heldDirty = true;
       const m: StoredMessage = { ...e.msg, status: e.status, ...(e.reason ? { reason: e.reason } : {}) };
@@ -563,7 +571,7 @@ export class ConsoleApp {
     } else if (e.type === "retention") {
       this.resync = true;
     }
-    if (this.tab === "map" && (e.type === "session" || e.type === "channel" || e.type === "ping")) this.track(this.refreshMap());
+    if (this.mapActive() && (e.type === "session" || e.type === "channel" || e.type === "ping")) this.track(this.refreshMap());
     if (this.tab === "activity" && this.followActivity) this.selection.activity = undefined;
   }
 
@@ -1126,6 +1134,7 @@ export class ConsoleApp {
     }
     const { columns: width, rows: height } = this.screen.size;
     this.hits = [];
+    this.mapHeight = 0;
     this.syncMap();
     this.shown = undefined;
     this.shownHeldId = undefined;
@@ -1148,18 +1157,23 @@ export class ConsoleApp {
 
   // ------------------------------------------------------------------ map tab
 
-  /** True while the Map tab owns keys and clicks: it is shown and no overlay is open. */
+  /** True while the Map is on screen and owns keys and clicks: it is the shown tab and no overlay covers it. */
   private mapActive(): boolean {
     return this.tab === "map" && !this.confirmation && !this.finder && !this.palette && !this.form && !this.searching && !this.panel;
   }
 
-  /** Starts the animation timer and fetching when the Map tab becomes the shown tab, stops the timer when it stops. Idempotent. */
+  /**
+   * Starts the animation timer and fetching when the Map becomes active and stops the timer when it stops being
+   * (another tab or an overlay). Results of fetches begun before a stop are discarded. Idempotent.
+   */
   private syncMap(): void {
-    const shown = this.tab === "map";
-    if (shown === (this.stopMapTicks !== undefined)) return;
-    if (!shown) {
+    const active = this.mapActive();
+    if (active === (this.stopMapTicks !== undefined)) return;
+    if (!active) {
       this.stopMapTicks?.();
       this.stopMapTicks = undefined;
+      this.mapGen++;
+      this.map.clearPackets();
       return;
     }
     this.stopMapTicks = this.schedule(() => this.stepMap(), TICK_MS);
@@ -1168,7 +1182,7 @@ export class ConsoleApp {
   }
 
   private stepMap(): void {
-    if (this.closed || this.tab !== "map") return;
+    if (this.closed || !this.mapActive()) return;
     this.fetchMap(this.map.step(TICK_MS));
     this.render();
   }
@@ -1180,7 +1194,7 @@ export class ConsoleApp {
 
   /** Lists sessions for the map; a request during a refresh schedules exactly one more pass. Failure shows SIGNAL LOST until the next poll. */
   private async refreshMap(): Promise<void> {
-    if (this.closed || this.tab !== "map") return;
+    if (this.closed || !this.mapActive()) return;
     if (this.mapLoading) {
       this.mapAgain = true;
       return;
@@ -1189,6 +1203,7 @@ export class ConsoleApp {
     try {
       do {
         this.mapAgain = false;
+        const gen = this.mapGen;
         let sessions: ListedSession[] = [];
         let connection: "connected" | "offline" = "offline";
         try {
@@ -1198,31 +1213,50 @@ export class ConsoleApp {
           // the map shows SIGNAL LOST until a later poll succeeds
         }
         if (this.closed) return;
-        this.map.setSessions(sessions, connection);
-        this.render();
-      } while (this.mapAgain && this.tab === "map");
+        if (gen === this.mapGen) {
+          this.map.setSessions(sessions, connection);
+          this.render();
+        }
+      } while (this.mapAgain && this.mapActive());
     } finally {
       this.mapLoading = false;
     }
   }
 
+  /** Scans processes for the map; a request during a scan schedules exactly one more pass, none is dropped. */
   private async rescanMap(): Promise<void> {
-    if (this.closed || this.tab !== "map" || this.mapScanning) return;
+    if (this.closed || !this.mapActive()) return;
+    if (this.mapScanning) {
+      this.scanAgain = true;
+      return;
+    }
     this.mapScanning = true;
     try {
-      this.map.setProcs(await this.scan());
-      this.render();
-    } catch {
-      // keep the previous scan
+      do {
+        this.scanAgain = false;
+        const gen = this.mapGen;
+        let procs: ProcInfo[] | undefined;
+        try {
+          procs = await this.scan();
+        } catch {
+          // keep the previous scan
+        }
+        if (this.closed) return;
+        if (procs && gen === this.mapGen) {
+          this.map.setProcs(procs);
+          this.render();
+        }
+      } while (this.scanAgain && this.mapActive());
     } finally {
       this.mapScanning = false;
     }
   }
 
-  /** The scene's own key-hint row is dropped: the console footer carries the hints. */
+  /** The scene fills the body exactly; its key hints and view flags are shown by the console footer. */
   private mapPane(width: number, height: number, y0: number): Pane {
     this.mapTop = y0;
-    const lines = this.map.frame({ columns: width, rows: height + 1 }).slice(0, height);
+    this.mapHeight = height;
+    const lines = this.map.frame({ columns: width, rows: height }).slice(0, height);
     return { rows: [...lines, ...Array<TerminalLine>(height - lines.length).fill("")] };
   }
 
@@ -1330,13 +1364,22 @@ export class ConsoleApp {
       hints += " · r release · x drop";
     }
     const notice = this.notice;
-    if (!notice) return padSpans(hintSpans(hints, width), width);
+    const flags = this.mapActive() ? this.map.flags : "";
+    if (!notice) {
+      return flags
+        ? justify(hintSpans(hints, Math.max(0, width - flags.length - 1)), [{ text: flags, style: theme.warn }], width)
+        : padSpans(hintSpans(hints, width), width);
+    }
     const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
     const left: TerminalSpan[] = [
       { text: notice.kind === "error" ? "✖ " : notice.kind === "new" ? "● " : "· ", style },
       { text: notice.text, style },
     ];
-    const right = hintSpans(notice.kind === "error" ? `Esc dismiss · ${hints}` : hints, Math.floor(width / 2));
+    const half = Math.floor(width / 2);
+    const hintText = notice.kind === "error" ? `Esc dismiss · ${hints}` : hints;
+    const right = flags
+      ? [...hintSpans(hintText, Math.max(0, half - flags.length - 2)), { text: "  " }, { text: flags, style: theme.warn }]
+      : hintSpans(hintText, half);
     return justify(left, right, width);
   }
 
@@ -2253,7 +2296,8 @@ export class ConsoleApp {
       return this.render();
     }
     if (m.action === "press" && m.button === "left" && !hit && this.mapActive()) {
-      if (this.map.click(m.column, m.row - this.mapTop)) this.render();
+      const row = m.row - this.mapTop;
+      if (row >= 0 && row < this.mapHeight && this.map.click(m.column, row)) this.render();
       return;
     }
     if (m.action !== "press" || m.button !== "left" || !hit) return;

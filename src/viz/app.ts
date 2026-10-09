@@ -171,7 +171,7 @@ export class VizApp {
     if (p.push !== "event" || this.closed) return;
     const event = p.event;
     if (event.type === "message") {
-      this.map.onMessage(event.msg);
+      this.map.onMessage(event.msg, true);
       this.render();
     } else if (event.type === "session" || event.type === "channel" || event.type === "ping") this.track(this.refresh());
   }

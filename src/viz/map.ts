@@ -3,7 +3,7 @@ import { sanitizeTerminalText } from "../tui/terminal.js";
 import type { KeyInput, TerminalLine, TerminalSize } from "../tui/terminal.js";
 import { buildWorld } from "./model.js";
 import type { ProcInfo } from "./scan.js";
-import { navigate, renderScene, visibleBugs } from "./scene.js";
+import { navigate, renderScene, viewFlags, visibleBugs } from "./scene.js";
 import { VIZ_HARNESSES } from "./types.js";
 import type { Bug, Direction, FeedLine, Hit, Packet, VizUi, World } from "./types.js";
 
@@ -57,9 +57,14 @@ export class VizMap {
   private lastScan = 0;
   private pending: MapDue = { list: false, scan: false };
 
-  /** `now` supplies epoch ms for relative times and gone-session ageing. */
-  constructor(private readonly now: () => number = Date.now) {
+  /** `now` supplies epoch ms for relative times and gone-session ageing; `embedded` drops the scene's key-hint row. */
+  constructor(private readonly now: () => number = Date.now, private readonly embedded = false) {
     this.world = this.build();
+  }
+
+  /** Filter / focus / feral flags of the current view, empty when none; embedders show them since the hint row is not drawn. */
+  get flags(): string {
+    return viewFlags(this.ui);
   }
 
   setSessions(sessions: ListedSession[], connection: World["connection"]): void {
@@ -73,8 +78,11 @@ export class VizMap {
     this.rebuild();
   }
 
-  /** Adds a feed line (and a packet when both endpoints are known); a message already seen is ignored. */
-  onMessage(msg: StoredMessage): void {
+  /**
+   * Adds a feed line; a message already seen is ignored. A packet is spawned too only when `animate` is true
+   * (the map is on screen) and both endpoints are known, so traffic that arrived unseen is never replayed.
+   */
+  onMessage(msg: StoredMessage, animate: boolean): void {
     if (this.seen.has(msg.id)) return;
     this.seen.add(msg.id);
     if (this.seen.size > SEEN_MAX) this.seen.delete(this.seen.values().next().value as string);
@@ -88,10 +96,20 @@ export class VizMap {
       text: clean(msg.text || msg.file?.summary || ""),
     };
     this.feed = [...this.feed, line].slice(-FEED_MAX);
-    if (from && to) {
+    if (animate && from && to) {
       this.packets = [...this.packets, { seq: line.seq, fromId: from.id, toId: to.id, kind, born: this.clock }].slice(-PACKET_MAX);
     }
     this.rebuild();
+  }
+
+  /** Packets currently in flight. */
+  get packetCount(): number {
+    return this.packets.length;
+  }
+
+  /** Drops in-flight packets; hosts call it when the map leaves the screen so re-entry never resumes old traffic. */
+  clearPackets(): void {
+    this.packets = [];
   }
 
   /** Advances animation, packet lifetimes and the 2s/5s poll clocks by `ms`; returns what the host should fetch now. */
@@ -176,7 +194,7 @@ export class VizMap {
     this.size = size;
     const packets: Packet[] = this.packets.map(({ born, ...p }) => ({ ...p, ageMs: this.clock - born }));
     try {
-      const scene = renderScene(this.world, packets, this.ui, this.tick, size, this.now());
+      const scene = renderScene(this.world, packets, this.ui, this.tick, size, this.now(), this.embedded);
       this.hits = scene.hits;
       return scene.frame.lines;
     } catch (e) {
@@ -222,7 +240,7 @@ export class VizMap {
   }
 
   private go(dir: Direction): boolean {
-    const next = navigate(this.world, this.ui, this.size, dir);
+    const next = navigate(this.world, this.ui, this.size, dir, this.embedded);
     if (next !== null) this.ui.selectedId = next;
     return true;
   }

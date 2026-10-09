@@ -72,6 +72,30 @@ test("a terminal below 60x20 gets a too-small notice", () => {
   assert.equal(navigate(small(), ui(), { columns: 50, rows: 15 }, "next"), null);
 });
 
+test("an embedded scene has no key-hint row, needs one row less, and fills the region exactly", () => {
+  const standalone = frameRows(small(), ui(), { columns: 80, rows: 24 });
+  assert.ok(standalone.some((row) => row.includes("quit")), "the standalone scene draws its hint row");
+  const embedded = renderScene(small(), [], ui(), 0, { columns: 80, rows: 23 }, 1_000_000, true);
+  const rows = embedded.frame.lines.map(lineText);
+  assert.equal(rows.length, 23);
+  assert.ok(!rows.some((row) => row.includes("quit") || row.includes("rescan")), "no hint row when embedded");
+  assert.ok(rows.at(-1)!.includes("┘"), "the HUD panels end on the region's last row");
+  assert.ok(rows.join("\n").includes("TARGET") && rows.join("\n").includes("NETWATCH"));
+  // laid out like the standalone scene one row taller: everything above the HUD (24 - 7 = 17 rows) is identical
+  assert.deepEqual(rows.slice(0, 17), standalone.slice(0, 17));
+  for (const size of [{ columns: 60, rows: 19 }, { columns: 100, rows: 30 }]) {
+    const result = renderScene(small(), [], ui(), 0, size, 0, true);
+    assert.equal(result.frame.lines.length, size.rows);
+    assert.ok(result.hits.length > 0, `bugs are drawn at ${size.columns}x${size.rows}`);
+  }
+  const tight = renderScene(small(), [], ui(), 0, { columns: 60, rows: 18 }, 0, true);
+  assert.ok(tight.frame.lines.map(lineText).some((row) => row.includes("TOO SMALL // need 60x19") && !row.includes("TERMINAL")));
+  assert.ok(tight.frame.lines.map(lineText).some((row) => row.includes("have 60x18")), "the notice reports the region's true size");
+  assert.deepEqual(tight.hits, []);
+  assert.equal(navigate(small(), ui(), { columns: 60, rows: 18 }, "next", true), null);
+  assert.notEqual(navigate(small(), ui(), { columns: 60, rows: 19 }, "next", true), null);
+});
+
 test("too many bugs for the smallest level show a +N more marker", () => {
   const bugs = [human()];
   const edges: Edge[] = [];

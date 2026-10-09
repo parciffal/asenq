@@ -45,11 +45,23 @@ export function visibleBugs(world: World, ui: VizUi): Bug[] {
   return world.bugs.filter((bug) => keep.has(bug.id));
 }
 
-function prepare(world: World, ui: VizUi, size: TerminalSize): { bugs: Bug[]; edges: Edge[]; lay: Layout } {
+/**
+ * An embedded scene has no key-hint row: it lays out as the standalone scene would one row taller (same HUD and
+ * minimum, minus that row), so the HUD's panels end on the region's last row.
+ */
+const layoutRows = (size: TerminalSize, embedded: boolean): number => size.rows + (embedded ? 1 : 0);
+const isTooSmall = (size: TerminalSize, embedded: boolean): boolean => size.columns < MIN_COLUMNS || layoutRows(size, embedded) < MIN_ROWS;
+
+/** Filter / focus / feral state flags; the standalone scene draws them on its hint row, embedders show them elsewhere. */
+export function viewFlags(ui: VizUi): string {
+  return [ui.filter !== null ? `FILTER:${ui.filter}` : "", ui.focus ? "FOCUS" : "", ui.feral ? "" : "FERAL OFF"].filter(Boolean).join(" ");
+}
+
+function prepare(world: World, ui: VizUi, size: TerminalSize, embedded: boolean): { bugs: Bug[]; edges: Edge[]; lay: Layout } {
   const bugs = visibleBugs(world, ui);
   const ids = new Set(bugs.map((bug) => bug.id));
   const edges = world.edges.filter((edge) => ids.has(edge.from) && ids.has(edge.to));
-  return { bugs, edges, lay: layoutScene(bugs, edges, size) };
+  return { bugs, edges, lay: layoutScene(bugs, edges, { columns: size.columns, rows: layoutRows(size, embedded) }) };
 }
 
 // ---- canvas -----------------------------------------------------------------------------------------------------
@@ -586,10 +598,11 @@ function targetLines(world: World, bug: Bug, inner: number, count: number, tick:
   return lines.slice(0, count);
 }
 
-function drawHud(c: Canvas, world: World, bugs: readonly Bug[], ui: VizUi, tick: number, now: number): void {
+function drawHud(c: Canvas, world: World, bugs: readonly Bug[], ui: VizUi, tick: number, now: number, embedded: boolean): void {
   const cols = c.cols;
-  const hud = hudHeight(c.rows);
-  const top = c.rows - hud;
+  const rows = c.rows + (embedded ? 1 : 0);
+  const hud = hudHeight(rows);
+  const top = rows - hud;
   const panelH = hud - 1;
   const leftW = Math.max(30, Math.floor(cols * 0.45));
   const rightW = cols - leftW;
@@ -626,6 +639,7 @@ function drawHud(c: Canvas, world: World, bugs: readonly Bug[], ui: VizUi, tick:
     putSegs(c, rx, top + 1 + i, segs, rw);
   });
 
+  if (embedded) return;
   // Key hints.
   const keyId = sid(PAL.yellow, PAL.void, true);
   const descId = sid(shade(PAL.ghost, 1.25));
@@ -638,7 +652,7 @@ function drawHud(c: Canvas, world: World, bugs: readonly Bug[], ui: VizUi, tick:
     [["q", "quit"]],
   ];
   const widthOf = (v: [string, string][]): number => v.reduce((n, [k, d]) => n + k.length + 1 + d.length, 0) + 3 * (v.length - 1);
-  const flags = [ui.filter !== null ? `FILTER:${ui.filter}` : "", ui.focus ? "FOCUS" : "", ui.feral ? "" : "FERAL OFF"].filter(Boolean).join(" ");
+  const flags = viewFlags(ui);
   const chosen = variants.find((v) => 1 + widthOf(v) <= cols) ?? variants[variants.length - 1];
   let at = 1;
   chosen.forEach(([k, d], i) => {
@@ -651,10 +665,10 @@ function drawHud(c: Canvas, world: World, bugs: readonly Bug[], ui: VizUi, tick:
 
 // ---- frame ------------------------------------------------------------------------------------------------------
 
-function tooSmall(size: TerminalSize): SceneResult {
+function tooSmall(size: TerminalSize, embedded: boolean): SceneResult {
   const base = sid(PAL.white);
   const rows = Math.max(0, size.rows);
-  const message = truncateTerminalText("TERMINAL TOO SMALL // need 60x20", size.columns);
+  const message = truncateTerminalText(embedded ? `MAP TOO SMALL // need ${MIN_COLUMNS}x${MIN_ROWS - 1}` : "TERMINAL TOO SMALL // need 60x20", size.columns);
   const have = truncateTerminalText(`have ${size.columns}x${size.rows}`, size.columns);
   const mid = Math.floor(rows / 2);
   const lines: TerminalSpan[][] = [];
@@ -671,10 +685,10 @@ function tooSmall(size: TerminalSize): SceneResult {
   return { frame: { lines }, hits: [] };
 }
 
-export function renderScene(world: World, packets: Packet[], ui: VizUi, tick: number, size: TerminalSize, now: number): SceneResult {
-  if (size.columns < MIN_COLUMNS || size.rows < MIN_ROWS) return tooSmall(size);
+export function renderScene(world: World, packets: Packet[], ui: VizUi, tick: number, size: TerminalSize, now: number, embedded = false): SceneResult {
+  if (isTooSmall(size, embedded)) return tooSmall(size, embedded);
   tick = Math.floor(tick);
-  const { bugs, edges, lay } = prepare(world, ui, size);
+  const { bugs, edges, lay } = prepare(world, ui, size, embedded);
   const c = acquire(size.columns, size.rows, sid(PAL.white));
   const selected = ui.selectedId !== null && lay.byId.has(ui.selectedId) ? ui.selectedId : null;
   let focus: Set<string> | null = null;
@@ -704,7 +718,7 @@ export function renderScene(world: World, packets: Packet[], ui: VizUi, tick: nu
   }
   drawBackground(c, lay.sceneTop, lay.sceneBottom, tick);
   drawHeader(c, world, tick, now);
-  drawHud(c, world, bugs, ui, tick, now);
+  drawHud(c, world, bugs, ui, tick, now, embedded);
 
   const lines: TerminalSpan[][] = [];
   for (let y = 0; y < c.rows; y++) {
@@ -733,9 +747,9 @@ export function renderScene(world: World, packets: Packet[], ui: VizUi, tick: nu
 
 const rangeGap = (aLo: number, aHi: number, bLo: number, bHi: number): number => Math.max(0, Math.max(aLo, bLo) - Math.min(aHi, bHi));
 
-export function navigate(world: World, ui: VizUi, size: TerminalSize, dir: Direction): string | null {
-  if (size.columns < MIN_COLUMNS || size.rows < MIN_ROWS) return null;
-  const { lay } = prepare(world, ui, size);
+export function navigate(world: World, ui: VizUi, size: TerminalSize, dir: Direction, embedded = false): string | null {
+  if (isTooSmall(size, embedded)) return null;
+  const { lay } = prepare(world, ui, size, embedded);
   if (lay.placed.length === 0) return null;
   const reading = [...lay.placed].sort((a, b) => a.y - b.y || a.x - b.x);
   const cur = ui.selectedId === null ? undefined : lay.byId.get(ui.selectedId);
