@@ -8,8 +8,8 @@ const DEBOUNCE_MS = 300
 const INITIAL_BACKOFF_MS = 1_000
 const MAX_BACKOFF_MS = 30_000
 const STABLE_MS = 5_000
-const HEARTBEAT_MS = 30_000
 const VERSION_MISMATCH_RE = /protocol|version/i
+const CONNECTED_RE = /^asenq tail: connected$/m
 
 const EMPTY: AsenqData = { sessions: [], channels: [], online: false, seq: 0 }
 
@@ -28,7 +28,6 @@ type Timer = { cancel: () => void }
 // Module-level state (reset on hot reload is acceptable, same as repo-pane pattern)
 let argv: string[] = []
 let debounceTimer: Timer | null = null
-let heartbeatTimer: Timer | null = null
 let versionMismatchToasted = false
 let fetchSeq = 0
 
@@ -72,11 +71,17 @@ async function setData($: any, data: AsenqData): Promise<void> {
   )
 }
 
+/** F-15: compute status from what the atom holds, so status and pane agree. */
+async function updateStatus($: any): Promise<void> {
+  const data = await read($, dataAtom)
+  const id = await sessionId($)
+  $.ui.status(statusLine(data, id))
+}
+
 async function refreshAndStatus($: any): Promise<void> {
   const data = await fetchData($)
   await setData($, data)
-  const id = await sessionId($)
-  $.ui.status(statusLine(data, id))
+  await updateStatus($)
 }
 
 function debouncedRefetch($: any): void {
@@ -87,27 +92,6 @@ function debouncedRefetch($: any): void {
   })
 }
 
-function startHeartbeat($: any): void {
-  if (heartbeatTimer) heartbeatTimer.cancel()
-  heartbeatTimer = $.clock.every(HEARTBEAT_MS, async () => {
-    const data = await fetchData($)
-    if (!data.online) {
-      // Daemon died under us; flip to offline
-      await setData($, data)
-      const id = await sessionId($)
-      $.ui.status(statusLine(data, id))
-    } else {
-      await setData($, data)
-      const id = await sessionId($)
-      $.ui.status(statusLine(data, id))
-    }
-  })
-}
-
-function stopHeartbeat(): void {
-  if (heartbeatTimer) { heartbeatTimer.cancel(); heartbeatTimer = null }
-}
-
 function startTail($: any): void {
   let backoff = INITIAL_BACKOFF_MS
 
@@ -116,10 +100,6 @@ function startTail($: any): void {
       let stableTimer: Timer | null = null
       try {
         const tail = $.process.spawn({ argv: [...argv, 'tail'] })
-        // Refetch immediately on connection (F-02)
-        void refreshAndStatus($)
-        // Start heartbeat while tail is believed up (F-11)
-        startHeartbeat($)
 
         let gotChunk = false
         stableTimer = $.clock.after(STABLE_MS, () => { backoff = INITIAL_BACKOFF_MS })
@@ -132,6 +112,11 @@ function startTail($: any): void {
             stableTimer = null
           }
           if (chunk.stream === 'stderr') {
+            // F-14: "asenq tail: connected" line triggers a refetch
+            if (CONNECTED_RE.test(chunk.text)) {
+              void refreshAndStatus($)
+              continue
+            }
             if (!versionMismatchToasted && VERSION_MISMATCH_RE.test(chunk.text)) {
               versionMismatchToasted = true
               $.ui.toast('asenq mod is out of date with the daemon: rerun `asenq setup`')
@@ -145,10 +130,9 @@ function startTail($: any): void {
       }
       // tail ended or failed: go offline, retry with backoff
       if (stableTimer) { stableTimer.cancel(); stableTimer = null }
-      stopHeartbeat()
       const offlineData: AsenqData = { ...EMPTY, seq: ++fetchSeq }
       await setData($, offlineData)
-      $.ui.status('asenq offline')
+      await updateStatus($)
       $.clock.after(backoff, () => attemptTail())
       backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
     })()
@@ -157,7 +141,7 @@ function startTail($: any): void {
   attemptTail()
 }
 
-async function handleRename($: any, oldName: string, newName: string): Promise<void> {
+async function handleRename($: any, draftKey: string, oldName: string, newName: string): Promise<void> {
   if (!newName || newName === oldName) return
   try {
     const result = await asenqRun($, ['rename', oldName, newName])
@@ -165,12 +149,10 @@ async function handleRename($: any, oldName: string, newName: string): Promise<v
       $.ui.toast(result.stderr.trim() || `rename failed (exit ${result.exitCode})`)
       return
     }
-    // Clear the draft on success
+    // F-06 nit: clear only the submitted row's draft
     await update($, draftsAtom, (prev: Drafts) => {
       const next = { ...prev }
-      for (const k of Object.keys(next)) {
-        if (k.startsWith('rename-')) delete next[k]
-      }
+      delete next[draftKey]
       return next
     })
     await refreshAndStatus($)
@@ -192,17 +174,17 @@ async function handleRole($: any, name: string, role: string): Promise<void> {
   }
 }
 
-async function handleChannelRename($: any, oldName: string, newName: string): Promise<void> {
+async function handleChannelRename($: any, draftKey: string, oldName: string, newName: string): Promise<void> {
   if (!newName || newName === oldName) return
   try {
     let answer: string
     try {
       answer = await $.ui.ask(
-        `Rename channel #${oldName} to #${newName}? Members get a note and the old name stops working.`,
+        `Rename #${oldName} to #${newName}? Members get a note and the old name stops working — continue?`,
         ['Rename', 'Cancel'],
       )
     } catch {
-      // Dialog dismissed → treat as Cancel (F-05)
+      // Dialog dismissed -> treat as Cancel (F-05)
       return
     }
     if (answer !== 'Rename') return
@@ -211,12 +193,10 @@ async function handleChannelRename($: any, oldName: string, newName: string): Pr
       $.ui.toast(result.stderr.trim() || `channel rename failed (exit ${result.exitCode})`)
       return
     }
-    // Clear channel rename drafts on success
+    // F-06 nit: clear only the submitted row's draft
     await update($, draftsAtom, (prev: Drafts) => {
       const next = { ...prev }
-      for (const k of Object.keys(next)) {
-        if (k.startsWith('chrename-')) delete next[k]
-      }
+      delete next[draftKey]
       return next
     })
     await refreshAndStatus($)
@@ -239,7 +219,9 @@ export const register: Register = (on) => {
     }
 
     versionMismatchToasted = false
-    fetchSeq = 0
+    // F-13: seed fetchSeq from the persisted atom so a reload doesn't drop writes
+    const stored = await read($, dataAtom)
+    fetchSeq = stored.seq
 
     await $.command.register({
       name: 'asenq',
@@ -251,7 +233,7 @@ export const register: Register = (on) => {
 
     const started = await next(e)
 
-    // Start live tail (which does its own initial fetch) after the session is ready
+    // Start live tail (the stderr "connected" line triggers the initial fetch)
     startTail($)
 
     return started
@@ -300,7 +282,7 @@ export const register: Register = (on) => {
               placeholder={s.name}
               value={drafts[renameKey] ?? ''}
               onInput={(v: string) => setDraft($, renameKey, v)}
-              onSubmit={(v: string) => handleRename($, s.name, v.trim())}
+              onSubmit={(v: string) => handleRename($, renameKey, s.name, v.trim())}
             />
           </Box>
           <Box>
@@ -331,7 +313,7 @@ export const register: Register = (on) => {
               placeholder={ch.name}
               value={drafts[chKey] ?? ''}
               onInput={(v: string) => setDraft($, chKey, v)}
-              onSubmit={(v: string) => handleChannelRename($, ch.name, v.trim())}
+              onSubmit={(v: string) => handleChannelRename($, chKey, ch.name, v.trim())}
             />
           </Box>
           {ch.members.map((m) => (

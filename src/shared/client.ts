@@ -14,8 +14,12 @@ import {
 export type ClientOpts = {
   onPush?(p: Push): void;
   onReconnect?(): Promise<void>;
+  /** Called when reconnect finally fails (maxReconnects reached). */
+  onDisconnect?(): void;
   schedule?(fn: () => void, ms: number): unknown;
   autoStart?: boolean;
+  /** When set, stop reconnecting after this many consecutive failures. */
+  maxReconnects?: number;
 };
 
 /** A successful daemon response; fields depend on the op. */
@@ -70,6 +74,7 @@ export class AsenqClient {
   private ready?: Promise<void>;
   private inHook = false;
   private backoff = 1000;
+  private reconnectCount = 0;
 
   constructor(private opts: ClientOpts = {}) {}
 
@@ -165,10 +170,16 @@ export class AsenqClient {
     const attempt = (): void => {
       if (this.closed) return gate.reject(new Error("asenq client closed"));
       this.open().then(async () => {
+        this.reconnectCount = 0;
         this.inHook = true;
         try { await this.opts.onReconnect?.(); } catch {} finally { this.inHook = false; }
         gate.resolve();
       }, () => {
+        this.reconnectCount++;
+        if (this.opts.maxReconnects !== undefined && this.reconnectCount >= this.opts.maxReconnects) {
+          this.opts.onDisconnect?.();
+          return gate.reject(new Error("asenq reconnect limit reached"));
+        }
         this.backoff = Math.min(this.backoff * 2, 10_000);
         schedule();
       });

@@ -249,11 +249,58 @@ test("setup --remove keeps other env keys beside PLUGIN_DIRS", () => {
 
 // --- F-09: PLUGIN_DIRS tracking ---
 
-test("setup --remove does not delete PLUGIN_DIRS key when user owned it", () => {
+test("fresh install then stale refresh then --remove cleans up fully", () => {
   const pkg = makePkg();
   const home = makeHome();
 
-  // Pre-populate with user's own PLUGIN_DIRS
+  // Fresh install: asenq creates the key
+  run(pkg, home, "setup");
+  const modDir = join(home, ".claude", "mods", "asenq");
+  assert.ok(pluginDirs(settings(home)).includes(modDir), "key created");
+  // Marker exists outside the mod folder
+  assert.ok(existsSync(join(home, ".claude", "mods", ".asenq-plugin-dirs-created")), "marker exists");
+
+  // Stale refresh: rmSync the mod folder and re-install
+  const registerPath = join(modDir, "hooks", "register.tsx");
+  writeFileSync(registerPath, "// stale\n");
+  run(pkg, home, "setup");
+  // Marker should survive the refresh (it's outside the mod folder)
+  assert.ok(existsSync(join(home, ".claude", "mods", ".asenq-plugin-dirs-created")), "marker survives refresh");
+
+  // Remove: cleans up fully (key deleted since asenq created it)
+  run(pkg, home, "setup", "--remove");
+  const s = settings(home);
+  const env = s.env as Record<string, unknown> | undefined;
+  assert.ok(!env || !("CLAUDE_CODE_PLUGIN_DIRS" in env), "key deleted");
+  assert.ok(!existsSync(join(home, ".claude", "mods", ".asenq-plugin-dirs-created")), "marker deleted");
+});
+
+test("user-owned PLUGIN_DIRS key survives remove as empty string", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  // User pre-registers only the mod's exact path
+  const modDir = join(home, ".claude", "mods", "asenq");
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: modDir } }, null, 2) + "\n",
+  );
+
+  run(pkg, home, "setup");
+  // The path already exists, so setup does not add a duplicate
+  assert.equal(pluginDirs(settings(home)).filter((d) => d === modDir).length, 1);
+
+  run(pkg, home, "setup", "--remove");
+  const s = settings(home);
+  const env = s.env as Record<string, unknown>;
+  // User owned the key: it survives as "" or remains present
+  assert.ok("CLAUDE_CODE_PLUGIN_DIRS" in env || (typeof env.CLAUDE_CODE_PLUGIN_DIRS === "string"), "key preserved for user");
+});
+
+test("user-owned key with other entries keeps those entries on remove", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
   writeFileSync(
     join(home, ".claude", "settings.json"),
     JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: "/user/plugin" } }, null, 2) + "\n",
@@ -263,11 +310,9 @@ test("setup --remove does not delete PLUGIN_DIRS key when user owned it", () => 
   run(pkg, home, "setup", "--remove");
 
   const s = settings(home);
-  const env = s.env as Record<string, unknown> | undefined;
-  // Should still have the user's entries
-  assert.ok(env !== undefined, "env preserved");
-  assert.ok(typeof env!.CLAUDE_CODE_PLUGIN_DIRS === "string", "PLUGIN_DIRS key kept");
-  assert.ok((env!.CLAUDE_CODE_PLUGIN_DIRS as string).includes("/user/plugin"), "user entry preserved");
+  const env = s.env as Record<string, unknown>;
+  assert.ok(typeof env.CLAUDE_CODE_PLUGIN_DIRS === "string", "key preserved");
+  assert.ok((env.CLAUDE_CODE_PLUGIN_DIRS as string).includes("/user/plugin"), "user entry preserved");
 });
 
 test("setup does not overwrite a non-string PLUGIN_DIRS value", () => {
@@ -292,7 +337,6 @@ test("setup does not duplicate a tilde-form entry", () => {
   const pkg = makePkg();
   const home = makeHome();
 
-  // Write a tilde-form entry that expands to the mod path
   const modDir = join(home, ".claude", "mods", "asenq");
   const tildeForm = modDir.replace(home, "~");
   writeFileSync(
@@ -302,8 +346,21 @@ test("setup does not duplicate a tilde-form entry", () => {
 
   run(pkg, home, "setup");
   const dirs = pluginDirs(settings(home));
-  // Should not have added a second entry
   assert.equal(dirs.length, 1, "no duplicate entry for tilde form");
+});
+
+test("setup does not leave behind env:{} that asenq created", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  // No pre-existing env key
+  writeFileSync(join(home, ".claude", "settings.json"), "{}\n");
+
+  run(pkg, home, "setup");
+  run(pkg, home, "setup", "--remove");
+
+  const s = settings(home);
+  assert.ok(!("env" in s) || s.env === undefined, "env removed since asenq created it");
 });
 
 // --- F-10: doctor ---

@@ -107,6 +107,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
     case "tail": {
       const tailClient = new AsenqClient({
         autoStart: true,
+        maxReconnects: 10,
         onPush: (p) => {
           if (p.push !== "event") return;
           const e: TailEvent = p.event;
@@ -127,9 +128,17 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
             out(`${hhmmss(Date.now())} read ${stream}: ${e.state.unread} unread`);
           }
         },
-        onReconnect: async () => void (await tailClient.request("tail")),
+        onReconnect: async () => {
+          process.stderr.write("asenq tail: connected\n");
+          await tailClient.request("tail");
+        },
+        onDisconnect: () => {
+          process.stderr.write("asenq tail: reconnect limit reached\n");
+          process.exit(1);
+        },
       });
       client.close();
+      process.stderr.write("asenq tail: connected\n");
       await tailClient.request("tail");
       process.on("SIGINT", () => {
         tailClient.close();

@@ -7,8 +7,11 @@ import { editJson, isObj, report, type Json } from "./jsonfile.js";
 /** The shipped mods directory: `<package root>/mods`. */
 export const modsSourceDir = (): string => fileURLToPath(new URL("../../../mods", import.meta.url));
 
-/** Marker file inside the mod folder recording that asenq created PLUGIN_DIRS. */
-const CREATED_MARKER = ".asenq-plugin-dirs-created";
+/**
+ * Marker file OUTSIDE the mod folder (so a stale refresh that rmSync's the mod doesn't delete it).
+ * Lives at `~/.claude/mods/.asenq-plugin-dirs-created`.
+ */
+const markerPath = (claudeBase: string): string => join(claudeBase, "mods", ".asenq-plugin-dirs-created");
 
 const SKIP_PATTERNS = [/\.test\./, /\.claude-plugin\/types\//];
 
@@ -81,21 +84,23 @@ export function installMod(claudeBase: string, runtime: string, cli: string): nu
   }
 
   // Add to PLUGIN_DIRS
-  addPluginDir(join(claudeBase, "settings.json"), modDir);
+  addPluginDir(claudeBase, modDir);
   return 0;
 }
 
 /** Removes the mod folder and its PLUGIN_DIRS entry. */
 export function removeMod(claudeBase: string): void {
   const modDir = join(claudeBase, "mods", "asenq");
-  const markerPath = join(modDir, CREATED_MARKER);
-  const asenqCreated = existsSync(markerPath);
+  const marker = markerPath(claudeBase);
+  const asenqCreated = existsSync(marker);
 
   if (existsSync(modDir)) {
     rmSync(modDir, { recursive: true });
     report("-", modDir);
   }
-  removePluginDir(join(claudeBase, "settings.json"), modDir, asenqCreated);
+  if (asenqCreated) rmSync(marker, { force: true });
+
+  removePluginDir(claudeBase, modDir, asenqCreated);
 }
 
 /**
@@ -103,11 +108,14 @@ export function removeMod(claudeBase: string): void {
  * Uses `:` as the path-list separator (POSIX standard).
  * If PLUGIN_DIRS was absent and asenq creates it, writes a marker file.
  */
-function addPluginDir(settingsPath: string, modDir: string): void {
+function addPluginDir(claudeBase: string, modDir: string): void {
+  const settingsPath = join(claudeBase, "settings.json");
   if (!existsSync(settingsPath)) return;
   let changed = false;
   let wasCreated = false;
+  let envExisted = false;
   editJson(settingsPath, (s) => {
+    envExisted = isObj(s.env);
     const env = (isObj(s.env) ? s.env : (s.env = {})) as Json;
     const raw = env.CLAUDE_CODE_PLUGIN_DIRS;
     // If the existing value is not a string and not undefined, don't overwrite (F-09)
@@ -134,34 +142,38 @@ function addPluginDir(settingsPath: string, modDir: string): void {
     return;
   }
   report("+", `${settingsPath} env.CLAUDE_CODE_PLUGIN_DIRS: ${modDir}`);
-  // Record that asenq created the key (F-09)
+  // Record that asenq created the key (F-09): marker is outside the mod folder
   if (wasCreated) {
-    const markerPath = join(modDir, CREATED_MARKER);
-    if (existsSync(join(modDir))) writeFileSync(markerPath, "");
+    mkdirSync(join(claudeBase, "mods"), { recursive: true });
+    writeFileSync(markerPath(claudeBase), "");
   }
 }
 
-/** Removes `modDir` from `env.CLAUDE_CODE_PLUGIN_DIRS`, cleaning up if empty and asenq created it. */
-function removePluginDir(settingsPath: string, modDir: string, asenqCreated: boolean): void {
+/** Removes `modDir` from `env.CLAUDE_CODE_PLUGIN_DIRS`. */
+function removePluginDir(claudeBase: string, modDir: string, asenqCreated: boolean): void {
+  const settingsPath = join(claudeBase, "settings.json");
   if (!existsSync(settingsPath)) return;
+
   let changed = false;
   editJson(settingsPath, (s) => {
     if (!isObj(s.env)) return;
     const env = s.env as Json;
     const current = typeof env.CLAUDE_CODE_PLUGIN_DIRS === "string" ? env.CLAUDE_CODE_PLUGIN_DIRS : "";
-    if (!current) return;
+    if (!current && current !== "") return;
     const dirs = current.split(":").filter((d) => d && expandTilde(d) !== modDir);
-    if (dirs.length === current.split(":").filter(Boolean).length) return;
-    if (dirs.length === 0 && asenqCreated) {
-      // Asenq created the key and it's now empty: delete it
-      delete env.CLAUDE_CODE_PLUGIN_DIRS;
-      if (Object.keys(env).length === 0) delete s.env;
-    } else if (dirs.length === 0) {
-      // User owned the key, just clear the value
-      delete env.CLAUDE_CODE_PLUGIN_DIRS;
+    if (current && dirs.length === current.split(":").filter(Boolean).length) return;
+    if (dirs.length === 0) {
+      if (asenqCreated) {
+        delete env.CLAUDE_CODE_PLUGIN_DIRS;
+      } else {
+        // User owned the key: leave as empty string so we don't destroy their key
+        env.CLAUDE_CODE_PLUGIN_DIRS = "";
+      }
     } else {
       env.CLAUDE_CODE_PLUGIN_DIRS = dirs.join(":");
     }
+    // If asenq created the key and env is now empty, remove env too
+    if (asenqCreated && Object.keys(env).length === 0) delete s.env;
     changed = true;
   });
   if (changed) report("-", `${settingsPath} env.CLAUDE_CODE_PLUGIN_DIRS: ${modDir}`);
