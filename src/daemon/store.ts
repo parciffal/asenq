@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS claude_lineage(
   fingerprint TEXT NOT NULL, identity_id TEXT NOT NULL, PRIMARY KEY(fingerprint,identity_id));
 CREATE INDEX IF NOT EXISTS claude_lineage_identity ON claude_lineage(identity_id);
 CREATE TABLE IF NOT EXISTS channels(name TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS channel_renames(
+  old_name TEXT PRIMARY KEY, new_name TEXT NOT NULL, renamed_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS channel_members(
   channel TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(channel,session_id));
 CREATE INDEX IF NOT EXISTS channel_members_identity ON channel_members(session_id,channel);
@@ -922,7 +924,7 @@ export class Store {
     return this.db.run("DELETE FROM channel_members WHERE channel=? AND session_id=?", name, sessionId).changes > 0;
   }
 
-  renameChannel(oldName: string, newName: string): void {
+  renameChannel(oldName: string, newName: string, at: number): void {
     this.transaction(() => {
       this.db.run("UPDATE channels SET name=? WHERE name=?", newName, oldName);
       this.db.run("UPDATE channel_members SET channel=? WHERE channel=?", newName, oldName);
@@ -932,7 +934,29 @@ export class Store {
         "UPDATE human_read_positions SET stream_key=? WHERE scope='channel' AND stream_key=?",
         newName, oldName,
       );
+      // Track the rename so sends to the old name can point at the current name.
+      // Any existing records pointing TO oldName now point to newName (chain collapse).
+      this.db.run("UPDATE channel_renames SET new_name=? WHERE new_name=?", newName, oldName);
+      // Record the direct rename (unless newName was the old_name of a prior record, clearing it).
+      this.db.run("DELETE FROM channel_renames WHERE old_name=?", newName);
+      this.db.run(
+        "INSERT OR REPLACE INTO channel_renames(old_name,new_name,renamed_at) VALUES(?,?,?)",
+        oldName, newName, at,
+      );
     });
+  }
+
+  /** Returns the current name if `name` was renamed away, following the full chain. */
+  channelRenamedTo(name: string): string | undefined {
+    const row = this.db.get<{ new_name: string }>(
+      "SELECT new_name FROM channel_renames WHERE old_name=?", name,
+    );
+    return row?.new_name;
+  }
+
+  /** Clears any rename record pointing away from `name`, allowing it to be reused. */
+  clearChannelRename(name: string): void {
+    this.db.run("DELETE FROM channel_renames WHERE old_name=?", name);
   }
 
   channelSummary(name: string): ChannelSummary {

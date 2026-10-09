@@ -29,7 +29,7 @@ export function hasMentionOpening(text: string, index: number): boolean {
 
 export type ErrCode =
   | "bad_request" | "unknown_target" | "name_taken" | "invalid_name"
-  | "unknown_channel" | "not_live" | "ambiguous_target" | "unknown_mention"
+  | "unknown_channel" | "channel_renamed" | "not_live" | "ambiguous_target" | "unknown_mention"
   | "too_large" | "not_registered" | "not_permitted" | "no_session" | "rate_limited" | "internal";
 
 export type Req = { id: number; op: string; [k: string]: unknown };

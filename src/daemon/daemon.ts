@@ -1943,7 +1943,10 @@ export class Daemon {
       const changed = action === "create" ? this.store.createChannel(name)
         : action === "add" ? this.store.addChannelMember(name, sessionId!)
         : this.store.removeChannelMember(name, sessionId!);
-      if (changed && action === "create" && sessionId !== undefined) this.store.addChannelMember(name, sessionId);
+      if (changed && action === "create") {
+        this.store.clearChannelRename(name);
+        if (sessionId !== undefined) this.store.addChannelMember(name, sessionId);
+      }
       const channel = this.store.channelSummary(name);
       const event = changed ? this.store.appendEvent({
         type: "channel", action: action === "create" ? "created" : "updated", channel,
@@ -1968,7 +1971,7 @@ export class Daemon {
     if (oldName === newName) return { channel: this.store.channelSummary(oldName) };
     if (this.store.hasChannel(newName)) throw new AsenqError("name_taken", `channel name "${newName}" is taken`);
     const members = this.store.channelMembers(oldName);
-    this.store.renameChannel(oldName, newName);
+    this.store.renameChannel(oldName, newName, this.now());
     const channel = this.store.channelSummary(newName);
     this.emit({ type: "channel", action: "renamed", channel, oldName });
     // Send a system note to every current member
@@ -1977,12 +1980,12 @@ export class Daemon {
       const session = this.store.session(member.id);
       const target = session ?? member;
       const note: MsgRow = {
-        id: newId("m_"), from_name: "human", from_session: null, to_name: target.name, to_session: member.id,
+        id: newId("m_"), from_name: "asenq", from_session: null, to_name: target.name, to_session: member.id,
         channel: null, text: `channel ${oldName} is now ${newName}`, kind: "status", thread: null,
         reply_to: null, done: 0, status: "queued", reason: null, attempts: 0,
         created_at: now, updated_at: now, ord: 0,
       };
-      void Promise.resolve(this.routeOne({ kind: "human" }, target, note)).catch((e) => this.log(`channel rename note failed: ${String(e)}`));
+      void Promise.resolve(this.routeOne({ kind: "asenq" }, target, note)).catch((e) => this.log(`channel rename note failed: ${String(e)}`));
     }
     return { channel };
   }
@@ -2061,7 +2064,11 @@ export class Daemon {
         if (s.kind !== "agent" || member.id !== s.session.id) targets.set(member.id, member);
       }
     }
-    if (!this.store.hasChannel(channel)) this.mutateChannel(channel, "create");
+    if (!this.store.hasChannel(channel)) {
+      const current = this.store.channelRenamedTo(channel);
+      if (current) throw new AsenqError("channel_renamed", `channel "${channel}" was renamed to "${current}"`);
+      this.mutateChannel(channel, "create");
+    }
     const now = this.now();
     const row: MsgRow = {
       id: newId("m_"), from_name: this.senderName(s), from_session: s.kind === "agent" ? s.session.id : null,
