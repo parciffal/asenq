@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { AsenqClient } from "../src/shared/client.js";
+import type { ClientOpts } from "../src/shared/client.js";
 import { GRACE_MS, type SendResult, type SessionIdentity, type StoredMessage } from "../src/shared/protocol.js";
 import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
@@ -41,12 +42,13 @@ const lineText = (line: TerminalLine | undefined): string =>
   line === undefined ? "" : typeof line === "string" ? line : line.map((span) => span.text).join("");
 
 /** Runs the real ui against the test daemon with a recording screen instead of a TTY. */
-async function startConsole(columns: number, rows: number, client?: ConsoleDeps["client"]): Promise<Console> {
+async function startConsole(columns: number, rows: number, client?: ConsoleDeps["client"], deps: Pick<ConsoleDeps, "scan" | "now" | "schedule"> = {}): Promise<Console> {
   let handlers: TerminalAdapterOptions = {};
   let frame: TerminalFrame = { lines: [] };
   const size = { columns, rows };
   const app = new ConsoleApp({
     ...(client ? { client } : {}),
+    ...deps,
     screen: (options) => {
       handlers = options;
       return { size, start() {}, render(next) { frame = next; }, cleanup() {} };
@@ -443,6 +445,21 @@ test("compact tabs remain mouse reachable without stealing the connection hit ar
   await ui.press("s");
   await ui.click(ui.rows()[0].indexOf("A"));
   assert.deepEqual(ui.rows().slice(1), before, "Activity mouse target selects the same view as its key");
+});
+
+test("the Map tab stays mouse reachable at compact widths and shows a too-small notice below the scene minimum", async () => {
+  env = await startEnv();
+  const ui = await startConsole(100, 24, undefined, { scan: async () => [] });
+  for (const columns of [100, 60, 40, 30, 24, 20]) {
+    await ui.resize(columns, 24);
+    await ui.press("s");
+    const header = ui.rows()[0];
+    const column = header.includes("Map") ? header.indexOf("Map") : header.indexOf("M");
+    assert.ok(column >= 0 && column < header.indexOf("●"), `Map precedes the connection symbol at ${columns}: ${header}`);
+    await ui.click(column);
+    assert.ok(ui.rows().some((row) => /NETWATCH|TOO SMALL/.test(row)), `Map opened at ${columns}:\n${ui.rows().join("\n")}`);
+    assertWithin(ui);
+  }
 });
 
 test("wrapping keeps every visible character within the cell width", () => {
@@ -2607,4 +2624,261 @@ test("replace session keeps the destination's history, drafts and read marker se
   assert.ok(!ui.rows().some((row) => row.includes("source-draft")), "the source draft is not adopted by the destination");
   assert.equal((await human.readState({ scope: "session", sessionId: source.session.id })).unread, 1, "opening the destination does not clear the source's marker");
   assertWithin(ui);
+});
+
+// ---------------------------------------------------------------- Map tab
+
+/** Injected Map-tab timer: `tick` plays what the 100ms interval would, and the counters expose its lifecycle. */
+function mapTimer() {
+  const state = { running: 0, started: 0, cancelled: 0, fn: undefined as (() => void) | undefined };
+  return {
+    state,
+    schedule(fn: () => void): () => void {
+      state.running++;
+      state.started++;
+      state.fn = fn;
+      return () => {
+        state.running--;
+        state.cancelled++;
+        if (state.fn === fn) state.fn = undefined;
+      };
+    },
+    /** Runs the last scheduled callback `count` times, even if it was cancelled (a stale timer must be inert). */
+    tick(count = 1): void {
+      for (let i = 0; i < count; i++) state.fn?.();
+    },
+  };
+}
+
+type MapFleet = { boss: Adapter; alpha: Adapter };
+
+/** claude orchestrator `boss-queen` leading omp worker `wrk-alpha`. */
+async function mapFleet(e: TestEnv): Promise<MapFleet> {
+  const human = e.human();
+  const boss = await e.adapter("claude", "map-boss", "boss-queen", { cwd: "/work/boss" });
+  const alpha = await e.adapter("omp", "map-alpha", "wrk-alpha", { cwd: "/work/alpha" });
+  await human.request("set_role", { name: "boss-queen", role: "orchestrator" });
+  await human.request("set_role", { name: "wrk-alpha", role: "worker" });
+  await human.request("channel_create", { channel: "ops" });
+  for (const name of ["boss-queen", "wrk-alpha"]) await human.request("channel_add", { channel: "ops", name });
+  return { boss, alpha };
+}
+
+const hasRow = (ui: Console, text: string): boolean => ui.rows().some((row) => row.includes(text));
+const noDaemon = (options: ClientOpts): AsenqClient => new AsenqClient({ ...options, autoStart: false });
+/** The row under the TARGET header: names the selected bug, or a hint when none is selected. */
+const mapTarget = (ui: Console): string => {
+  const rows = ui.rows();
+  const header = rows.findIndex((row) => row.includes("TARGET"));
+  return header < 0 ? "" : rows[header + 1] ?? "";
+};
+
+async function openMap(columns = 160, rows = 48, deps: Pick<ConsoleDeps, "scan" | "now" | "schedule"> = {}): Promise<Console> {
+  const ui = await startConsole(columns, rows, undefined, { scan: async () => [], ...deps });
+  await ui.press("m");
+  return ui;
+}
+
+test("the tab bar has a Map tab and m opens the bug-map with its panels and the console footer hints", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const timer = mapTimer();
+  const ui = await startConsole(160, 48, undefined, { scan: async () => [], schedule: timer.schedule });
+  assert.ok(ui.rows()[0].includes("Map"), ui.rows()[0]);
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "boss-queen") && hasRow(ui, "wrk-alpha"), "sessions drawn on the map");
+  assert.ok(hasRow(ui, "TARGET") && hasRow(ui, "NETWATCH"), ui.rows().join("\n"));
+  assert.ok(!hasRow(ui, "SIGNAL LOST"));
+  assert.ok(ui.rows()[0].includes("Map"), "the console tab bar stays above the scene");
+  assert.equal(ui.rows().length, ui.size.rows, "the scene fills the body and the console footer");
+  const footer = ui.rows().at(-1)!;
+  assert.ok(footer.includes("select") && footer.includes("rescan"), `console footer carries the map hints: ${footer}`);
+  assert.ok(!ui.rows().slice(0, -1).some((row) => row.includes("rescan")), "the scene's own key-hint row is dropped");
+  assertWithin(ui);
+});
+
+test("Left/Right switch tabs from the tab bar into and out of the Map tab", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await openMap();
+  await ui.until(() => hasRow(ui, "NETWATCH"), "map shown");
+  await ui.press("s");
+  assert.ok(!hasRow(ui, "NETWATCH"));
+  await ui.press("SHIFT_TAB"); // list → tab bar
+  for (let i = 0; i < 4; i++) await ui.press("RIGHT");
+  await ui.until(() => hasRow(ui, "NETWATCH"), "four Right presses reach the Map tab");
+  await ui.press("RIGHT");
+  await ui.until(() => !hasRow(ui, "NETWATCH"), "Right from the Map tab wraps to Sessions");
+  await ui.press("LEFT");
+  await ui.until(() => hasRow(ui, "NETWATCH"), "Left from Sessions wraps back to Map");
+});
+
+test("clicking the Map tab opens it and Esc returns to Sessions", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
+  await ui.click(ui.rows()[0].indexOf("Map") + 1, 0);
+  await ui.until(() => hasRow(ui, "NETWATCH") && hasRow(ui, "wrk-alpha"), "map opened by mouse");
+  await ui.press("ESCAPE");
+  assert.ok(!hasRow(ui, "NETWATCH"), "Esc keeps its console meaning: back to Sessions");
+});
+
+test("Tab selects bugs on the map instead of moving console focus, and f filters by harness", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await openMap();
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "initial world");
+  const names = ["boss-queen", "wrk-alpha"];
+  const selected = (): string[] => names.filter((n) => mapTarget(ui).includes(n));
+  assert.deepEqual(selected(), [], "nothing is selected initially");
+  await ui.press("TAB");
+  assert.equal(selected().length, 1, `Tab selects one bug: ${mapTarget(ui)}`);
+  const first = mapTarget(ui);
+  await ui.press("TAB");
+  assert.notEqual(mapTarget(ui), first, "a second Tab selects another bug");
+  await ui.press("SHIFT_TAB");
+  assert.equal(mapTarget(ui), first, "Shift-Tab goes back");
+  assert.ok(ui.rows().at(-1)!.includes("select"), "console focus did not move to another region");
+  await ui.press("f"); // claude: the orchestrator remains, the omp worker is hidden
+  // the selected orchestrator's TARGET panel still lists its drone, so look for the worker's own plate only
+  assert.ok(hasRow(ui, "boss-queen") && !ui.rows().some((row) => row.includes("wrk-alpha") && !row.includes("DRONES")), ui.rows().join("\n"));
+  await ui.press("f"); // omp: the worker and the orchestrator leading it
+  assert.ok(hasRow(ui, "wrk-alpha") && hasRow(ui, "boss-queen"));
+  assert.ok(hasRow(ui, "NETWATCH"), "f never reached the console's activity filter");
+});
+
+test("a mouse press on a bug selects it, offset by the tab bar row", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await openMap();
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "initial world");
+  const row = ui.rows().findIndex((r) => r.includes("wrk-alpha"));
+  assert.ok(row > 0, "the bug is drawn below the tab bar");
+  await ui.click(ui.rows()[row].indexOf("wrk-alpha") + 2, row);
+  assert.ok(mapTarget(ui).includes("wrk-alpha"), `TARGET shows the clicked bug: ${mapTarget(ui)}`);
+  assert.ok(!mapTarget(ui).includes("boss-queen"));
+});
+
+test("messages produce NETWATCH feed rows, including ones sent before the tab was opened", async () => {
+  env = await startEnv();
+  const { boss, alpha } = await mapFleet(env);
+  const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
+  await boss.client.request("send", { to: "wrk-alpha", text: "ship ledger", kind: "task" });
+  await alpha.nextDelivery();
+  await ui.until(() => ui.app.idle().then(() => true), "console processed the message event");
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "ship ledger"), "feed row present on opening");
+  await boss.client.request("channel_send", { channel: "ops", text: "standup in five" });
+  await ui.until(() => hasRow(ui, "standup in five"), "live feed row");
+  assert.equal(ui.rows().join("\n").split("ship ledger").length - 1, 1, "status updates do not duplicate the row");
+});
+
+test("the animation timer and list polling run only while the Map tab is shown", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const timer = mapTimer();
+  let lists = 0;
+  let scans = 0;
+  const counting = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient(options);
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      if (op === "list") lists++;
+      return request(op, params);
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, counting, { scan: async () => (scans++, []), schedule: timer.schedule });
+  await ui.press("a");
+  timer.tick(60);
+  assert.deepEqual([lists, scans, timer.state.started], [0, 0, 0], "no timer, list or scan on other tabs");
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  assert.deepEqual([timer.state.running, lists, scans], [1, 1, 1], "entering fetches once and starts one timer");
+  timer.tick(19);
+  await ui.app.idle();
+  assert.equal(lists, 1, "no relist before 2s");
+  timer.tick(1);
+  await ui.until(() => lists === 2, "relist at 2s");
+  timer.tick(30);
+  await ui.until(() => scans === 2, "rescan at 5s");
+  await ui.press("s");
+  assert.deepEqual([timer.state.running, timer.state.cancelled], [0, 1], "leaving cancels the timer");
+  const [before, scanned] = [lists, scans];
+  timer.tick(100); // a stale tick must be inert
+  await ui.app.idle();
+  assert.deepEqual([lists, scans], [before, scanned], "nothing polls while another tab is shown");
+  await ui.press("m");
+  assert.equal(timer.state.running, 1, "re-entering starts a fresh timer");
+  ui.close();
+  assert.equal(timer.state.running, 0, "quitting cancels the timer");
+});
+
+test("the Map tab marks nothing read and opens no composer or conversation", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  await alpha.client.request("send", { to: "human", text: "please read me" });
+  const human = env.human();
+  const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  for (const key of ["TAB", "ENTER", "TAB", "ENTER", "r", "DOWN", "RIGHT", "u"]) await ui.press(key);
+  assert.equal((await human.readState({ scope: "session", sessionId: alpha.session.id })).unread, 1, "unread marker untouched");
+  assert.ok(!hasRow(ui, "Enter send") && !hasRow(ui, "please read me"), ui.rows().join("\n"));
+  await alpha.client.request("send", { to: "human", text: "second note" });
+  await ui.until(() => ui.app.idle().then(() => true), "event applied");
+  assert.equal((await human.readState({ scope: "session", sessionId: alpha.session.id })).unread, 2, "new arrivals stay unread");
+});
+
+test("the palette lists Map under Navigate with its shortcut and opens it", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
+  await ui.press("?");
+  const row = ui.rows().find((r) => /\bMap\b/.test(r) && r.includes("m"));
+  assert.ok(row, ui.rows().join("\n"));
+  await ui.type("Map");
+  await ui.press("ENTER");
+  await ui.until(() => hasRow(ui, "NETWATCH"), "palette action opened the map");
+  await ui.press("?");
+  assert.ok(hasRow(ui, "type to filter"), "console keys still work on the Map tab");
+  assert.ok(!hasRow(ui, "NETWATCH"), "overlays replace the map");
+  await ui.press("f");
+  assert.ok(ui.rows().some((row) => row.startsWith("? f")), "keys go to the palette filter while it is open");
+  await ui.press("ESCAPE");
+  assert.ok(hasRow(ui, "NETWATCH"), "closing the palette returns to the map");
+});
+
+test("an unreachable daemon shows SIGNAL LOST on the map and it recovers when the daemon returns", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const timer = mapTimer();
+  const ui = await startConsole(160, 48, noDaemon, { scan: async () => [], schedule: timer.schedule });
+  await ui.press("m");
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  await env.daemon.close();
+  timer.tick(20);
+  await ui.until(() => hasRow(ui, "SIGNAL LOST"), "SIGNAL LOST after the daemon goes away");
+  assert.ok(hasRow(ui, "netrunner"), "the netrunner survives a lost signal");
+  await env.restart();
+  await ui.until(async () => {
+    timer.tick(20);
+    await ui.app.idle();
+    return hasRow(ui, "LINK ESTABLISHED") && !hasRow(ui, "SIGNAL LOST");
+  }, "recovery on a later poll");
+});
+
+test("the Map tab survives tiny terminals without throwing", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  const ui = await openMap();
+  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  for (const [columns, rows] of [[1, 1], [5, 3], [10, 4], [30, 8], [59, 19], [60, 22], [80, 5]]) {
+    await ui.resize(columns, rows);
+    assertWithin(ui);
+    await ui.press("TAB");
+    await ui.click(0, Math.min(rows - 1, 2));
+  }
+  await ui.resize(160, 48);
+  await ui.until(() => hasRow(ui, "NETWATCH"), "recovers at full size");
 });

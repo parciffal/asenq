@@ -259,11 +259,11 @@ asenq --version
 
 ## TUI (keys and palette)
 
-`asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues.
+`asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues. The fifth tab, **Map**, is the live [bug-map](#asenq-viz-live-bug-map) inside the console (see below).
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Focus tabs → list → conversation → composer. |
+| `Tab` / `Shift+Tab` | Focus tabs → list → conversation → composer (on **Map**: select the next / previous bug). |
 | `↑` / `↓`, `Enter` | Move/open list items; select messages and open details. |
 | `/`, `Ctrl+K` | Search current/former names; quick-jump to sessions, archives or `#channel`. |
 | `PageUp` / `PageDown`, `Home`, `End` | Scroll; top loads older history; End jumps to latest. |
@@ -271,8 +271,8 @@ asenq --version
 | `Ctrl+E` | Full editor: kind, thread, reply-to, done. |
 | `u` | Set an **unread reminder** on the latest eligible item. |
 | `Ctrl+X` | Close selected Sessions list row after y/n confirmation; not a composer binding. |
-| `s`, `i`, `#`, `a` | Sessions, Inbox, Channels, Activity. |
-| `v`, `f` | Inbox grouped/feed toggle; Activity read-marker event filter. |
+| `s`, `i`, `#`, `a`, `m` | Sessions, Inbox, Channels, Activity, Map. |
+| `v`, `f` | Inbox grouped/feed toggle; Activity read-marker event filter (on **Map**, `f` filters by harness). |
 | `?` | Searchable action palette. |
 | `Esc`, `q` | Dismiss/back/quit. |
 
@@ -286,6 +286,8 @@ Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste ne
 
 `asenq viz` is a full-screen, read-only, animated cyberpunk view of everything running: the human is a yellow **netrunner** node, each orchestrator a large hive-queen bug, each worker a small bug. Links run human → orchestrators and orchestrator → workers (shared channel; a worker with no orchestrator hangs off the human), and direct messages travel along them as packets coloured by kind (task yellow, result green, status cyan, chat white, control red). A feed panel lists recent messages and a TARGET panel shows the selected bug. Needs a TTY; it never sends anything.
 
+The same view is the **Map** tab of `asenq tui` (`m`, or click the tab): it sits under the console's tab bar and above its footer, which carries the key hints. On the Map tab the keys below apply (arrows, `h j k l`, `Tab`, `Enter`, `f`, `u`, `r` and a click on a bug) while no palette, form, finder or confirmation is open; `s i # a m`, `?`, `Ctrl+K`, `q` and `Esc` keep their console meaning (`Esc` returns to Sessions). With the tab bar focused, `←`/`→` still switch tabs. The Map tab only lists sessions, scans processes and animates while it is the shown tab, never reads, marks or composes anything, and shows **SIGNAL LOST** while the daemon is unreachable. `asenq viz` is the standalone full-screen form of the same view.
+
 | Key | Action |
 |---|---|
 | `↑ ↓ ← →`, `h j k l` | Select the nearest bug in that direction. |
@@ -294,7 +296,7 @@ Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste ne
 | `f` | Filter by harness: all → claude → omp → opencode → codex → all. |
 | `u` | Show / hide feral bugs. |
 | `r` | Rescan processes and refresh now. |
-| `q`, `Esc`, `Ctrl+C` | Quit. |
+| `q`, `Esc`, `Ctrl+C` | Quit (standalone `asenq viz` only; in the Map tab they keep their console meaning). |
 
 | Species | Harness | Colour |
 |---|---|---|

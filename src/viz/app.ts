@@ -1,15 +1,13 @@
 import { AsenqClient } from "../shared/client.js";
 import type { ClientOpts } from "../shared/client.js";
-import type { ListedSession, Push, StoredMessage } from "../shared/protocol.js";
+import type { ListedSession, Push } from "../shared/protocol.js";
 import type { Screen } from "../tui/app.js";
-import { sanitizeTerminalText, TerminalAdapter, TerminalUnavailableError } from "../tui/terminal.js";
+import { TerminalAdapter, TerminalUnavailableError } from "../tui/terminal.js";
 import type { KeyInput, MouseInput, TerminalAdapterOptions } from "../tui/terminal.js";
-import { buildWorld } from "./model.js";
+import { REQUEST_TIMEOUT_MS, TICK_MS, VizMap, within } from "./map.js";
+import type { MapDue } from "./map.js";
 import { scanProcesses } from "./scan.js";
 import type { ProcInfo } from "./scan.js";
-import { navigate, renderScene, visibleBugs } from "./scene.js";
-import { VIZ_HARNESSES } from "./types.js";
-import type { Bug, Direction, FeedLine, Hit, Packet, VizUi, World } from "./types.js";
 
 export type VizDeps = {
   client?(options: ClientOpts): AsenqClient;
@@ -22,51 +20,13 @@ export type VizDeps = {
   schedule?(fn: () => void, ms: number): () => void;
 };
 
-/** Animation frame length; one setInterval runs at this period and everything else is counted off it. */
-const TICK_MS = 100;
-const LIST_MS = 2000;
-const SCAN_MS = 5000;
-const PACKET_MS = 1400;
-const FEED_MAX = 50;
-const PACKET_MAX = 100;
-const SEEN_MAX = 500;
-/** A daemon that does not answer within this long is treated as lost (a reconnecting client otherwise waits indefinitely). */
-const REQUEST_TIMEOUT_MS = 4000;
-const TEXT_MAX = 200;
-
-type LivePacket = Omit<Packet, "ageMs"> & { born: number };
-
-/** Rejects if `task` takes longer than `ms`; the late result is discarded. */
-function within<T>(task: Promise<T>, ms: number): Promise<T> {
-  const { promise, resolve, reject } = Promise.withResolvers<T>();
-  const timer = setTimeout(() => reject(new Error("asenq daemon timed out")), ms);
-  timer.unref?.();
-  task.then(resolve, reject).finally(() => clearTimeout(timer));
-  return promise;
-}
-
-const clean = (text: string): string => sanitizeTerminalText(text).slice(0, TEXT_MAX);
-
+/** Standalone full-screen `asenq viz`: a client, a timer and a screen around a `VizMap`. */
 export class VizApp {
   private readonly screen: Screen;
   private readonly client: AsenqClient;
   private readonly scan: () => Promise<ProcInfo[]>;
-  private readonly now: () => number;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
-  private sessions: ListedSession[] = [];
-  private procs: ProcInfo[] = [];
-  private feed: FeedLine[] = [];
-  private connection: World["connection"] = "offline";
-  private world: World;
-  private readonly ui: VizUi = { selectedId: null, filter: null, focus: false, feral: true };
-  private packets: LivePacket[] = [];
-  private hits: Hit[] = [];
-  private readonly seen = new Set<string>();
-  private feedSeq = 0;
-  private clock = 0;
-  private tick = 0;
-  private lastList = 0;
-  private lastScan = 0;
+  private readonly map: VizMap;
   private subscribed = false;
   private refreshing = false;
   private loadSeq = 0;
@@ -96,12 +56,11 @@ export class VizApp {
     };
     this.screen = deps.screen ? deps.screen(screenOptions) : new TerminalAdapter(screenOptions);
     this.scan = deps.scan ?? (() => scanProcesses());
-    this.now = deps.now ?? Date.now;
+    this.map = new VizMap(deps.now);
     this.schedule = deps.schedule ?? ((fn, ms) => {
       const timer = setInterval(fn, ms);
       return () => clearInterval(timer);
     });
-    this.world = this.build();
   }
 
   async run(): Promise<number> {
@@ -130,18 +89,13 @@ export class VizApp {
    */
   step(ms: number): void {
     if (this.closed) return;
-    this.clock += ms;
-    this.tick = Math.floor(this.clock / TICK_MS);
-    this.packets = this.packets.filter((p) => this.clock - p.born < PACKET_MS);
-    if (this.clock - this.lastList >= LIST_MS) {
-      this.lastList = this.clock;
-      this.track(this.refresh());
-    }
-    if (this.clock - this.lastScan >= SCAN_MS) {
-      this.lastScan = this.clock;
-      this.track(this.rescan());
-    }
+    this.fetch(this.map.step(ms));
     this.render();
+  }
+
+  private fetch(due: MapDue): void {
+    if (due.list) this.track(this.refresh());
+    if (due.scan) this.track(this.rescan());
   }
 
   private track(task: Promise<unknown>): void {
@@ -159,26 +113,6 @@ export class VizApp {
   }
 
   // ------------------------------------------------------------------ data
-
-  private build(): World {
-    return buildWorld({
-      sessions: this.sessions, procs: this.procs, feed: this.feed, connection: this.connection, now: this.now(),
-    });
-  }
-
-  /** Rebuilds the world from current inputs, drops a selection/filter-hidden bug and redraws. */
-  private rebuild(): void {
-    this.world = this.build();
-    this.reresolveFeed();
-    this.world = this.build();
-    this.reconcile();
-    this.render();
-  }
-
-  private reconcile(): void {
-    const { selectedId } = this.ui;
-    if (selectedId !== null && !visibleBugs(this.world, this.ui).some((b) => b.id === selectedId)) this.ui.selectedId = null;
-  }
 
   /** Coalesces concurrent requests: a request during a refresh schedules exactly one more pass. */
   private async refresh(): Promise<void> {
@@ -201,6 +135,8 @@ export class VizApp {
   /** Subscribes (once per connection) then lists; any failure shows the SIGNAL LOST world and retries on the next poll. */
   private async load(): Promise<void> {
     const attempt = ++this.loadSeq;
+    let sessions: ListedSession[] = [];
+    let connection: "connected" | "offline" = "offline";
     try {
       await this.client.connect();
       if (!this.subscribed) {
@@ -208,22 +144,24 @@ export class VizApp {
         if (attempt === this.loadSeq) this.subscribed = true;
       }
       const reply = await within(this.client.request("list"), REQUEST_TIMEOUT_MS);
-      this.sessions = reply.sessions as ListedSession[];
-      this.connection = "connected";
+      sessions = reply.sessions as ListedSession[];
+      connection = "connected";
     } catch {
       this.subscribed = false;
-      this.sessions = [];
-      this.connection = "offline";
     }
-    if (!this.closed) this.rebuild();
+    if (this.closed) return;
+    this.map.setSessions(sessions, connection);
+    this.render();
   }
 
   private async rescan(): Promise<void> {
     if (this.scanning || this.closed) return;
     this.scanning = true;
     try {
-      this.procs = await this.scan();
-      if (!this.closed) this.rebuild();
+      const procs = await this.scan();
+      if (this.closed) return;
+      this.map.setProcs(procs);
+      this.render();
     } finally {
       this.scanning = false;
     }
@@ -232,120 +170,31 @@ export class VizApp {
   private push(p: Push): void {
     if (p.push !== "event" || this.closed) return;
     const event = p.event;
-    if (event.type === "message") this.message(event.msg);
-    else if (event.type === "session" || event.type === "channel" || event.type === "ping") this.track(this.refresh());
-  }
-
-  /** Resolves a message endpoint to a bug by stable session id, else by current or former name. */
-  private endpoint(sessionId: string | undefined, name: string): Bug | undefined {
-    const bugs = this.world.bugs;
-    if (name === "human") return bugs.find((b) => b.id === "human");
-    return (sessionId ? bugs.find((b) => b.id === sessionId) : undefined)
-      ?? bugs.find((b) => b.kind !== "human" && b.name === name)
-      ?? bugs.find((b) => b.kind !== "human" && b.previousNames.includes(name));
-  }
-
-  /** Resolves feed lines whose endpoint could not be found when they arrived (world not yet loaded). */
-  private reresolveFeed(): void {
-    if (!this.feed.some((l) => l.fromId === null || l.toId === null)) return;
-    this.feed = this.feed.map((l) => {
-      const from = l.fromId === null ? this.endpoint(undefined, l.from) : undefined;
-      const to = l.toId === null && !l.to.startsWith("#") ? this.endpoint(undefined, l.to) : undefined;
-      return from || to
-        ? { ...l, fromId: from?.id ?? l.fromId, toId: to?.id ?? l.toId, from: from?.name ?? l.from, to: to?.name ?? l.to }
-        : l;
-    });
-  }
-
-  private message(msg: StoredMessage): void {
-    if (this.seen.has(msg.id)) return;
-    this.seen.add(msg.id);
-    if (this.seen.size > SEEN_MAX) this.seen.delete(this.seen.values().next().value as string);
-    const channelPost = msg.to.startsWith("#");
-    const from = this.endpoint(msg.fromSessionId, msg.from);
-    const to = channelPost ? undefined : this.endpoint(msg.toSessionId, msg.to);
-    const kind = msg.kind ?? "chat";
-    const line: FeedLine = {
-      seq: ++this.feedSeq, at: msg.createdAt, fromId: from?.id ?? null, toId: to?.id ?? null,
-      from: from?.name ?? clean(msg.from), to: to?.name ?? clean(msg.to), kind,
-      text: clean(msg.text || msg.file?.summary || ""),
-    };
-    this.feed = [...this.feed, line].slice(-FEED_MAX);
-    if (from && to) {
-      this.packets = [...this.packets, { seq: line.seq, fromId: from.id, toId: to.id, kind, born: this.clock }].slice(-PACKET_MAX);
-    }
-    this.rebuild();
+    if (event.type === "message") {
+      this.map.onMessage(event.msg);
+      this.render();
+    } else if (event.type === "session" || event.type === "channel" || event.type === "ping") this.track(this.refresh());
   }
 
   // ------------------------------------------------------------------ input
 
-  private go(dir: Direction): void {
-    const next = navigate(this.world, this.ui, this.screen.size, dir);
-    if (next !== null) this.ui.selectedId = next;
-    this.render();
-  }
-
   private key(k: KeyInput): void {
     if (this.closed) return;
-    switch (k.name) {
-      case "UP": return this.go("up");
-      case "DOWN": return this.go("down");
-      case "LEFT": return this.go("left");
-      case "RIGHT": return this.go("right");
-      case "TAB": return this.go("next");
-      case "SHIFT_TAB": return this.go("prev");
-      case "ENTER":
-      case "KP_ENTER":
-        this.ui.focus = !this.ui.focus;
-        return this.render();
-      case "ESCAPE": return this.quit();
+    if (this.map.key(k)) {
+      this.fetch(this.map.take());
+      return this.render();
     }
-    if (k.ctrl || k.alt) return;
-    switch ((k.text ?? k.name).toLowerCase()) {
-      case "h": return this.go("left");
-      case "j": return this.go("down");
-      case "k": return this.go("up");
-      case "l": return this.go("right");
-      case "f":
-        this.ui.filter = VIZ_HARNESSES[(this.ui.filter === null ? 0 : VIZ_HARNESSES.indexOf(this.ui.filter) + 1)] ?? null;
-        return this.rebuild();
-      case "u":
-        this.ui.feral = !this.ui.feral;
-        return this.rebuild();
-      case "r":
-        this.lastList = this.clock;
-        this.lastScan = this.clock;
-        this.track(this.refresh());
-        this.track(this.rescan());
-        return;
-      case "q": return this.quit();
-    }
+    if (k.name === "ESCAPE" || (!k.ctrl && !k.alt && (k.text ?? k.name).toLowerCase() === "q")) this.quit();
   }
 
   private mouse(m: MouseInput): void {
     if (this.closed || m.action !== "press" || m.button !== "left") return;
-    for (let i = this.hits.length - 1; i >= 0; i--) {
-      const h = this.hits[i];
-      if (m.column >= h.column && m.column < h.column + h.width && m.row >= h.row && m.row < h.row + h.height) {
-        this.ui.selectedId = h.id;
-        return this.render();
-      }
-    }
+    if (this.map.click(m.column, m.row)) this.render();
   }
-
-  // ------------------------------------------------------------------ output
 
   private render(): void {
     if (this.closed) return;
-    const packets: Packet[] = this.packets.map(({ born, ...p }) => ({ ...p, ageMs: this.clock - born }));
-    try {
-      const scene = renderScene(this.world, packets, this.ui, this.tick, this.screen.size, this.now());
-      this.hits = scene.hits;
-      this.screen.render(scene.frame);
-    } catch (e) {
-      this.hits = [];
-      this.screen.render({ lines: [[{ text: clean(`VIZ RENDER FAULT: ${e instanceof Error ? e.message : String(e)}`), style: { foreground: "red" } }]] });
-    }
+    this.screen.render({ lines: this.map.frame(this.screen.size) });
   }
 }
 
