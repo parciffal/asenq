@@ -129,8 +129,8 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           }
         },
         onReconnect: async () => {
-          process.stderr.write("asenq tail: connected\n");
           await tailClient.request("tail");
+          process.stderr.write("asenq tail: connected\n");
         },
         onDisconnect: () => {
           process.stderr.write("asenq tail: reconnect limit reached\n");
@@ -138,8 +138,8 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
         },
       });
       client.close();
-      process.stderr.write("asenq tail: connected\n");
       await tailClient.request("tail");
+      process.stderr.write("asenq tail: connected\n");
       process.on("SIGINT", () => {
         tailClient.close();
         process.exit(0);

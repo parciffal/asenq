@@ -438,3 +438,87 @@ test("setup fails when shipped mod source is missing", () => {
   assert.equal(r.status, 1);
   assert.ok(r.out.includes("shipped mod missing") || r.out.includes("reinstall"), "reports missing mod");
 });
+
+// --- N-2: removePluginDir idempotency and safety ---
+
+test("double --remove does not modify settings on the second run", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { FOO: "1" } }, null, 2) + "\n",
+  );
+
+  run(pkg, home, "setup");
+  run(pkg, home, "setup", "--remove");
+  const after1 = readFileSync(join(home, ".claude", "settings.json"), "utf8");
+
+  run(pkg, home, "setup", "--remove");
+  const after2 = readFileSync(join(home, ".claude", "settings.json"), "utf8");
+
+  assert.equal(after1, after2, "second remove does not change the file");
+  const s = settings(home);
+  const env = s.env as Record<string, unknown>;
+  assert.equal(env.FOO, "1", "FOO preserved");
+  assert.ok(!("CLAUDE_CODE_PLUGIN_DIRS" in env), "no PLUGIN_DIRS key written");
+});
+
+test("--remove leaves an array PLUGIN_DIRS value untouched", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  // Write settings with an array value (non-string)
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: ["/a", "/b"] } }, null, 2) + "\n",
+  );
+
+  // Setup cannot add the mod dir (non-string, skipped), but remove should not touch it
+  run(pkg, home, "setup");
+  run(pkg, home, "setup", "--remove");
+
+  const s = settings(home);
+  const env = s.env as Record<string, unknown>;
+  assert.deepEqual(env.CLAUDE_CODE_PLUGIN_DIRS, ["/a", "/b"], "array value untouched");
+});
+
+test("--remove with the key absent leaves it absent", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  // Settings with env but no PLUGIN_DIRS
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { FOO: "1" } }, null, 2) + "\n",
+  );
+
+  // Setup adds the key, remove removes it. Then a second remove should not re-add it.
+  run(pkg, home, "setup");
+  run(pkg, home, "setup", "--remove");
+
+  const s = settings(home);
+  const env = s.env as Record<string, unknown>;
+  assert.ok(!("CLAUDE_CODE_PLUGIN_DIRS" in env), "key stays absent");
+  assert.equal(env.FOO, "1", "FOO untouched");
+});
+
+// --- asenqCreated && guard on env deletion ---
+
+test("setup --remove does not delete env when user created it", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  // User pre-created env with FOO
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { FOO: "1" } }, null, 2) + "\n",
+  );
+
+  run(pkg, home, "setup");
+  run(pkg, home, "setup", "--remove");
+
+  const s = settings(home);
+  assert.ok("env" in s, "env key preserved (user created it)");
+  assert.equal((s.env as Record<string, unknown>).FOO, "1", "user key preserved");
+});

@@ -158,15 +158,19 @@ function removePluginDir(claudeBase: string, modDir: string, asenqCreated: boole
   editJson(settingsPath, (s) => {
     if (!isObj(s.env)) return;
     const env = s.env as Json;
-    const current = typeof env.CLAUDE_CODE_PLUGIN_DIRS === "string" ? env.CLAUDE_CODE_PLUGIN_DIRS : "";
-    if (!current && current !== "") return;
+    // Key absent: nothing to do
+    if (!("CLAUDE_CODE_PLUGIN_DIRS" in env)) return;
+    // Not a string (array, number, etc.): don't touch it
+    if (typeof env.CLAUDE_CODE_PLUGIN_DIRS !== "string") return;
+    const current = env.CLAUDE_CODE_PLUGIN_DIRS as string;
     const dirs = current.split(":").filter((d) => d && expandTilde(d) !== modDir);
-    if (current && dirs.length === current.split(":").filter(Boolean).length) return;
+    // Our entry was not in the list: nothing to do
+    if (dirs.length === current.split(":").filter(Boolean).length) return;
     if (dirs.length === 0) {
       if (asenqCreated) {
         delete env.CLAUDE_CODE_PLUGIN_DIRS;
       } else {
-        // User owned the key: leave as empty string so we don't destroy their key
+        // User owned the key: leave as empty string
         env.CLAUDE_CODE_PLUGIN_DIRS = "";
       }
     } else {

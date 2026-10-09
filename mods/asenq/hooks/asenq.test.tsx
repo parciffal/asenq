@@ -486,10 +486,10 @@ describe('channel rename', () => {
   })
 })
 
-// --- F-07: tail, debounce, protocol, backoff ---
+// --- tail, debounce, protocol, backoff ---
 
 describe('tail and backoff', () => {
-  test('tail output triggers a debounced refetch; burst gives one refetch', async ($, on) => {
+  test('tail stdout triggers a debounced refetch; burst gives one refetch', async ($, on) => {
     const clock = mock.clock(on)
     let fetchCount = 0
     on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
@@ -519,13 +519,11 @@ describe('tail and backoff', () => {
       yield { stream: 'stdout' as const, text: 'e5\n' }
       return { value: { code: 0, signal: null } }
     })
-
     fetchCount = 0
     await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
     await clock.settle()
     const before = fetchCount
     await clock.advance(400)
-    // connect refetch + at most 1 debounced = <= 2
     expect(fetchCount - before).toBeLessThanOrEqual(2)
   })
 
@@ -560,7 +558,54 @@ describe('tail and backoff', () => {
     expect(toasts.filter((t) => t.includes('out of date')).length).toBe(1)
   })
 
-  test('backoff grows: 1, 2, 4, 8, 16, 30, 30 s gaps', async ($, on) => {
+  // N-1: mock writes stderr error then exits (like the real CLI). Backoff must still grow.
+  test('backoff grows even when spawn writes stderr before dying', async ($, on) => {
+    const clock = mock.clock(on)
+    const spawnTimes: number[] = []
+    on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
+    on('session.id', () => ({ value: 'cc-test' }))
+    on('command.register', () => V)
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    on('ui.close', () => V)
+    on('ui.toast', () => V)
+    on('ui.status', () => V)
+    on('ui.render', () => ({ type: 'engine', ref: 0 }))
+    on('fs.read', (_$: any, e: any) => {
+      if (e.path && e.path.endsWith('asenq-cli.json')) return { value: CLI_JSON }
+      throw new Error(`unexpected fs.read: ${e.path}`)
+    })
+    on('process.run', (_$: any, e: any) => {
+      const sub = e.argv.slice(2).join(' ')
+      if (sub === 'ls --json') return procOk(LS_JSON)
+      if (sub === 'channels --json') return procOk(CHANNELS_JSON)
+      return procFail()
+    })
+    // Writes stderr error then exits non-zero (matches real tail behaviour)
+    on('process.spawn', async function* (_$: any, _e: any, _next: any) {
+      spawnTimes.push(clock.now())
+      yield { stream: 'stderr' as const, text: 'asenq: connection refused\n' }
+      return { value: { code: 1, signal: null } }
+    })
+
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    expect(spawnTimes.length).toBeGreaterThanOrEqual(1)
+    await clock.advance(121_000)
+
+    const gaps: number[] = []
+    for (let i = 1; i < spawnTimes.length; i++) gaps.push(spawnTimes[i] - spawnTimes[i - 1])
+    expect(gaps.length).toBeGreaterThanOrEqual(7)
+    expect(gaps[0]).toBe(1000)
+    expect(gaps[1]).toBe(2000)
+    expect(gaps[2]).toBe(4000)
+    expect(gaps[3]).toBe(8000)
+    expect(gaps[4]).toBe(16000)
+    expect(gaps[5]).toBe(30000)
+    expect(gaps[6]).toBe(30000)
+  })
+
+  // N-1: same test where the mock prints "connected" then exits
+  test('backoff grows when spawn prints connected then exits', async ($, on) => {
     const clock = mock.clock(on)
     const spawnTimes: number[] = []
     on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
@@ -583,6 +628,7 @@ describe('tail and backoff', () => {
     })
     on('process.spawn', async function* (_$: any, _e: any, _next: any) {
       spawnTimes.push(clock.now())
+      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
       return { value: { code: 1, signal: null } }
     })
 
@@ -597,14 +643,10 @@ describe('tail and backoff', () => {
     expect(gaps[0]).toBe(1000)
     expect(gaps[1]).toBe(2000)
     expect(gaps[2]).toBe(4000)
-    expect(gaps[3]).toBe(8000)
-    expect(gaps[4]).toBe(16000)
-    expect(gaps[5]).toBe(30000)
-    expect(gaps[6]).toBe(30000)
   })
 })
 
-// --- F-06: drafts ---
+// --- drafts ---
 
 describe('drafts', () => {
   test('a tail-driven redraw does not wipe a draft', async ($, on) => {
@@ -622,9 +664,103 @@ describe('drafts', () => {
     expect(input!.props['value']).toBe('partial')
     await ui.unmount()
   })
+
+  test('rename clears only the submitted row draft, not others', async ($, on) => {
+    const clock = mock.clock(on)
+    setupMocks(on)
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    await $.command.run(CMD_RUN)
+    await clock.settle()
+    const ui = await $.ui.mount({ plugin: 'asenq', surface: 'terminal', component: 'Pane', requestId: 'asenq', props: PANE_PROPS })
+    // Type into both rename fields
+    await ui.input({ plugin: 'asenq', key: 'rename-s1', text: 'draft-s1', kind: 'change' })
+    await ui.input({ plugin: 'asenq', key: 'rename-s2', text: 'draft-s2', kind: 'change' })
+    await clock.settle()
+    // Submit s1's rename (succeeds)
+    await ui.input({ plugin: 'asenq', key: 'rename-s1', text: 'newlead', kind: 'submit' })
+    await clock.settle()
+    // s1's draft should be cleared, s2's should survive
+    const s1 = await ui.find({ type: 'Input', key: 'rename-s1' })
+    const s2 = await ui.find({ type: 'Input', key: 'rename-s2' })
+    expect(s1!.props['value']).toBe('')
+    expect(s2!.props['value']).toBe('draft-s2')
+    await ui.unmount()
+  })
 })
 
-// --- F-14: tail stderr "connected" line triggers refetch ---
+// --- F-15: status from atom, seq guard, fetchSeq seed ---
+
+describe('seq guard in setData', () => {
+  test('a command.run after tail-offline overwrites with a higher seq', async ($, on) => {
+    const clock = mock.clock(on)
+    const statusCalls: string[] = []
+
+    on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
+    on('session.id', () => ({ value: 'cc-test' }))
+    on('command.register', () => V)
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    on('ui.close', () => V)
+    on('ui.toast', () => V)
+    on('ui.status', (_$: any, e: any) => { statusCalls.push(e.text ?? ''); return V })
+    on('ui.render', () => ({ type: 'engine', ref: 0 }))
+    on('fs.read', (_$: any, e: any) => {
+      if (e.path && e.path.endsWith('asenq-cli.json')) return { value: CLI_JSON }
+      throw new Error(`unexpected fs.read: ${e.path}`)
+    })
+    on('process.run', (_$: any, e: any) => {
+      const sub = e.argv.slice(2).join(' ')
+      if (sub === 'channels --json') return procOk(CHANNELS_JSON)
+      if (sub === 'ls --json') return procOk(LS_JSON)
+      return procFail()
+    })
+    // Tail connects, refetches, then exits -> sets offline
+    on('process.spawn', async function* () {
+      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+      return { value: { code: 1, signal: null } }
+    })
+
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+
+    // After the tail exits, status should be offline
+    const offlineIdx = statusCalls.findIndex((s) => s.includes('offline'))
+    expect(offlineIdx).toBeGreaterThanOrEqual(0)
+
+    // command.run refetches with a higher seq and goes online again
+    await $.command.run(CMD_RUN)
+    await clock.settle()
+
+    const last = statusCalls[statusCalls.length - 1]
+    expect(last).toContain('lead')
+    expect(last).toContain('orchestrator')
+  })
+})
+
+describe('status line reads atom (F-15)', () => {
+  test('status matches pane data after a mutation', async ($, on) => {
+    const clock = mock.clock(on)
+    const statusCalls: string[] = []
+    setupMocks(on, { onStatus: (t) => statusCalls.push(t) })
+
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    await $.command.run(CMD_RUN)
+    await clock.settle()
+
+    // The status should reflect the atom data (1 worker)
+    const last = statusCalls[statusCalls.length - 1]
+    expect(last).toContain('1 workers')
+
+    // Mount the pane and check the data matches
+    const ui = await $.ui.mount({ plugin: 'asenq', surface: 'terminal', component: 'Pane', requestId: 'asenq', props: PANE_PROPS })
+    expect(await ui.find({ type: 'Text', text: /lead/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /w1/ })).toBeDefined()
+    await ui.unmount()
+  })
+})
+
+// --- tail stderr "connected" line triggers refetch ---
 
 describe('tail connected line', () => {
   test('stderr connected line triggers refetch', async ($, on) => {

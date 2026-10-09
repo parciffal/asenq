@@ -101,16 +101,12 @@ function startTail($: any): void {
       try {
         const tail = $.process.spawn({ argv: [...argv, 'tail'] })
 
-        let gotChunk = false
+        // N-1: reset backoff only after 5 s stable OR on first stdout chunk.
+        // Never reset on stderr (the real tail always writes stderr before dying).
+        let gotStdout = false
         stableTimer = $.clock.after(STABLE_MS, () => { backoff = INITIAL_BACKOFF_MS })
 
         for await (const chunk of tail) {
-          if (!gotChunk) {
-            gotChunk = true
-            backoff = INITIAL_BACKOFF_MS
-            stableTimer.cancel()
-            stableTimer = null
-          }
           if (chunk.stream === 'stderr') {
             // F-14: "asenq tail: connected" line triggers a refetch
             if (CONNECTED_RE.test(chunk.text)) {
@@ -122,6 +118,12 @@ function startTail($: any): void {
               $.ui.toast('asenq mod is out of date with the daemon: rerun `asenq setup`')
             }
             continue
+          }
+          // stdout: a real event from the daemon
+          if (!gotStdout) {
+            gotStdout = true
+            backoff = INITIAL_BACKOFF_MS
+            if (stableTimer) { stableTimer.cancel(); stableTimer = null }
           }
           debouncedRefetch($)
         }
@@ -221,7 +223,7 @@ export const register: Register = (on) => {
     versionMismatchToasted = false
     // F-13: seed fetchSeq from the persisted atom so a reload doesn't drop writes
     const stored = await read($, dataAtom)
-    fetchSeq = stored.seq
+    fetchSeq = stored?.seq ?? 0
 
     await $.command.register({
       name: 'asenq',
