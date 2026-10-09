@@ -528,6 +528,8 @@ export class Daemon {
         this.requireHumanOrOrchestrator(actor, "only the human or an orchestrator can create channels");
         return this.mutateChannel(this.channelName(p), "create", actor.kind === "agent" ? actor.session.id : undefined);
       }
+      case "channel_rename":
+        return this.opChannelRename(this.sender(c, p), p);
       case "channel_add":
       case "channel_remove":
         return this.opChannelMember(this.sender(c, p), p, p.op === "channel_add");
@@ -1950,6 +1952,39 @@ export class Daemon {
     });
     if (result.event) this.publish(result.event);
     return { channel: result.channel };
+  }
+
+  private opChannelRename(actor: Sender, p: Params): Result {
+    this.requireHuman(actor, "rename channels");
+    const oldName = this.channelName({ channel: str(p, "channel", true) });
+    const newName = str(p, "name", true);
+    if (!NAME_RE.test(newName)) {
+      throw new AsenqError("invalid_name", `invalid channel name "${newName}" (lowercase letters, digits, - and _; not ${RESERVED.join("/")})`);
+    }
+    if (RESERVED.includes(newName)) {
+      throw new AsenqError("invalid_name", `invalid channel name "${newName}" (lowercase letters, digits, - and _; not ${RESERVED.join("/")})`);
+    }
+    if (!this.store.hasChannel(oldName)) throw new AsenqError("unknown_channel", `unknown channel "${oldName}"`);
+    if (oldName === newName) return { channel: this.store.channelSummary(oldName) };
+    if (this.store.hasChannel(newName)) throw new AsenqError("name_taken", `channel name "${newName}" is taken`);
+    const members = this.store.channelMembers(oldName);
+    this.store.renameChannel(oldName, newName);
+    const channel = this.store.channelSummary(newName);
+    this.emit({ type: "channel", action: "renamed", channel, oldName });
+    // Send a system note to every current member
+    const now = this.now();
+    for (const member of members) {
+      const session = this.store.session(member.id);
+      const target = session ?? member;
+      const note: MsgRow = {
+        id: newId("m_"), from_name: "human", from_session: null, to_name: target.name, to_session: member.id,
+        channel: null, text: `channel ${oldName} is now ${newName}`, kind: "status", thread: null,
+        reply_to: null, done: 0, status: "queued", reason: null, attempts: 0,
+        created_at: now, updated_at: now, ord: 0,
+      };
+      void Promise.resolve(this.routeOne({ kind: "human" }, target, note)).catch((e) => this.log(`channel rename note failed: ${String(e)}`));
+    }
+    return { channel };
   }
 
   private opChannelMember(actor: Sender, p: Params, add: boolean): Result {

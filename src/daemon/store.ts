@@ -922,6 +922,19 @@ export class Store {
     return this.db.run("DELETE FROM channel_members WHERE channel=? AND session_id=?", name, sessionId).changes > 0;
   }
 
+  renameChannel(oldName: string, newName: string): void {
+    this.transaction(() => {
+      this.db.run("UPDATE channels SET name=? WHERE name=?", newName, oldName);
+      this.db.run("UPDATE channel_members SET channel=? WHERE channel=?", newName, oldName);
+      this.db.run("UPDATE messages SET channel=? WHERE channel=?", newName, oldName);
+      this.db.run("UPDATE messages SET source_channel=? WHERE source_channel=?", newName, oldName);
+      this.db.run(
+        "UPDATE human_read_positions SET stream_key=? WHERE scope='channel' AND stream_key=?",
+        newName, oldName,
+      );
+    });
+  }
+
   channelSummary(name: string): ChannelSummary {
     const summary = this.db.get<{ count: number; lastAt: number; lastOrder: number }>(
       `SELECT count(*) AS count,COALESCE(max(created_at),0) AS lastAt,COALESCE(max(ord),0) AS lastOrder

@@ -244,7 +244,8 @@ asenq inbound <name> accept|hold|refuse
 asenq role <name> orchestrator|worker|unset
 asenq held [name] | asenq release <msgId> | asenq drop <msgId>
 asenq channels
-asenq channel create <ch> | asenq channel add <ch> <live-name>
+asenq channel create <ch> | asenq channel rename <ch> <new>
+asenq channel add <ch> <live-name>
 asenq channel remove <ch> <member-name>
 asenq channel remove <ch> --session-id <session-id>
 asenq channel members <ch>

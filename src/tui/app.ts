@@ -555,6 +555,21 @@ export class ConsoleApp {
     } else if (e.type === "read") {
       this.readStates.set(keyOf(e.state.scope), e.state);
     } else if (e.type === "channel") {
+      if (e.action === "renamed" && e.oldName) {
+        const oldIndex = this.channels.findIndex((c) => c.name === e.oldName);
+        if (oldIndex >= 0) this.channels.splice(oldIndex, 1);
+        const oldStream = this.streams.get(`c:${e.oldName}`);
+        if (oldStream) {
+          this.streams.delete(`c:${e.oldName}`);
+          this.streams.set(`c:${e.channel.name}`, oldStream);
+        }
+        const oldRead = this.readStates.get(`c:${e.oldName}`);
+        if (oldRead) {
+          this.readStates.delete(`c:${e.oldName}`);
+          this.readStates.set(`c:${e.channel.name}`, { ...oldRead, scope: { scope: "channel", channel: e.channel.name } });
+        }
+        if (this.selection.channels === `c:${e.oldName}`) this.selection.channels = `c:${e.channel.name}`;
+      }
       const index = this.channels.findIndex((c) => c.name === e.channel.name);
       if (index >= 0) this.channels[index] = e.channel;
       else this.channels.push(e.channel);
