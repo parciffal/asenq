@@ -250,6 +250,7 @@ asenq channel remove <ch> --session-id <session-id>
 asenq channel members <ch>
 asenq channel read <ch> [--limit n] | asenq channel send <ch> <text…>
 asenq tui
+asenq viz
 asenq daemon run|start|stop|status
 asenq setup [--remove]
 asenq doctor
@@ -280,6 +281,31 @@ The palette covers broadcast, held-message review/release/drop, rename, replacem
 **Human read markers** are shared across consoles and survive restart. Unread counts cover direct messages to `human` by sending identity plus non-human channel posts, never session-to-session traffic. A conversation marks read when the last row of its newest incoming message is visible; plain CLI inbox/channel reads do not. The header's failed count covers all retained failed/expired direct messages. Bodies wrap without truncation; **End ↓ latest** sits outside readable rows. [Display and confirmation details](docs/how-delivery-works.md#console-display-and-reading).
 
 Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste never confirm. Close/purge submit only previewed identity IDs. Select Archive for **Purge all archives**, or an archived conversation for **Purge conversation**. Replacement picks a non-closed source and different live destination, checks eligibility again on confirmation, and shows skipped names in full. History, drafts and reading positions stay separate; other consoles reconcile moved messages and archived ordering.
+
+### `asenq viz`: live bug-map
+
+`asenq viz` is a full-screen, read-only, animated cyberpunk view of everything running: the human is a yellow **netrunner** node, each orchestrator a large hive-queen bug, each worker a small bug. Links run human → orchestrators and orchestrator → workers (shared channel; a worker with no orchestrator hangs off the human), and direct messages travel along them as packets coloured by kind (task yellow, result green, status cyan, chat white, control red). A feed panel lists recent messages and a TARGET panel shows the selected bug. Needs a TTY; it never sends anything.
+
+| Key | Action |
+|---|---|
+| `↑ ↓ ← →`, `h j k l` | Select the nearest bug in that direction. |
+| `Tab` / `Shift+Tab` | Next / previous bug. Mouse click also selects. |
+| `Enter` | Focus: dim everything but the selected bug and its links. |
+| `f` | Filter by harness: all → claude → omp → opencode → codex → all. |
+| `u` | Show / hide feral bugs. |
+| `r` | Rescan processes and refresh now. |
+| `q`, `Esc`, `Ctrl+C` | Quit. |
+
+| Species | Harness | Colour |
+|---|---|---|
+| Scarab beetle | Claude Code | orange |
+| Spider | omp | cyan |
+| Mantis | OpenCode | acid green |
+| Moth | Codex | magenta |
+
+Working bugs scuttle and spark with a bright link, idle ones breathe, **lost** ones (stale or not answering pings) glitch with a `?`, and **dead** (gone) ones flatline grey; gone sessions disappear 30 minutes after last contact.
+
+**Limits.** Codex has no asenq adapter, so it only appears as a **feral** bug found by scanning `ps` (macOS/Linux, processes with a controlling TTY; nothing on Windows). Feral detection is a heuristic: processes are matched to registered sessions by harness session id in their command line, and per harness any surplus of processes over live registered sessions (newest first) is drawn as feral, named `<harness>-<pid>`, working when CPU is at least 5%. A new agent can look feral until it registers (OpenCode only registers after its first prompt), and a helper process the classifier cannot tell apart may show as a bug. Feral bugs have no links or messages. Packets are drawn only for direct messages between two known bugs; channel posts appear in the feed only. If the daemon is unreachable the screen shows `SIGNAL LOST` and keeps retrying.
 
 ## Upgrading
 
