@@ -303,7 +303,7 @@ Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste ne
 | Mantis | OpenCode | acid green |
 | Moth | Codex | magenta |
 
-Working bugs scuttle and spark with a bright link, idle ones breathe, **lost** ones (stale or not answering pings) glitch with a `?`, and **dead** (gone) ones flatline grey; gone sessions disappear 30 minutes after last contact.
+Working bugs scuttle and spark with a bright link, idle ones breathe, **lost** ones (stale or not answering pings) glitch with a `?`, and **dead** (gone) ones flatline grey; gone sessions disappear 30 minutes after last contact. Sessions with no role set are drawn like workers but labelled **UNASSIGNED** and counted as `UNSET`, never as workers.
 
 **Limits.** Codex has no asenq adapter, so it only appears as a **feral** bug found by scanning `ps` (macOS/Linux, processes with a controlling TTY; nothing on Windows). Feral detection is a heuristic: processes are matched to registered sessions by harness session id in their command line, and per harness any surplus of processes over live registered sessions (newest first) is drawn as feral, named `<harness>-<pid>`, working when CPU is at least 5%. A new agent can look feral until it registers (OpenCode only registers after its first prompt), and a helper process the classifier cannot tell apart may show as a bug. Feral bugs have no links or messages. Packets are drawn only for direct messages between two known bugs; channel posts appear in the feed only. If the daemon is unreachable the screen shows `SIGNAL LOST` and keeps retrying.
 

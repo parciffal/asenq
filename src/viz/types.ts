@@ -31,6 +31,8 @@ export type Bug = {
   /** Former names; messages addressed to them reach this bug. */
   previousNames: string[];
   pid?: number;
+  /** Registered session with no role set; drawn like a worker but never labelled one. */
+  unassigned?: true;
   /** Epoch ms of last harness contact, when known. */
   lastSeen: number | null;
 };

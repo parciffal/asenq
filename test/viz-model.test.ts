@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ListedSession } from "../src/shared/protocol.js";
 import { buildWorld } from "../src/viz/model.js";
-import { classify, parsePs, scanProcesses, type ProcInfo } from "../src/viz/scan.js";
+import { classify, parsePs, scanProcesses } from "../src/viz/scan.js";
+import type { ProcInfo } from "../src/viz/scan.js";
 import type { VizHarness } from "../src/viz/types.js";
 
 const NOW = 1_700_000_000_000;
@@ -46,7 +47,8 @@ test("edges link the human to orchestrators and each orchestrator to the workers
     "o1>w1:channel",
     "human>w3:human", "human>w4:human", // no orchestrator link: hangs off the human
   ]);
-  assert.equal(w.bugs.find((b) => b.id === "w4")?.kind, "worker", "an unset role draws as a worker");
+  assert.equal(w.bugs.find((b) => b.id === "w4")?.unassigned, true, "a role-less session is flagged unassigned, not claimed as a worker");
+  assert.equal(w.bugs.find((b) => b.id === "w3")?.unassigned, undefined, "assigned workers carry no flag");
 });
 
 test("bugs are ordered human, orchestrators, workers, feral, each group by name", () => {

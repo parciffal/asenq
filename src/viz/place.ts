@@ -1,5 +1,7 @@
-import { sanitizeTerminalText, terminalTextWidth, type TerminalSize } from "../tui/terminal.js";
-import { EYE_ROW, SPRITE_ROWS, type SpriteClass, type SpriteMode } from "./sprites.js";
+import { sanitizeTerminalText, terminalTextWidth } from "../tui/terminal.js";
+import type { TerminalSize } from "../tui/terminal.js";
+import { EYE_ROW, SPRITE_ROWS } from "./sprites.js";
+import type { SpriteClass, SpriteMode } from "./sprites.js";
 import type { Bug, Edge } from "./types.js";
 
 export const MIN_COLUMNS = 60;

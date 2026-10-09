@@ -1,9 +1,10 @@
 import { homedir } from "node:os";
-import { truncateTerminalText, type TerminalFrame, type TerminalSize, type TerminalSpan, type TerminalStyle } from "../tui/terminal.js";
-import { MIN_COLUMNS, MIN_ROWS, cleanLabel, edgeKey, hudHeight, layoutScene, textWidth, type Layout, type Level, type Placed } from "./place.js";
-import {
-  GLITCH_CHARS, ORCH_ART, PAL, SPRITE_ROWS, SPRITE_WIDTH, WORKER_ART, artRows, humanRows, mix, shade, speciesOf, type Hex,
-} from "./sprites.js";
+import { truncateTerminalText } from "../tui/terminal.js";
+import type { TerminalFrame, TerminalSize, TerminalSpan, TerminalStyle } from "../tui/terminal.js";
+import { MIN_COLUMNS, MIN_ROWS, cleanLabel, edgeKey, hudHeight, layoutScene, textWidth } from "./place.js";
+import type { Layout, Level, Placed } from "./place.js";
+import { GLITCH_CHARS, ORCH_ART, PAL, SPRITE_ROWS, SPRITE_WIDTH, WORKER_ART, artRows, humanRows, mix, shade, speciesOf } from "./sprites.js";
+import type { Hex } from "./sprites.js";
 import type { Bug, Direction, Edge, FeedLine, Hit, Packet, SceneResult, VizUi, World } from "./types.js";
 
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -460,7 +461,8 @@ function drawHeader(c: Canvas, world: World, tick: number, now: number): void {
   }
   const counts = (kind: Bug["kind"]): number => world.bugs.filter((bug) => bug.kind === kind).length;
   const orch = counts("orchestrator");
-  const work = counts("worker");
+  const work = world.bugs.filter((bug) => bug.kind === "worker" && !bug.unassigned).length;
+  const unset = world.bugs.filter((bug) => bug.unassigned).length;
   const feral = counts("feral");
   const online = world.connection === "connected";
   const blink = online || (tick % 8) < 4;
@@ -479,8 +481,8 @@ function drawHeader(c: Canvas, world: World, tick: number, now: number): void {
     rightW = conn.length + 2 + clockText.length + 1;
   }
   const room = cols - rightW - titleEnd;
-  const full: Seg[] = [["ORCH ", label], [String(orch), value], [" · ", sep], ["WORK ", label], [String(work), value], [" · ", sep], ["FERAL ", label], [String(feral), value]];
-  const compact: Seg[] = [["O", label], [String(orch), value], [" W", label], [String(work), value], [" F", label], [String(feral), value]];
+  const full: Seg[] = [["ORCH ", label], [String(orch), value], [" · ", sep], ["WORK ", label], [String(work), value], ...(unset ? [[" · ", sep], ["UNSET ", label], [String(unset), value]] as Seg[] : []), [" · ", sep], ["FERAL ", label], [String(feral), value]];
+  const compact: Seg[] = [["O", label], [String(orch), value], [" W", label], [String(work), value], ...(unset ? [[" U", label], [String(unset), value]] as Seg[] : []), [" F", label], [String(feral), value]];
   const fullW = full.reduce((n, [t]) => n + t.length, 0);
   const compactW = compact.reduce((n, [t]) => n + t.length, 0);
   if (room >= fullW + 2) putSegs(c, titleEnd + 1, 0, full, fullW);
@@ -559,7 +561,7 @@ function targetLines(world: World, bug: Bug, inner: number, count: number, tick:
   const list = (items: string[]): string => (items.length > 0 ? items.join(", ") : "—");
   const species = bug.kind === "human" ? "deck" : sp.name;
   const lines: Seg[][] = [
-    [["▌ ", sid(PAL.yellow)], [label, sid(PAL.yellow, PAL.void, true)], [`  ${CLASS_TAG[bug.kind]}`, sid(color, PAL.void, true)], [` · ${bug.harness ?? "local"} ${species}`, dim]],
+    [["▌ ", sid(PAL.yellow)], [label, sid(PAL.yellow, PAL.void, true)], [`  ${bug.unassigned ? "UNASSIGNED" : CLASS_TAG[bug.kind]}`, sid(color, PAL.void, true)], [` · ${bug.harness ?? "local"} ${species}`, dim]],
     [["STATE ", key], ...stateBar(bug, tick, color), [` ${STATE_WORD[bug.state]}`, sid(bug.state === "lost" ? PAL.alert : bug.state === "dead" ? PAL.ghost : color, PAL.void, true)]],
     [["CWD ", key], [bug.cwd === null ? "—" : shortenPath(bug.cwd, inner - 4), val]],
   ];

@@ -1,14 +1,15 @@
-import { AsenqClient, type ClientOpts } from "../shared/client.js";
+import { AsenqClient } from "../shared/client.js";
+import type { ClientOpts } from "../shared/client.js";
 import type { ListedSession, Push, StoredMessage } from "../shared/protocol.js";
 import type { Screen } from "../tui/app.js";
-import {
-  sanitizeTerminalText, TerminalAdapter, TerminalUnavailableError,
-  type KeyInput, type MouseInput, type TerminalAdapterOptions,
-} from "../tui/terminal.js";
+import { sanitizeTerminalText, TerminalAdapter, TerminalUnavailableError } from "../tui/terminal.js";
+import type { KeyInput, MouseInput, TerminalAdapterOptions } from "../tui/terminal.js";
 import { buildWorld } from "./model.js";
-import { scanProcesses, type ProcInfo } from "./scan.js";
+import { scanProcesses } from "./scan.js";
+import type { ProcInfo } from "./scan.js";
 import { navigate, renderScene, visibleBugs } from "./scene.js";
-import { VIZ_HARNESSES, type Bug, type Direction, type FeedLine, type Hit, type Packet, type VizUi, type World } from "./types.js";
+import { VIZ_HARNESSES } from "./types.js";
+import type { Bug, Direction, FeedLine, Hit, Packet, VizUi, World } from "./types.js";
 
 export type VizDeps = {
   client?(options: ClientOpts): AsenqClient;

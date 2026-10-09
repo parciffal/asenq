@@ -11,7 +11,8 @@ import { buildWorld } from "../src/viz/model.js";
 import type { ProcInfo } from "../src/viz/scan.js";
 import { renderScene } from "../src/viz/scene.js";
 import type { Hit } from "../src/viz/types.js";
-import { isSession, startEnv, type Adapter, type TestEnv } from "./helpers.js";
+import { isSession, startEnv } from "./helpers.js";
+import type { Adapter, TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 let open: Viz | undefined;

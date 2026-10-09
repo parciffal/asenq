@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { terminalTextWidth, type TerminalLine, type TerminalSize } from "../src/tui/terminal.js";
+import { terminalTextWidth } from "../src/tui/terminal.js";
+import type { TerminalLine, TerminalSize } from "../src/tui/terminal.js";
 import { navigate, renderScene, visibleBugs } from "../src/viz/scene.js";
 import { ORCH_ART, ORCH_W, WORKER_ART, WORKER_W } from "../src/viz/sprites.js";
 import type { Bug, BugState, Edge, FeedLine, Hit, Packet, VizHarness, VizUi, World } from "../src/viz/types.js";
@@ -179,6 +180,18 @@ test("selection draws a bracket frame and the target panel", () => {
   assert.ok(text.includes("UPLINK alpha-lead"), "uplink named in the target panel");
   const focused = renderScene(w, [], ui({ selectedId: "w3", focus: true }), 0, SIZES[1], 0).frame;
   assert.notEqual(JSON.stringify(focused), JSON.stringify(renderScene(w, [], ui({ selectedId: "w3" }), 0, SIZES[1], 0).frame));
+});
+
+test("a role-less session is labelled UNASSIGNED and counted apart from workers", () => {
+  const stray: Bug = { ...bug("u1", "stray-one", "worker", "omp"), unassigned: true };
+  const w = world(
+    [human(), bug("o1", "alpha-lead", "orchestrator", "claude"), stray, bug("w1", "real-worker", "worker", "omp")],
+    [link("human", "o1"), link("o1", "u1"), link("o1", "w1")],
+  );
+  const rows = frameRows(w, ui({ selectedId: "u1" }), SIZES[1]);
+  assert.ok(rows.join("\n").includes("UNASSIGNED"), "target panel says UNASSIGNED");
+  assert.ok(!rows.join("\n").includes("  WORKER"), "never called a worker");
+  assert.match(rows[0], /WORK 1 · UNSET 1/);
 });
 
 test("the netwatch panel lists the newest feed lines", () => {

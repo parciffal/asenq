@@ -73,6 +73,7 @@ export function buildWorld(input: WorldInput): World {
         : s.state === "stale" || s.ping === "not_responding" ? "lost"
         : s.busy === true ? "working" : "idle",
       cwd: s.cwd, channels: [...s.channels], previousNames: [...s.previousNames], lastSeen: s.lastSeen,
+      ...(s.role === null ? { unassigned: true as const } : {}),
     });
   }
   const orchestrators = registered.filter((b) => b.kind === "orchestrator").sort(byName);
