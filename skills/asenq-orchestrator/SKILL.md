@@ -37,7 +37,7 @@ Posting with `asenq_channel_send { "channel": "backend", "text": "Review @alpha;
 
 Keywords take precedence over member names, and a member can also be named by its current or former name. Parsing is case-sensitive ASCII (`[A-Za-z0-9_-]`). An `@` starts a mention only at the start of the text, after whitespace, or after one of `(`, `[`, `{`, `<`, `"`, `'`, `` ` ``; any other preceding character blocks it, so email local parts such as `foo@alpha` and `foo+@alpha.example` stay literal. A token ends at the first character outside that name set, so `(@alpha)`, `"@alpha"` and `@alpha,` all address `alpha`. There are no Markdown or code-block exceptions.
 
-A group with no matching members is valid and delivers nothing. An unknown, ambiguous or non-member token fails the **whole post** with `unknown_mention` and no message is created; inspect the roster with `asenq_channel_members` first. Each identity is targeted once per post, never the poster, and never the human.
+A group with no matching members is valid and delivers nothing. An unknown, ambiguous or non-member token fails the **whole post** with `unknown_mention` and no message is created; inspect the roster with `asenq_channel_members` first. Each identity is targeted once per post, never the poster, and never the human. If a channel post returns `channel_renamed`, switch to the name it gives.
 
 ## Broadcast scope
 

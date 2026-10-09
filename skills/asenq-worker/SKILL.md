@@ -16,7 +16,7 @@ Reply with the `asenq_send` tool. Send to the **explicit sender name** from the 
   "thread": "api-review", "reply_to": "m_3f2a9c01be44" }
 ```
 
-Never use `"*"` for a task acknowledgment, question or result. `"*"` broadcasts to every live session sharing one of your channels — every other live session on the machine if you belong to no channel — and is reserved for a deliberate notice, never a reply.
+Never use `"*"` for a task acknowledgment, question or result. `"*"` broadcasts to every live session sharing one of your channels — every other live session on the machine if you belong to no channel — and is reserved for a deliberate notice, never a reply. If a channel post returns `channel_renamed`, switch to the name it gives.
 
 ## Acknowledging and reporting
 

@@ -76,13 +76,18 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
   switch (cmd) {
     case "ls": {
       const { values } = parseArgs({
-        args: argv, options: { cwd: { type: "string" }, harness: { type: "string" }, channel: { type: "string" } },
+        args: argv, options: { cwd: { type: "string" }, harness: { type: "string" }, channel: { type: "string" }, json: { type: "boolean" } },
       });
       if (values.harness !== undefined && !["claude", "omp", "opencode"].includes(values.harness)) {
         throw new Error("harness must be claude, omp or opencode");
       }
       const r = await client.request("list", values);
-      out(formatSessions(r.sessions as ListedSession[], values.cwd !== undefined || values.harness !== undefined || values.channel !== undefined));
+      const sessions = r.sessions as ListedSession[];
+      if (values.json) {
+        out(JSON.stringify(sessions));
+      } else {
+        out(formatSessions(sessions, values.cwd !== undefined || values.harness !== undefined || values.channel !== undefined));
+      }
       return 0;
     }
     case "send": {
@@ -108,7 +113,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           if (e.type === "session") {
             out(`${hhmmss(Date.now())} session ${e.name} (${e.harness}) ${e.action}${e.oldName ? ` from ${e.oldName}` : ""}`);
           } else if (e.type === "channel") {
-            out(`${hhmmss(Date.now())} channel #${e.channel.name} ${e.action} (${e.channel.memberIds?.length ?? 0} members)`);
+            out(`${hhmmss(Date.now())} channel #${e.channel.name} ${e.action}${e.oldName ? ` from #${e.oldName}` : ""} (${e.channel.memberIds?.length ?? 0} members)`);
           } else if (e.type === "ping") {
             out(`${hhmmss(Date.now())} ping ${e.sessionId}: ${e.ping}`);
           } else if (e.type === "message") {
@@ -269,10 +274,24 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       return 0;
     }
     case "channels": {
+      const { values: chValues } = parseArgs({ args: argv, allowPositionals: true, options: { json: { type: "boolean" } } });
       const r = await client.request("channel_list");
       const rows = r.channels as ChannelSummary[];
-      if (rows.length === 0) out("no channels");
-      for (const c of rows) out(`#${c.name}  ${c.count ? `${c.count} messages  last ${new Date(c.lastAt).toLocaleString()}` : "no posts"}  ${c.memberIds?.length ?? 0} members`);
+      if (chValues.json) {
+        const identities = (await client.sync()).sessions;
+        const idMap = new Map(identities.map((s) => [s.id, s]));
+        out(JSON.stringify(rows.map((c) => ({
+          name: c.name,
+          members: (c.memberIds ?? []).map((id) => {
+            const s = idMap.get(id);
+            return { name: s?.name ?? id, role: s?.role ?? null, state: s?.state ?? "removed", id };
+          }),
+          count: c.count, lastAt: c.lastAt, lastOrder: c.lastOrder,
+        }))));
+      } else {
+        if (rows.length === 0) out("no channels");
+        for (const c of rows) out(`#${c.name}  ${c.count ? `${c.count} messages  last ${new Date(c.lastAt).toLocaleString()}` : "no posts"}  ${c.memberIds?.length ?? 0} members`);
+      }
       return 0;
     }
     case "channel": {
@@ -299,11 +318,28 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
         out(`${sessionId ?? positionals[0]} removed from #${ch}`);
         return 0;
       }
-      if (sub === "members" && ch && rest.length === 0) {
-        const r = await client.request("channel_members", { channel: ch });
+      if (sub === "rename" && ch && rest.length === 1) {
+        const r = await client.request("channel_rename", { channel: ch, name: rest[0] });
+        const renamed = r.channel as ChannelSummary;
+        out(`#${ch} renamed to #${renamed.name}`);
+        return 0;
+      }
+      if (sub === "members") {
+        const { values: memberValues, positionals: memberPositionals } = parseArgs({
+          args: argv.slice(1), allowPositionals: true, options: { json: { type: "boolean" } },
+        });
+        if (memberPositionals.length !== 1) {
+          throw new Error("usage: asenq channel members <ch> [--json]");
+        }
+        const memberChannel = memberPositionals[0];
+        const r = await client.request("channel_members", { channel: memberChannel });
         const members = r.members as SessionIdentity[];
-        if (members.length === 0) out(`#${ch} has no members`);
-        for (const member of members) out(`${member.name}  ${member.role ?? "unset"}  ${member.state}  ${member.id}`);
+        if (memberValues.json) {
+          out(JSON.stringify(members.map((m) => ({ name: m.name, role: m.role ?? null, state: m.state, id: m.id }))));
+        } else {
+          if (members.length === 0) out(`#${memberChannel} has no members`);
+          for (const member of members) out(`${member.name}  ${member.role ?? "unset"}  ${member.state}  ${member.id}`);
+        }
         return 0;
       }
       if (sub === "read" && ch) {
@@ -319,7 +355,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
         out(results.length ? formatSendResults(results) : "no mention targets; no direct messages pushed");
         return 0;
       }
-      throw new Error("usage: asenq channel create <ch> | add <ch> <name> | remove <ch> <name> | remove <ch> --session-id <id> | members <ch> | read <ch> [--limit n] | send <ch> <text…>");
+      throw new Error("usage: asenq channel create <ch> | rename <ch> <new> | add <ch> <name> | remove <ch> <name> | remove <ch> --session-id <id> | members <ch> | read <ch> [--limit n] | send <ch> <text…>");
     }
     default:
       throw new Error(`unknown command "${cmd}"\n${usage}`);

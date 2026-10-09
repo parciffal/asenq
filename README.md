@@ -244,7 +244,8 @@ asenq inbound <name> accept|hold|refuse
 asenq role <name> orchestrator|worker|unset
 asenq held [name] | asenq release <msgId> | asenq drop <msgId>
 asenq channels
-asenq channel create <ch> | asenq channel add <ch> <live-name>
+asenq channel create <ch> | asenq channel rename <ch> <new>
+asenq channel add <ch> <live-name>
 asenq channel remove <ch> <member-name>
 asenq channel remove <ch> --session-id <session-id>
 asenq channel members <ch>
@@ -256,6 +257,14 @@ asenq setup [--remove]
 asenq doctor
 asenq --version
 ```
+
+### `--json` output schemas
+
+`asenq ls --json` emits the full `ListedSession` array: `id`, `name`, `previousNames`, `harness`, `cwd`, `state` (`live`/`gone`/`stale`), `stale`, `ping`, `inbound`, `role`, `channels`, `lastSeen`, `busy`, `harnessSessionId`, `resumeCommand`, `you`. `harnessSessionId` is `null` until the session's hooks report it.
+
+`asenq channels --json` emits an array of `{ name, members, count, lastAt, lastOrder }`. Each member is `{ name, role, state, id }`.
+
+`asenq channel members <ch> --json` emits an array of `{ name, role, state, id }`, the same member shape as `channels --json`.
 
 ## TUI (keys and palette)
 
@@ -321,7 +330,7 @@ asenq setup        # only if wiring or skills changed; doctor tells you
 asenq daemon stop  # the next asenq command starts the new daemon
 ```
 
-`npm link` points at the checkout, so rebuilding is the reinstall. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **17**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
+`npm link` points at the checkout, so rebuilding is the reinstall. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **18**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
 
 ## Limitations
 

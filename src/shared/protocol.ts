@@ -1,4 +1,4 @@
-export const PROTOCOL = 17;
+export const PROTOCOL = 18;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
@@ -29,7 +29,7 @@ export function hasMentionOpening(text: string, index: number): boolean {
 
 export type ErrCode =
   | "bad_request" | "unknown_target" | "name_taken" | "invalid_name"
-  | "unknown_channel" | "not_live" | "ambiguous_target" | "unknown_mention"
+  | "unknown_channel" | "channel_renamed" | "not_live" | "ambiguous_target" | "unknown_mention"
   | "too_large" | "not_registered" | "not_permitted" | "no_session" | "rate_limited" | "internal";
 
 export type Req = { id: number; op: string; [k: string]: unknown };
@@ -137,7 +137,7 @@ export type ReadState = {
 export type TailEvent =
   | { type: "session"; action: "registered" | "renamed" | "gone" | "removed" | "updated";
       name: string; harness: Harness; cwd?: string; oldName?: string; reason?: string; session: SessionIdentity }
-  | { type: "channel"; action: "created" | "updated"; channel: ChannelSummary }
+  | { type: "channel"; action: "created" | "updated" | "renamed"; channel: ChannelSummary; oldName?: string }
   | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string; failedCount?: number }
   | { type: "read"; state: ReadState }
   | { type: "ping"; sessionId: string; ping: PingStatus }

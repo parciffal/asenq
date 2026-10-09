@@ -9,7 +9,7 @@ if (!process.versions.bun && (major < 22 || (major === 22 && minor < 13))) {
 
 const USAGE = `usage: asenq <command>
 
-  ls [--cwd prefix] [--harness claude|omp|opencode] [--channel name]  list sessions
+  ls [--cwd prefix] [--harness claude|omp|opencode] [--channel name] [--json]  list sessions
   send <name|*|human> <text…>          send as the user [--kind k] [--action pause|resume|cancel] [--reset compact] [--thread t] [--reply-to id] [--done]
   tail                                 follow messages, sessions and channel events
   log [--session name] [--id msgId] [--limit n]
@@ -23,12 +23,13 @@ const USAGE = `usage: asenq <command>
   inbound <name> accept|hold|refuse
   role <name> orchestrator|worker|unset
   held [name] | release <msgId> | drop <msgId>
-  channels                             list channels, including those with no posts
+  channels [--json]                     list channels, including those with no posts
   channel create <ch>                   create an empty channel
+  channel rename <ch> <new>              rename a channel
   channel add <ch> <name>               add a live session
   channel remove <ch> <name>            remove a member by current or former name
   channel remove <ch> --session-id <id> remove a member by stable identity
-  channel members <ch>                  list names, roles, states and identity IDs
+  channel members <ch> [--json]          list names, roles, states and identity IDs
   channel read <ch> [--limit n] | channel send <ch> <text…>
   daemon run|start|stop|status
   setup [--remove]
