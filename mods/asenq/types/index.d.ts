@@ -12,7 +12,7 @@ export type Session = {
 export type ChannelMember = {
   name: string
   role: 'orchestrator' | 'worker' | null
-  state: 'live' | 'gone' | 'stale'
+  state: 'live' | 'gone' | 'stale' | 'removed'
   id: string
 }
 
@@ -26,12 +26,18 @@ export type AsenqData = {
   sessions: Session[]
   channels: Channel[]
   online: boolean
+  /** Monotonic sequence number; a fetch with a lower seq never overwrites a higher one. */
+  seq: number
 }
+
+/** Per-element draft state for rename inputs. Keyed by element key. */
+export type Drafts = Record<string, string>
 
 declare module 'claude-code' {
   interface PluginState {
     asenq: {
       data: AsenqData
+      drafts: Drafts
     }
   }
 }

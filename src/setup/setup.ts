@@ -8,7 +8,7 @@ import { readConfig, writeConfig } from "../shared/config.js";
 import { configPath, dbPath } from "../shared/paths.js";
 import { QUEUE_TTL_MS } from "../shared/protocol.js";
 import { editJson, isObj, readJson, report, type Json } from "./jsonfile.js";
-import { installMod, removeMod, modsSourceDir } from "./mods.js";
+import { installMod, removeMod } from "./mods.js";
 import { installSkills, removeSkills, SKILL_NAMES, skillsSourceDir } from "./skills.js";
 
 export const CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "PostToolUse", "UserPromptSubmit", "Stop"] as const;
@@ -257,7 +257,8 @@ export async function setup(argv: string[]): Promise<number> {
 
   if (existsSync(claudeDir())) {
     setupClaude(i);
-    installMod(claudeDir(), i.runtime, i.cli);
+    const modResult = installMod(claudeDir(), i.runtime, i.cli);
+    if (modResult !== 0) return modResult;
   } else process.stdout.write("skip claude: not installed\n");
   if (existsSync(opencodeDir())) writeShim(join(opencodeDir(), "plugins", "asenq.js"), opencodeShim(i));
   else process.stdout.write("skip opencode: not installed\n");

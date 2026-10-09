@@ -53,7 +53,7 @@ asenq doctor     # checks wiring and starts the daemon
 
 ### Claude Code mod
 
-`asenq setup` installs a Claude Code mod to `~/.claude/mods/asenq` and registers it in `CLAUDE_CODE_PLUGIN_DIRS`. The mod adds a status line showing your session's name, role and workers, and the `/asenq` slash command opens a pane with all sessions, their roles, channels and members. From the pane you can rename sessions and channels, and change roles. A live `tail` stream keeps the status line and pane current as sessions join, leave or change.
+`asenq setup` installs a Claude Code mod to `~/.claude/mods/asenq` and registers it in `CLAUDE_CODE_PLUGIN_DIRS`. The mod adds a status line showing your session's name, role and workers, and the `/asenq` slash command opens a pane with all sessions, their roles, channels and members. From the pane you can rename sessions and channels, and change roles. A live `tail` stream keeps the status line and pane current as sessions join, leave or change. The mod applies to Claude Code sessions started after setup.
 
 ## Quick start
 

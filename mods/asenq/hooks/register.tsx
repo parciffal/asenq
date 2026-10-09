@@ -1,26 +1,36 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
-import type { AsenqData, Session, Channel } from '../types'
-import { findSelf, statusLine, sharedWorkers, firstOrchestrator } from './format'
+import type { AsenqData, Session, Channel, Drafts } from '../types'
+import { findSelf, statusLine } from './format'
 
 const PANE_ID = 'asenq'
 const DEBOUNCE_MS = 300
 const INITIAL_BACKOFF_MS = 1_000
 const MAX_BACKOFF_MS = 30_000
+const STABLE_MS = 5_000
+const HEARTBEAT_MS = 30_000
 const VERSION_MISMATCH_RE = /protocol|version/i
+
+const EMPTY: AsenqData = { sessions: [], channels: [], online: false, seq: 0 }
 
 const dataAtom = atom(
   { plugin: 'asenq', key: 'data' } as const,
-  { sessions: [], channels: [], online: false } as AsenqData,
+  EMPTY,
+)
+
+const draftsAtom = atom(
+  { plugin: 'asenq', key: 'drafts' } as const,
+  {} as Drafts,
 )
 
 type Timer = { cancel: () => void }
 
 // Module-level state (reset on hot reload is acceptable, same as repo-pane pattern)
 let argv: string[] = []
-let claudeSessionId = ''
 let debounceTimer: Timer | null = null
+let heartbeatTimer: Timer | null = null
 let versionMismatchToasted = false
+let fetchSeq = 0
 
 async function loadArgv($: any): Promise<string[]> {
   const text = await $.fs.read(`${$.plugin.root}/asenq-cli.json`)
@@ -33,26 +43,40 @@ async function asenqRun($: any, args: string[]): Promise<{ exitCode: number; std
 }
 
 async function fetchData($: any): Promise<AsenqData> {
+  const seq = ++fetchSeq
   try {
     const [lsResult, chResult] = await Promise.all([
       asenqRun($, ['ls', '--json']),
       asenqRun($, ['channels', '--json']),
     ])
     if (lsResult.exitCode !== 0 || chResult.exitCode !== 0) {
-      return { sessions: [], channels: [], online: false }
+      return { ...EMPTY, seq }
     }
     const sessions = JSON.parse(lsResult.stdout) as Session[]
     const channels = JSON.parse(chResult.stdout) as Channel[]
-    return { sessions, channels, online: true }
+    return { sessions, channels, online: true, seq }
   } catch {
-    return { sessions: [], channels: [], online: false }
+    return { ...EMPTY, seq }
   }
+}
+
+/** Reads the session id fresh each time (F-03: survives /clear and /resume). */
+async function sessionId($: any): Promise<string> {
+  return $.session.id()
+}
+
+/** Writes data to the atom only if seq >= the stored seq (last-write-wins by sequence). */
+async function setData($: any, data: AsenqData): Promise<void> {
+  await update($, dataAtom, (prev: AsenqData) =>
+    data.seq >= prev.seq ? data : prev,
+  )
 }
 
 async function refreshAndStatus($: any): Promise<void> {
   const data = await fetchData($)
-  await update($, dataAtom, () => data)
-  $.ui.status(statusLine(data, claudeSessionId))
+  await setData($, data)
+  const id = await sessionId($)
+  $.ui.status(statusLine(data, id))
 }
 
 function debouncedRefetch($: any): void {
@@ -63,15 +87,50 @@ function debouncedRefetch($: any): void {
   })
 }
 
+function startHeartbeat($: any): void {
+  if (heartbeatTimer) heartbeatTimer.cancel()
+  heartbeatTimer = $.clock.every(HEARTBEAT_MS, async () => {
+    const data = await fetchData($)
+    if (!data.online) {
+      // Daemon died under us; flip to offline
+      await setData($, data)
+      const id = await sessionId($)
+      $.ui.status(statusLine(data, id))
+    } else {
+      await setData($, data)
+      const id = await sessionId($)
+      $.ui.status(statusLine(data, id))
+    }
+  })
+}
+
+function stopHeartbeat(): void {
+  if (heartbeatTimer) { heartbeatTimer.cancel(); heartbeatTimer = null }
+}
+
 function startTail($: any): void {
   let backoff = INITIAL_BACKOFF_MS
 
   function attemptTail(): void {
     void (async () => {
+      let stableTimer: Timer | null = null
       try {
         const tail = $.process.spawn({ argv: [...argv, 'tail'] })
-        backoff = INITIAL_BACKOFF_MS
+        // Refetch immediately on connection (F-02)
+        void refreshAndStatus($)
+        // Start heartbeat while tail is believed up (F-11)
+        startHeartbeat($)
+
+        let gotChunk = false
+        stableTimer = $.clock.after(STABLE_MS, () => { backoff = INITIAL_BACKOFF_MS })
+
         for await (const chunk of tail) {
+          if (!gotChunk) {
+            gotChunk = true
+            backoff = INITIAL_BACKOFF_MS
+            stableTimer.cancel()
+            stableTimer = null
+          }
           if (chunk.stream === 'stderr') {
             if (!versionMismatchToasted && VERSION_MISMATCH_RE.test(chunk.text)) {
               versionMismatchToasted = true
@@ -85,7 +144,10 @@ function startTail($: any): void {
         // spawn failed
       }
       // tail ended or failed: go offline, retry with backoff
-      await update($, dataAtom, (prev: AsenqData) => ({ ...prev, online: false }))
+      if (stableTimer) { stableTimer.cancel(); stableTimer = null }
+      stopHeartbeat()
+      const offlineData: AsenqData = { ...EMPTY, seq: ++fetchSeq }
+      await setData($, offlineData)
       $.ui.status('asenq offline')
       $.clock.after(backoff, () => attemptTail())
       backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
@@ -97,36 +159,74 @@ function startTail($: any): void {
 
 async function handleRename($: any, oldName: string, newName: string): Promise<void> {
   if (!newName || newName === oldName) return
-  const result = await asenqRun($, ['rename', oldName, newName])
-  if (result.exitCode !== 0) {
-    $.ui.toast(result.stderr.trim() || `rename failed (exit ${result.exitCode})`)
-    return
+  try {
+    const result = await asenqRun($, ['rename', oldName, newName])
+    if (result.exitCode !== 0) {
+      $.ui.toast(result.stderr.trim() || `rename failed (exit ${result.exitCode})`)
+      return
+    }
+    // Clear the draft on success
+    await update($, draftsAtom, (prev: Drafts) => {
+      const next = { ...prev }
+      for (const k of Object.keys(next)) {
+        if (k.startsWith('rename-')) delete next[k]
+      }
+      return next
+    })
+    await refreshAndStatus($)
+  } catch (err) {
+    $.ui.toast(String(err))
   }
-  await refreshAndStatus($)
 }
 
 async function handleRole($: any, name: string, role: string): Promise<void> {
-  const result = await asenqRun($, ['role', name, role])
-  if (result.exitCode !== 0) {
-    $.ui.toast(result.stderr.trim() || `role change failed (exit ${result.exitCode})`)
-    return
+  try {
+    const result = await asenqRun($, ['role', name, role])
+    if (result.exitCode !== 0) {
+      $.ui.toast(result.stderr.trim() || `role change failed (exit ${result.exitCode})`)
+      return
+    }
+    await refreshAndStatus($)
+  } catch (err) {
+    $.ui.toast(String(err))
   }
-  await refreshAndStatus($)
 }
 
 async function handleChannelRename($: any, oldName: string, newName: string): Promise<void> {
   if (!newName || newName === oldName) return
-  const answer = await $.ui.ask(
-    `Rename channel #${oldName} to #${newName}? Members get a note and the old name stops working.`,
-    ['Rename', 'Cancel'],
-  )
-  if (answer !== 'Rename') return
-  const result = await asenqRun($, ['channel', 'rename', oldName, newName])
-  if (result.exitCode !== 0) {
-    $.ui.toast(result.stderr.trim() || `channel rename failed (exit ${result.exitCode})`)
-    return
+  try {
+    let answer: string
+    try {
+      answer = await $.ui.ask(
+        `Rename channel #${oldName} to #${newName}? Members get a note and the old name stops working.`,
+        ['Rename', 'Cancel'],
+      )
+    } catch {
+      // Dialog dismissed → treat as Cancel (F-05)
+      return
+    }
+    if (answer !== 'Rename') return
+    const result = await asenqRun($, ['channel', 'rename', oldName, newName])
+    if (result.exitCode !== 0) {
+      $.ui.toast(result.stderr.trim() || `channel rename failed (exit ${result.exitCode})`)
+      return
+    }
+    // Clear channel rename drafts on success
+    await update($, draftsAtom, (prev: Drafts) => {
+      const next = { ...prev }
+      for (const k of Object.keys(next)) {
+        if (k.startsWith('chrename-')) delete next[k]
+      }
+      return next
+    })
+    await refreshAndStatus($)
+  } catch (err) {
+    $.ui.toast(String(err))
   }
-  await refreshAndStatus($)
+}
+
+function setDraft($: any, key: string, value: string): void {
+  void update($, draftsAtom, (prev: Drafts) => ({ ...prev, [key]: value }))
 }
 
 export const register: Register = (on) => {
@@ -138,20 +238,20 @@ export const register: Register = (on) => {
       return next(e)
     }
 
-    claudeSessionId = await $.session.id()
     versionMismatchToasted = false
+    fetchSeq = 0
 
     await $.command.register({
       name: 'asenq',
       description: 'asenq sessions, roles and channels',
     })
 
-    // Fetch initial data
-    await refreshAndStatus($)
+    // Show placeholder status immediately (F-02: don't block on CLI)
+    $.ui.status('asenq …')
 
     const started = await next(e)
 
-    // Start live tail after the session is ready
+    // Start live tail (which does its own initial fetch) after the session is ready
     startTail($)
 
     return started
@@ -166,7 +266,9 @@ export const register: Register = (on) => {
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text, Input, Select } = $.ui.resolve(e)
     const data = await read($, dataAtom)
-    const self = findSelf(data.sessions, claudeSessionId)
+    const id = await sessionId($)
+    const self = findSelf(data.sessions, id)
+    const drafts = await read($, draftsAtom)
 
     if (!data.online) {
       return (
@@ -184,6 +286,7 @@ export const register: Register = (on) => {
 
     function sessionRow(s: Session, key: string) {
       const rolePart = s.role ?? 'unset'
+      const renameKey = `rename-${s.id}`
       return (
         <Box key={key} flexDirection="column">
           <Box>
@@ -192,10 +295,11 @@ export const register: Register = (on) => {
           </Box>
           <Box>
             <Input
-              key={`rename-${s.id}`}
+              key={renameKey}
               label="name"
               placeholder={s.name}
-              value=""
+              value={drafts[renameKey] ?? ''}
+              onInput={(v: string) => setDraft($, renameKey, v)}
               onSubmit={(v: string) => handleRename($, s.name, v.trim())}
             />
           </Box>
@@ -213,18 +317,20 @@ export const register: Register = (on) => {
     }
 
     function channelSection(ch: Channel) {
+      const chKey = `chrename-${ch.name}`
       return (
         <Box key={`ch-${ch.name}`} flexDirection="column">
           <Box>
             <Text bold>#{ch.name}</Text>
-            <Text dimColor> ({ch.count} members)</Text>
+            <Text dimColor> ({ch.members.length} members)</Text>
           </Box>
           <Box>
             <Input
-              key={`chrename-${ch.name}`}
+              key={chKey}
               label="rename"
               placeholder={ch.name}
-              value=""
+              value={drafts[chKey] ?? ''}
+              onInput={(v: string) => setDraft($, chKey, v)}
               onSubmit={(v: string) => handleChannelRename($, ch.name, v.trim())}
             />
           </Box>

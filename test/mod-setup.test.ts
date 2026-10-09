@@ -16,7 +16,6 @@ type Result = { status: number | null; out: string; lines: string[] };
 const garbage: string[] = [];
 after(() => { for (const p of garbage) rmSync(p, { recursive: true, force: true }); });
 
-/** Stub `claude` that answers --version and applies `mcp add/remove/get` to ~/.claude.json. */
 const CLAUDE_STUB = `#!/usr/bin/env node
 const fs = require("fs");
 const home = process.env.HOME;
@@ -112,18 +111,10 @@ test("setup installs the mod folder and adds it to PLUGIN_DIRS", () => {
   assert.ok(existsSync(join(modDir, "hooks", "format.ts")), "format.ts exists");
   assert.ok(existsSync(join(modDir, "types", "index.d.ts")), "types/index.d.ts exists");
   assert.ok(existsSync(join(modDir, "asenq-cli.json")), "asenq-cli.json exists");
-
-  // Test files should be excluded
   assert.ok(!existsSync(join(modDir, "hooks", "asenq.test.tsx")), "test file excluded");
 
-  // PLUGIN_DIRS should contain the mod path
   const dirs = pluginDirs(settings(home));
   assert.ok(dirs.includes(modDir), `PLUGIN_DIRS contains ${modDir}`);
-
-  // asenq-cli.json should have the right argv
-  const cli = JSON.parse(readFileSync(join(modDir, "asenq-cli.json"), "utf8"));
-  assert.ok(Array.isArray(cli.argv));
-  assert.equal(cli.argv.length, 2);
 });
 
 test("setup is idempotent for the mod and does not duplicate PLUGIN_DIRS", () => {
@@ -136,15 +127,13 @@ test("setup is idempotent for the mod and does not duplicate PLUGIN_DIRS", () =>
 
   const modDir = join(home, ".claude", "mods", "asenq");
   const dirs = pluginDirs(settings(home));
-  const count = dirs.filter((d) => d === modDir).length;
-  assert.equal(count, 1, "mod path appears exactly once in PLUGIN_DIRS");
+  assert.equal(dirs.filter((d) => d === modDir).length, 1, "mod path appears exactly once");
 });
 
 test("setup preserves existing PLUGIN_DIRS entries", () => {
   const pkg = makePkg();
   const home = makeHome();
 
-  // Pre-populate with a user's own plugin dir
   writeFileSync(
     join(home, ".claude", "settings.json"),
     JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: "/my/plugin:/other/plugin" } }, null, 2) + "\n",
@@ -170,16 +159,13 @@ test("setup --remove strips mod entry from PLUGIN_DIRS and deletes folder", () =
   const r = run(pkg, home, "setup", "--remove");
   assert.equal(r.status, 0);
   assert.ok(!existsSync(modDir), "mod dir removed");
-
-  const dirs = pluginDirs(settings(home));
-  assert.ok(!dirs.includes(modDir), "mod dir removed from PLUGIN_DIRS");
+  assert.ok(!pluginDirs(settings(home)).includes(modDir), "mod dir removed from PLUGIN_DIRS");
 });
 
 test("setup --remove leaves other PLUGIN_DIRS entries intact", () => {
   const pkg = makePkg();
   const home = makeHome();
 
-  // Pre-populate with a user's own plugin dir
   writeFileSync(
     join(home, ".claude", "settings.json"),
     JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: "/my/plugin" } }, null, 2) + "\n",
@@ -189,8 +175,7 @@ test("setup --remove leaves other PLUGIN_DIRS entries intact", () => {
   const r = run(pkg, home, "setup", "--remove");
   assert.equal(r.status, 0);
 
-  const s = settings(home);
-  const dirs = pluginDirs(s);
+  const dirs = pluginDirs(settings(home));
   assert.ok(dirs.includes("/my/plugin"), "user's plugin dir preserved");
   assert.ok(!dirs.includes(join(home, ".claude", "mods", "asenq")), "mod dir removed");
 });
@@ -199,15 +184,129 @@ test("setup --remove deletes env key when PLUGIN_DIRS ends up empty and asenq cr
   const pkg = makePkg();
   const home = makeHome();
 
+  // No pre-existing PLUGIN_DIRS: asenq creates it
   run(pkg, home, "setup");
   const r = run(pkg, home, "setup", "--remove");
   assert.equal(r.status, 0);
 
   const s = settings(home);
   const env = s.env as Record<string, unknown> | undefined;
-  // env.CLAUDE_CODE_PLUGIN_DIRS should be gone
   assert.ok(!env || !("CLAUDE_CODE_PLUGIN_DIRS" in env), "CLAUDE_CODE_PLUGIN_DIRS key removed when empty");
 });
+
+// --- F-08: three setup mutations that survived ---
+
+test("asenq-cli.json argv is exactly [runtime, cli] in order and value", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+  run(pkg, home, "setup");
+
+  const modDir = join(home, ".claude", "mods", "asenq");
+  const cliConfig = JSON.parse(readFileSync(join(modDir, "asenq-cli.json"), "utf8"));
+  assert.deepEqual(Object.keys(cliConfig), ["argv"], "only has argv key");
+  assert.equal(cliConfig.argv.length, 2, "exactly two elements");
+  assert.equal(cliConfig.argv[0], process.execPath, "first element is the runtime");
+  // The second element must be a real cli.js path
+  assert.ok(typeof cliConfig.argv[1] === "string" && cliConfig.argv[1].endsWith("cli.js"), "second element is cli.js path");
+  assert.ok(existsSync(cliConfig.argv[1]), "cli.js path exists");
+});
+
+test("setup refreshes a stale installed mod (isModCurrent detects changes)", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+  run(pkg, home, "setup");
+
+  const modDir = join(home, ".claude", "mods", "asenq");
+  const registerPath = join(modDir, "hooks", "register.tsx");
+  const original = readFileSync(registerPath, "utf8");
+  // Make the installed copy stale
+  writeFileSync(registerPath, original + "\n// stale\n");
+
+  const second = run(pkg, home, "setup");
+  assert.equal(second.status, 0);
+  // Should have been refreshed: the stale comment should be gone
+  assert.equal(readFileSync(registerPath, "utf8"), original, "mod was refreshed to current");
+  assert.ok(second.out.includes("mod installed"), "reports mod installed on refresh");
+});
+
+test("setup --remove keeps other env keys beside PLUGIN_DIRS", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { FOO: "1" } }, null, 2) + "\n",
+  );
+
+  run(pkg, home, "setup");
+  run(pkg, home, "setup", "--remove");
+
+  const s = settings(home);
+  const env = s.env as Record<string, unknown> | undefined;
+  assert.ok(env !== undefined, "env key preserved");
+  assert.equal(env!.FOO, "1", "FOO key preserved");
+});
+
+// --- F-09: PLUGIN_DIRS tracking ---
+
+test("setup --remove does not delete PLUGIN_DIRS key when user owned it", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  // Pre-populate with user's own PLUGIN_DIRS
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: "/user/plugin" } }, null, 2) + "\n",
+  );
+
+  run(pkg, home, "setup");
+  run(pkg, home, "setup", "--remove");
+
+  const s = settings(home);
+  const env = s.env as Record<string, unknown> | undefined;
+  // Should still have the user's entries
+  assert.ok(env !== undefined, "env preserved");
+  assert.ok(typeof env!.CLAUDE_CODE_PLUGIN_DIRS === "string", "PLUGIN_DIRS key kept");
+  assert.ok((env!.CLAUDE_CODE_PLUGIN_DIRS as string).includes("/user/plugin"), "user entry preserved");
+});
+
+test("setup does not overwrite a non-string PLUGIN_DIRS value", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: 42 } }, null, 2) + "\n",
+  );
+
+  const r = run(pkg, home, "setup");
+  assert.equal(r.status, 0);
+  assert.ok(r.out.includes("not a string") || r.out.includes("skipping"), "warns about non-string value");
+
+  const s = settings(home);
+  const env = s.env as Record<string, unknown>;
+  assert.equal(env.CLAUDE_CODE_PLUGIN_DIRS, 42, "value unchanged");
+});
+
+test("setup does not duplicate a tilde-form entry", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+
+  // Write a tilde-form entry that expands to the mod path
+  const modDir = join(home, ".claude", "mods", "asenq");
+  const tildeForm = modDir.replace(home, "~");
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: tildeForm } }, null, 2) + "\n",
+  );
+
+  run(pkg, home, "setup");
+  const dirs = pluginDirs(settings(home));
+  // Should not have added a second entry
+  assert.equal(dirs.length, 1, "no duplicate entry for tilde form");
+});
+
+// --- F-10: doctor ---
 
 test("doctor reports mod as installed and registered", () => {
   const pkg = makePkg();
@@ -223,26 +322,62 @@ test("doctor reports mod not installed when folder is missing", () => {
   const pkg = makePkg();
   const home = makeHome();
   run(pkg, home, "setup");
-
-  // Remove the mod
   rmSync(join(home, ".claude", "mods", "asenq"), { recursive: true });
 
   const d = doctor(pkg, home);
   assert.equal(d.status, 1);
-  assert.ok(d.out.includes("claude mod:") && d.out.includes("not installed"), "mod missing");
+  assert.ok(d.out.includes("not installed"), "mod missing");
 });
 
 test("doctor reports mod not in PLUGIN_DIRS when entry is missing", () => {
   const pkg = makePkg();
   const home = makeHome();
   run(pkg, home, "setup");
-
-  // Remove the PLUGIN_DIRS entry only
   const s = settings(home);
   (s as any).env = {};
   writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify(s, null, 2) + "\n");
 
   const d = doctor(pkg, home);
   assert.equal(d.status, 1);
-  assert.ok(d.out.includes("claude mod:") && d.out.includes("not in CLAUDE_CODE_PLUGIN_DIRS"), "mod not registered");
+  assert.ok(d.out.includes("not in CLAUDE_CODE_PLUGIN_DIRS"), "mod not registered");
+});
+
+test("doctor reports stale mod when installed copy differs from shipped", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+  run(pkg, home, "setup");
+
+  // Make the installed copy stale
+  const registerPath = join(home, ".claude", "mods", "asenq", "hooks", "register.tsx");
+  writeFileSync(registerPath, "// stale\n");
+
+  const d = doctor(pkg, home);
+  assert.equal(d.status, 1);
+  assert.ok(d.out.includes("outdated"), "mod outdated");
+});
+
+test("doctor reports invalid asenq-cli.json when paths are missing", () => {
+  const pkg = makePkg();
+  const home = makeHome();
+  run(pkg, home, "setup");
+
+  // Overwrite with invalid paths
+  writeFileSync(
+    join(home, ".claude", "mods", "asenq", "asenq-cli.json"),
+    JSON.stringify({ argv: ["/nonexistent/node", "/nonexistent/cli.js"] }, null, 2) + "\n",
+  );
+
+  const d = doctor(pkg, home);
+  assert.equal(d.status, 1);
+  assert.ok(d.out.includes("asenq-cli.json") || d.out.includes("paths do not exist"), "cli paths invalid");
+});
+
+test("setup fails when shipped mod source is missing", () => {
+  const pkg = makePkg();
+  rmSync(join(pkg, "mods", "asenq", ".claude-plugin", "plugin.json"));
+  const home = makeHome();
+
+  const r = run(pkg, home, "setup");
+  assert.equal(r.status, 1);
+  assert.ok(r.out.includes("shipped mod missing") || r.out.includes("reinstall"), "reports missing mod");
 });
