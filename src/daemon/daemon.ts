@@ -535,13 +535,14 @@ export class Daemon {
         return this.opChannelMember(this.sender(c, p), p, p.op === "channel_add");
       case "channel_members": {
         const channel = this.channelName(p);
-        if (!this.store.hasChannel(channel)) throw new AsenqError("unknown_channel", `unknown channel "${channel}"`);
+        this.requireChannel(channel);
         return { members: this.store.channelMembers(channel) };
       }
       case "channel_send":
         return this.opChannelSend(this.sender(c, p), p);
       case "channel_read": {
         const channel = str(p, "channel", true);
+        this.requireChannel(channel);
         const rows = this.store.db.all<MsgRow>(
           "SELECT * FROM (SELECT * FROM messages WHERE channel=? ORDER BY ord DESC LIMIT ?) ORDER BY ord",
           channel, limitParam(p, 20, 100));
@@ -1938,6 +1939,21 @@ export class Daemon {
     return channel;
   }
 
+  /** Throws channel_renamed if the name was renamed away and no live channel exists. */
+  private requireExistingOrNewChannel(name: string): void {
+    if (this.store.hasChannel(name)) return;
+    const current = this.store.channelRenamedTo(name);
+    if (current) throw new AsenqError("channel_renamed", `channel "${name}" was renamed to "${current}"`);
+  }
+
+  /** Throws unknown_channel or channel_renamed for a name that must already exist. */
+  private requireChannel(name: string): void {
+    if (this.store.hasChannel(name)) return;
+    const current = this.store.channelRenamedTo(name);
+    if (current) throw new AsenqError("channel_renamed", `channel "${name}" was renamed to "${current}"`);
+    throw new AsenqError("unknown_channel", `unknown channel "${name}"`);
+  }
+
   private mutateChannel(name: string, action: "create" | "add" | "remove", sessionId?: string): Result {
     const result = this.store.transaction(() => {
       const changed = action === "create" ? this.store.createChannel(name)
@@ -1971,9 +1987,14 @@ export class Daemon {
     if (oldName === newName) return { channel: this.store.channelSummary(oldName) };
     if (this.store.hasChannel(newName)) throw new AsenqError("name_taken", `channel name "${newName}" is taken`);
     const members = this.store.channelMembers(oldName);
-    this.store.renameChannel(oldName, newName, this.now());
-    const channel = this.store.channelSummary(newName);
-    this.emit({ type: "channel", action: "renamed", channel, oldName });
+    const result = this.store.transaction(() => {
+      this.store.renameChannel(oldName, newName, this.now());
+      const channel = this.store.channelSummary(newName);
+      const positioned = this.store.appendEvent({ type: "channel", action: "renamed", channel, oldName }, this.now());
+      return { channel, positioned };
+    });
+    this.publish(result.positioned);
+    const channel = result.channel;
     // Send a system note to every current member
     const now = this.now();
     for (const member of members) {
@@ -1996,7 +2017,7 @@ export class Daemon {
       throw new AsenqError("not_permitted", "only the human can remove members by identity");
     }
     const channel = this.channelName(p);
-    if (!this.store.hasChannel(channel)) throw new AsenqError("unknown_channel", `unknown channel "${channel}"`);
+    this.requireChannel(channel);
     if (actor.kind === "agent" && !this.store.isChannelMember(channel, actor.session.id)
       && !(add && p.name === actor.session.name)) {
       throw new AsenqError("not_permitted", `not a member of channel "${channel}"`);
@@ -2042,6 +2063,7 @@ export class Daemon {
     const text = str(p, "text", true);
     if (text.length === 0) throw new AsenqError("bad_request", "text is empty");
     if (text.length > MAX_TEXT) throw new AsenqError("too_large", `text exceeds ${MAX_TEXT} characters`);
+    this.requireExistingOrNewChannel(channel);
     const members = this.store.channelMembers(channel);
     const targets = new Map<string, (typeof members)[number]>();
     for (const match of text.matchAll(/@([A-Za-z0-9_-]+)/g)) {
@@ -2064,11 +2086,7 @@ export class Daemon {
         if (s.kind !== "agent" || member.id !== s.session.id) targets.set(member.id, member);
       }
     }
-    if (!this.store.hasChannel(channel)) {
-      const current = this.store.channelRenamedTo(channel);
-      if (current) throw new AsenqError("channel_renamed", `channel "${channel}" was renamed to "${current}"`);
-      this.mutateChannel(channel, "create");
-    }
+    if (!this.store.hasChannel(channel)) this.mutateChannel(channel, "create");
     const now = this.now();
     const row: MsgRow = {
       id: newId("m_"), from_name: this.senderName(s), from_session: s.kind === "agent" ? s.session.id : null,

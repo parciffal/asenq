@@ -1,6 +1,6 @@
 # How delivery works
 
-User workflows and command reference: [README](../README.md). This document preserves the detailed behavior behind naming, delivery, reading and human actions for protocol revision **17**.
+User workflows and command reference: [README](../README.md). This document preserves the detailed behavior behind naming, delivery, reading and human actions for protocol revision **18**.
 
 ## Harness wiring and delivery
 
@@ -88,7 +88,7 @@ Every group excludes the posting session; the human is never a target. Each reso
 
 Mentions start at the beginning of text, after whitespace, or after `(`, `[`, `{`, `<`, `"`, `'`, or a backtick. A token ends at the first character outside ASCII letters, digits, `_` and `-`: `(@alpha)`, `"@alpha"` and `@alpha,` address `alpha`. Other preceding characters block mentions, so `foo@alpha`, `foo+@alpha.example` and `foo-@alpha.example` stay literal. Parsing is case-sensitive and has no Markdown or code-block exceptions.
 
-An unknown, ambiguous or non-member token fails the **whole post** with `unknown_mention`, listing valid members and any ambiguous candidates. No channel, retained post or direct message is created by that failed request. Use `asenq_channel_members` to inspect the roster before posting.
+An unknown, ambiguous or non-member token fails the **whole post** with `unknown_mention`, listing valid members and any ambiguous candidates. No channel, retained post or direct message is created by that failed request. Use `asenq_channel_members` to inspect the roster before posting. A post, read, add or remove targeting a renamed-away channel name fails with `channel_renamed` and names the current channel; use the current name or explicitly re-create the old name.
 
 The pushed direct-message header names the channel and poster; the post body is unchanged. Direct-message policies still apply: session-sent posts to held targets remain held, refused targets are rejected, and human posts bypass hold just as ordinary human direct messages do. Sends return the post's `msgId` and per-target `results` with real states, rather than claiming that a held or rejected target was delivered. The CLI and `asenq_channel_send` show those target names and states. Posts without mentions remain on demand.
 

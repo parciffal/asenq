@@ -258,6 +258,14 @@ asenq doctor
 asenq --version
 ```
 
+### `--json` output schemas
+
+`asenq ls --json` emits the full `ListedSession` array: `id`, `name`, `previousNames`, `harness`, `cwd`, `state` (`live`/`gone`/`stale`), `stale`, `ping`, `inbound`, `role`, `channels`, `lastSeen`, `busy`, `harnessSessionId`, `resumeCommand`, `you`. `harnessSessionId` is `null` until the session's hooks report it.
+
+`asenq channels --json` emits an array of `{ name, members, count, lastAt, lastOrder }`. Each member is `{ name, role, state, id }`.
+
+`asenq channel members <ch> --json` emits an array of `{ name, role, state, id }`, the same member shape as `channels --json`.
+
 ## TUI (keys and palette)
 
 `asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues. The fifth tab, **Map**, is the live [bug-map](#asenq-viz-live-bug-map) inside the console (see below).
@@ -322,7 +330,7 @@ asenq setup        # only if wiring or skills changed; doctor tells you
 asenq daemon stop  # the next asenq command starts the new daemon
 ```
 
-`npm link` points at the checkout, so rebuilding is the reinstall. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **17**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
+`npm link` points at the checkout, so rebuilding is the reinstall. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **18**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
 
 ## Limitations
 

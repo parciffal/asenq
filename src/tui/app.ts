@@ -556,19 +556,30 @@ export class ConsoleApp {
       this.readStates.set(keyOf(e.state.scope), e.state);
     } else if (e.type === "channel") {
       if (e.action === "renamed" && e.oldName) {
+        const oldKey = `c:${e.oldName}`;
+        const newKey = `c:${e.channel.name}`;
         const oldIndex = this.channels.findIndex((c) => c.name === e.oldName);
         if (oldIndex >= 0) this.channels.splice(oldIndex, 1);
-        const oldStream = this.streams.get(`c:${e.oldName}`);
+        const oldStream = this.streams.get(oldKey);
         if (oldStream) {
-          this.streams.delete(`c:${e.oldName}`);
-          this.streams.set(`c:${e.channel.name}`, oldStream);
+          for (const m of oldStream.messages) if (m.channel === e.oldName) m.channel = e.channel.name;
+          this.streams.delete(oldKey);
+          this.streams.set(newKey, oldStream);
         }
-        const oldRead = this.readStates.get(`c:${e.oldName}`);
+        const oldRead = this.readStates.get(oldKey);
         if (oldRead) {
-          this.readStates.delete(`c:${e.oldName}`);
-          this.readStates.set(`c:${e.channel.name}`, { ...oldRead, scope: { scope: "channel", channel: e.channel.name } });
+          this.readStates.delete(oldKey);
+          this.readStates.set(newKey, { ...oldRead, scope: { scope: "channel", channel: e.channel.name } });
         }
-        if (this.selection.channels === `c:${e.oldName}`) this.selection.channels = `c:${e.channel.name}`;
+        if (this.selection.channels === oldKey) this.selection.channels = newKey;
+        const oldDraftKey = `channel:${e.oldName}`;
+        const draft = this.drafts.get(oldDraftKey);
+        if (draft !== undefined) { this.drafts.delete(oldDraftKey); this.drafts.set(`channel:${e.channel.name}`, draft); }
+        if (this.readHold === oldKey) this.readHold = newKey;
+        for (const item of this.activity) {
+          const ev = item.event;
+          if (ev.type === "channel" && ev.channel.name === e.oldName) ev.channel.name = e.channel.name;
+        }
       }
       const index = this.channels.findIndex((c) => c.name === e.channel.name);
       if (index >= 0) this.channels[index] = e.channel;

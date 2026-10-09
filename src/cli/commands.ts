@@ -84,10 +84,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       const r = await client.request("list", values);
       const sessions = r.sessions as ListedSession[];
       if (values.json) {
-        out(JSON.stringify(sessions.map((s) => ({
-          id: s.id, name: s.name, role: s.role, state: s.state, harness: s.harness,
-          harnessSessionId: s.harnessSessionId, cwd: s.cwd, channels: s.channels,
-        }))));
+        out(JSON.stringify(sessions));
       } else {
         out(formatSessions(sessions, values.cwd !== undefined || values.harness !== undefined || values.channel !== undefined));
       }
@@ -277,7 +274,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       return 0;
     }
     case "channels": {
-      const { values: chValues } = parseArgs({ args: argv, options: { json: { type: "boolean" } } });
+      const { values: chValues } = parseArgs({ args: argv, allowPositionals: true, options: { json: { type: "boolean" } } });
       const r = await client.request("channel_list");
       const rows = r.channels as ChannelSummary[];
       if (chValues.json) {
@@ -287,9 +284,9 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           name: c.name,
           members: (c.memberIds ?? []).map((id) => {
             const s = idMap.get(id);
-            return { name: s?.name ?? id, role: s?.role ?? null, state: s?.state ?? "unknown", id };
+            return { name: s?.name ?? id, role: s?.role ?? null, state: s?.state ?? "removed", id };
           }),
-          count: c.count,
+          count: c.count, lastAt: c.lastAt, lastOrder: c.lastOrder,
         }))));
       } else {
         if (rows.length === 0) out("no channels");
@@ -327,19 +324,20 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
         out(`#${ch} renamed to #${renamed.name}`);
         return 0;
       }
-      if (sub === "members" && ch) {
+      if (sub === "members") {
         const { values: memberValues, positionals: memberPositionals } = parseArgs({
-          args: rest, allowPositionals: true, options: { json: { type: "boolean" } },
+          args: argv.slice(1), allowPositionals: true, options: { json: { type: "boolean" } },
         });
-        if (memberPositionals.length !== 0) {
+        if (memberPositionals.length !== 1) {
           throw new Error("usage: asenq channel members <ch> [--json]");
         }
-        const r = await client.request("channel_members", { channel: ch });
+        const memberChannel = memberPositionals[0];
+        const r = await client.request("channel_members", { channel: memberChannel });
         const members = r.members as SessionIdentity[];
         if (memberValues.json) {
           out(JSON.stringify(members.map((m) => ({ name: m.name, role: m.role ?? null, state: m.state, id: m.id }))));
         } else {
-          if (members.length === 0) out(`#${ch} has no members`);
+          if (members.length === 0) out(`#${memberChannel} has no members`);
           for (const member of members) out(`${member.name}  ${member.role ?? "unset"}  ${member.state}  ${member.id}`);
         }
         return 0;
