@@ -250,8 +250,8 @@ asenq channel remove <ch> <member-name>
 asenq channel remove <ch> --session-id <session-id>
 asenq channel members <ch>
 asenq channel read <ch> [--limit n] | asenq channel send <ch> <text…>
-asenq tui
-asenq viz
+asenq tui [--reduced-motion]
+asenq viz [--reduced-motion]
 asenq daemon run|start|stop|status
 asenq setup [--remove]
 asenq doctor
@@ -268,11 +268,11 @@ asenq --version
 
 ## TUI (keys and palette)
 
-`asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues. The fifth tab, **Map**, is the live [bug-map](#asenq-viz-live-bug-map) inside the console (see below).
+`asenq tui` needs a TTY; keyboard works without mouse reporting. **Sessions**, **Inbox**, **Channels**, **Activity** share a list/conversation layout at ≥80 columns, or a narrower picker. Session conversations include exchanges with other sessions, not only you. Sessions group LIVE, RECONNECTING and collapsed Archive, sorted by recent direct-message activity, with harness/role/inbound/ping cues. The fifth tab, **Map**, is the live [cyberpunk city](#asenq-viz-live-cyberpunk-city) inside the console.
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Focus tabs → list → conversation → composer (on **Map**: select the next / previous bug). |
+| `Tab` / `Shift+Tab` | Focus tabs → list → conversation → composer (on **Map**: cycle matching city targets, including offscreen). |
 | `↑` / `↓`, `Enter` | Move/open list items; select messages and open details. |
 | `/`, `Ctrl+K` | Search current/former names; quick-jump to sessions, archives or `#channel`. |
 | `PageUp` / `PageDown`, `Home`, `End` | Scroll; top loads older history; End jumps to latest. |
@@ -291,32 +291,54 @@ The palette covers broadcast, held-message review/release/drop, rename, replacem
 
 Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste never confirm. Close/purge submit only previewed identity IDs. Select Archive for **Purge all archives**, or an archived conversation for **Purge conversation**. Replacement picks a non-closed source and different live destination, checks eligibility again on confirmation, and shows skipped names in full. History, drafts and reading positions stay separate; other consoles reconcile moved messages and archived ordering.
 
-### `asenq viz`: live bug-map
+### `asenq viz`: live cyberpunk city
 
-`asenq viz` is a full-screen, read-only, animated cyberpunk view of everything running: the human is a yellow **netrunner** node, each orchestrator a large hive-queen bug, each worker a small bug. Links run human → orchestrators and orchestrator → workers (shared channel; a worker with no orchestrator hangs off the human), and direct messages travel along them as packets coloured by kind (task yellow, result green, status cyan, chat white, control red). A feed panel lists recent messages and a TARGET panel shows the selected bug. Needs a TTY; it never sends anything.
+`asenq viz` is a full-screen, read-only terminal city of real channels and session identities. Empty channels have venues too. Each registered identity has one character at its canonical home; other memberships have `@` markers, not duplicate characters. Sessions without memberships and detected processes occupy street workstations, alongside the human operator. Harness, role (including unset), and actual state appear as text badges, independently of costume.
 
-The same view is the **Map** tab of `asenq tui` (`m`, or click the tab): it sits under the console's tab bar and above its footer, which carries the key hints and the active `FILTER:…`, `FOCUS` and `FERAL OFF` flags. It needs a region of at least 60×19 (a 60×21 terminal), otherwise it shows a too-small notice. On the Map tab the keys below apply (arrows, `h j k l`, `Tab`, `Enter`, `f`, `u`, `r` and a click on a bug) while no palette, form, finder or confirmation is open; `s i # a m`, `?`, `Ctrl+K`, `q` and `Esc` keep their console meaning (`Esc` returns to Sessions). With the tab bar focused, `←`/`→` still switch tabs. The Map tab only lists sessions, scans processes and animates while it is the shown, uncovered tab, never reads, marks or composes anything, and shows **SIGNAL LOST** while the daemon is unreachable. `asenq viz` is the standalone full-screen form of the same view.
+The city grows streets and floors as rosters grow. Coordinates remain stable during this map's lifetime across polling, rename, filter, zoom and resize; removing a canonical membership may move its character to another membership or the street. Small terminals switch to compact inspection, not a dead end: Tab and search still reach offscreen targets and full rosters. `I` opens focused inspection; PageUp/PageDown expose the remaining metadata, memberships and observed exchanges.
 
-| Key | Action |
+Only observed traffic animates: a plain channel post travels once to its venue, never to every member. Actual mention-copy direct messages travel separately between canonical homes. Unknown endpoints remain feed-only. Repeated delivery updates and reconnect history do not replay motion. Unknown availability is **UNKNOWN**, never invented IDLE; CPU activity for an unregistered process is explicitly inferred. A failed snapshot retains the last successful city with **SIGNAL LOST / STALE SNAPSHOT**, clears animations and resumes after a successful fetch.
+
+The same city is the **Map** tab of `asenq tui` (`m`, or click the tab), beneath the console tab bar and above its footer. It polls/scans and advances animation only while shown and uncovered. Selecting or inspecting never advances read markers. Explicit Enter opens the existing session/channel conversation, whose normal visible-transcript read rules then apply; a secondary marker opens its session, not the marker's channel. Standalone Enter only inspects: it never sends or marks read.
+
+| Key / mouse | Action |
 |---|---|
-| `↑ ↓ ← →`, `h j k l` | Select the nearest bug in that direction. |
-| `Tab` / `Shift+Tab` | Next / previous bug. Mouse click also selects. |
-| `Enter` | Focus: dim everything but the selected bug and its links. |
-| `f` | Filter by harness: all → claude → omp → opencode → codex → all. |
-| `u` | Show / hide feral bugs. |
-| `r` | Rescan processes and refresh now. |
-| `q`, `Esc`, `Ctrl+C` | Quit (standalone `asenq viz` only; in the Map tab they keep their console meaning). |
+| Arrows | Pan eight screen cells; manual pan cancels follow. |
+| `h j k l` | Select the nearest matching target in that direction and center it. |
+| `Tab` / `Shift+Tab` | Cycle every matching venue, character and membership marker, including offscreen. |
+| `+` / `=` / `-` | Zoom in/out (1, 2, or 4 world cells per screen cell). |
+| `0` | Frame the selected venue or room at the richest fitting zoom. |
+| `/`, Up/Down, Enter, Escape | Search current/former real names; choose result; select without opening; cancel search. |
+| `Enter` | Embedded: open registered session/channel conversation; process/human: inspect. Standalone: inspect only. |
+| `Space` | Dim other targets, without implying relationships. |
+| `F` / `T` | Follow selected registered session / its observed traffic. |
+| `I`, PageUp/PageDown | Toggle focused inspector; scroll metadata/roster/exchanges. |
+| `f` | Harness filter: all → claude → omp → opencode → codex → all; geometry does not change. |
+| `u` / `r` | Toggle detected processes / refresh snapshots and process scan. |
+| Left click / drag / wheel | Select target or roster entry / pan / pan vertically. |
+| `q`, `Ctrl+C` | Quit; Escape first leaves local search/inspection, then standalone quits or embedded returns. |
 
-| Species | Harness | Colour |
-|---|---|---|
-| Scarab beetle | Claude Code | orange |
-| Spider | omp | cyan |
-| Mantis | OpenCode | acid green |
-| Moth | Codex | magenta |
+Outside map-local search, `s i # a m c q ?` keep their console meanings; uppercase `I` is inspection, lowercase `i` is Inbox, uppercase `F` follows while lowercase `f` filters. Ctrl+K always opens the global finder. Host overlays take precedence. With tab-bar focus, arrows and Tab still navigate the console, and Enter enters the map body.
 
-Working bugs scuttle and spark with a bright link, idle ones breathe, **lost** ones (stale or not answering pings) glitch with a `?`, and **dead** (gone) ones flatline grey; gone sessions disappear 30 minutes after last contact. Sessions with no role set are drawn like workers but labelled **UNASSIGNED** and counted as `UNSET`, never as workers.
+#### Character costumes and reduced motion
 
-**Limits.** Codex has no asenq adapter, so it only appears as a **feral** bug found by scanning `ps` (macOS/Linux, processes with a controlling TTY; nothing on Windows). Feral detection is a heuristic: processes are matched to registered sessions by harness session id in their command line, and per harness any surplus of processes over live registered sessions (newest first) is drawn as feral, named `<harness>-<pid>`, working when CPU is at least 5%. A new agent can look feral until it registers (OpenCode only registers after its first prompt), and a helper process the classifier cannot tell apart may show as a bug. Feral bugs have no links or messages. Packets are drawn only for direct messages between two known bugs; channel posts appear in the feed only. If the daemon is unreachable the screen shows `SIGNAL LOST` and keeps retrying.
+No session or adapter reports model/provider metadata. Unmapped sessions use **neutral** graphite outfits regardless of harness; provider-inspired costumes require an explicit mapping. Appearance and variant use stable session identity, so renaming/reconnecting the same ID retains them. The operator has its own costume. Sprites are terminal-cell half-blocks, with readable monochrome silhouettes and bracketed selection when color is disabled.
+
+Use `$ASENQ_HOME/viz.json` (by default `~/.asenq/viz.json`), separate from daemon configuration:
+
+```json
+{
+  "reducedMotion": true,
+  "appearance": {
+    "sessions": { "<stable-session-id>": "qwen" },
+    "harnesses": { "claude": "claude", "omp": "neutral" }
+  }
+}
+```
+
+Outfits: `claude`, `codex`, `gemini`, `qwen`, `llama`, `mistral`, `neutral`. Session mappings override harness mappings; detected processes use only harness mappings. A `claude` harness mapping is a chosen costume, not evidence of a model. Settings are read once at startup; invalid values are skipped with a visible warning. `asenq tui --reduced-motion` and `asenq viz --reduced-motion` force reduced motion regardless of the file: no walking or blinking, static busy/send poses.
+
+**Limits.** Placement reservations live only for this map instance, not across application restarts. Channels have name-only wire identity: an observed rename retains frontage/appearance, but a pruned reconnect replay shows **HISTORY GAP** and cannot reconstruct missed rename identity; new names receive new frontages without guessing. Codex has no asenq registration adapter and appears only as an unregistered detected process. Process scanning is a macOS/Linux controlling-TTY heuristic: it matches harness session IDs in command lines and shows newest surplus processes over registered sessions; helpers can be misclassified, and CPU is not reported agent state. Process/human targets have no session conversation. This is cell art, not photographic raster rendering; terminal graphics protocols would be a separate optional approach.
 
 ## Upgrading
 

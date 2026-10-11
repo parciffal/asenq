@@ -1,389 +1,364 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, test } from "node:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { AsenqClient } from "../src/shared/client.js";
-import type { ListedSession } from "../src/shared/protocol.js";
-import type { TerminalAdapterOptions, TerminalFrame, TerminalLine, TerminalSize } from "../src/tui/terminal.js";
+import type { ClientOpts } from "../src/shared/client.js";
+import type { ChannelSummary, PositionedEvent } from "../src/shared/protocol.js";
+import { terminalTextWidth } from "../src/tui/terminal.js";
+import type { MouseInput, TerminalAdapterOptions, TerminalFrame, TerminalLine, TerminalSize } from "../src/tui/terminal.js";
 import { VizApp } from "../src/viz/app.js";
-import { buildWorld } from "../src/viz/model.js";
+import type { VizDeps } from "../src/viz/app.js";
+import type { VizMap } from "../src/viz/map.js";
 import type { ProcInfo } from "../src/viz/scan.js";
-import { renderScene } from "../src/viz/scene.js";
-import type { Hit } from "../src/viz/types.js";
-import { isSession, startEnv } from "./helpers.js";
-import type { Adapter, TestEnv } from "./helpers.js";
+import { startEnv } from "./helpers.js";
+import type { TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 let open: Viz | undefined;
-const home = process.env.ASENQ_HOME;
-const scratch: string[] = [];
 afterEach(async () => {
   open?.interrupt();
   open = undefined;
   await env?.close();
   env = undefined;
-  if (home === undefined) delete process.env.ASENQ_HOME;
-  else process.env.ASENQ_HOME = home;
-  for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+const lineText = (line: TerminalLine): string => typeof line === "string" ? line : line.map((span) => span.text).join("");
 type Viz = {
-  app: VizApp;
-  size: TerminalSize;
-  done: Promise<number>;
-  cleanups(): number;
-  lists(): number;
-  rows(): string[];
-  press(name: string): Promise<void>;
-  click(column: number, row: number): Promise<void>;
-  resize(columns: number, rows: number): Promise<void>;
-  step(ms: number): Promise<void>;
-  interrupt(): void;
-  until(predicate: () => boolean, what: string): Promise<void>;
+  app: VizApp; map: VizMap; size: TerminalSize; done: Promise<number>;
+  rows(): string[]; lists(): number; cleanups(): number;
+  press(name: string): Promise<void>; search(name: string): Promise<void>;
+  mouse(action: MouseInput["action"], column: number, row: number): Promise<void>;
+  resize(columns: number, rows: number): Promise<void>; step(ms: number): Promise<void>;
+  interrupt(): void; until(predicate: () => boolean, what: string): Promise<void>;
 };
 
-const lineText = (line: TerminalLine | undefined): string =>
-  line === undefined ? "" : typeof line === "string" ? line : line.map((span) => span.text).join("");
-
-type VizOptions = { columns?: number; rows?: number; scan?: () => Promise<ProcInfo[]> };
-
-/** Runs the real app against the test daemon with a recording screen and a manually stepped clock. */
-function startViz(o: VizOptions = {}): Viz {
+/** Real daemon/client, recording terminal and manual animation clock. */
+function startViz(deps: Omit<VizDeps, "screen" | "now" | "schedule"> = {}): Viz {
   let handlers: TerminalAdapterOptions = {};
   let frame: TerminalFrame = { lines: [] };
-  let cleanups = 0;
   let lists = 0;
-  const size = { columns: o.columns ?? 160, rows: o.rows ?? 48 };
+  let cleanups = 0;
+  const size = { columns: 160, rows: 48 };
   const app = new VizApp({
+    ...deps,
     client: (options) => {
-      const client = new AsenqClient({ ...options, autoStart: false });
+      const client = deps.client?.(options) ?? new AsenqClient({ ...options, autoStart: false });
       const request = client.request.bind(client);
-      client.request = async (op, params) => {
-        if (op === "list") lists++;
-        return request(op, params);
-      };
+      client.request = async (op, params) => { if (op === "list") lists++; return request(op, params); };
       return client;
     },
     screen: (options) => {
       handlers = options;
       return { size, start() {}, render(next) { frame = next; }, cleanup() { cleanups++; } };
     },
-    scan: o.scan ?? (async () => []),
-    now: () => env?.clock.now() ?? Date.now(),
+    scan: deps.scan ?? (async () => []),
+    now: () => env!.clock.now(),
     schedule: () => () => {},
   });
   const done = app.run();
+  // Packet/animation counts and selected scope are public controller seams, not terminal glyph assertions.
+  const inner = app as unknown as { map: VizMap };
+  const map = inner.map;
   const viz: Viz = {
-    app, size, done,
-    lists: () => lists,
-    cleanups: () => cleanups,
-    rows: () => frame.lines.map(lineText),
+    app, map, size, done, rows: () => frame.lines.map(lineText), lists: () => lists, cleanups: () => cleanups,
     async press(name) {
       const text = [...name].length === 1 ? name : undefined;
       handlers.onKey?.({ name, matches: [name], ...(text ? { text } : {}), ctrl: name.startsWith("CTRL_"), alt: false, shift: name.startsWith("SHIFT_") });
       await app.idle();
     },
-    async click(column, row) {
-      handlers.onMouse?.({ name: "MOUSE_LEFT_BUTTON_PRESSED", column, row, action: "press", button: "left", ctrl: false, alt: false, shift: false });
+    async search(name) { await viz.press("/"); for (const ch of name) await viz.press(ch); await viz.press("ENTER"); },
+    async mouse(action, column, row) {
+      handlers.onMouse?.({ name: "MOUSE", action, column, row, button: "left", ctrl: false, alt: false, shift: false });
       await app.idle();
     },
-    async resize(columns, rows) {
-      Object.assign(size, { columns, rows });
-      handlers.onResize?.(size);
-      await app.idle();
-    },
-    async step(ms) {
-      app.step(ms);
-      await app.idle();
-    },
+    async resize(columns, rows) { Object.assign(size, { columns, rows }); handlers.onResize?.(size); await app.idle(); },
+    async step(ms) { app.step(ms); await app.idle(); },
     interrupt: () => handlers.onInterrupt?.(),
     async until(predicate, what) {
-      const deadline = Date.now() + 3000;
-      for (;;) {
-        await app.idle();
-        if (predicate()) return;
-        if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}:\n${viz.rows().join("\n")}`);
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      for (let turn = 0; turn < 2000; turn++) { await app.idle(); if (predicate()) return; await nextTurn(); }
+      assert.fail(`never reached ${what}:\n${viz.rows().join("\n")}`);
     },
   };
   open = viz;
   return viz;
 }
-
 const has = (viz: Viz, text: string): boolean => viz.rows().some((row) => row.includes(text));
-const count = (viz: Viz, text: string): number => viz.rows().join("\n").split(text).length - 1;
-/** The TARGET panel's first body row: names the selected bug, or a hint when none is selected. */
-const target = (viz: Viz): string => {
-  const rows = viz.rows();
-  const header = rows.findIndex((row) => row.includes("TARGET"));
-  return header < 0 ? "" : rows[header + 1] ?? "";
-};
-
-type Fleet = { boss: Adapter; alpha: Adapter; beta: Adapter };
-
-/** claude orchestrator `boss-queen` with omp workers `wrk-alpha`/`wrk-beta` sharing channel `ops`. */
-async function fleet(e: TestEnv): Promise<Fleet> {
-  const human = e.human();
-  const boss = await e.adapter("claude", "viz-boss", "boss-queen", { cwd: "/work/boss" });
-  const alpha = await e.adapter("omp", "viz-alpha", "wrk-alpha", { cwd: "/work/alpha-project" });
-  const beta = await e.adapter("omp", "viz-beta", "wrk-beta", { cwd: "/work/beta-project" });
-  await human.request("set_role", { name: "boss-queen", role: "orchestrator" });
-  await human.request("set_role", { name: "wrk-alpha", role: "worker" });
-  await human.request("set_role", { name: "wrk-beta", role: "worker" });
-  await human.request("channel_create", { channel: "ops" });
-  for (const name of ["boss-queen", "wrk-alpha", "wrk-beta"]) await human.request("channel_add", { channel: "ops", name });
-  return { boss, alpha, beta };
+async function fleet() {
+  const e = env!;
+  const boss = await e.adapter("claude", "viz-boss", "boss-queen");
+  const alpha = await e.adapter("omp", "viz-alpha", "wrk-alpha");
+  await e.human().request("channel_create", { channel: "ops" });
+  await e.human().request("channel_create", { channel: "empty" });
+  for (const name of ["boss-queen", "wrk-alpha"]) await e.human().request("channel_add", { channel: "ops", name });
+  return { boss, alpha };
+}
+async function ready(viz: Viz): Promise<void> { await viz.until(() => !has(viz, "SIGNAL LOST") && viz.lists() > 0, "successful city snapshot"); }
+function within(viz: Viz): void {
+  assert.equal(viz.rows().length, viz.size.rows);
+  for (const row of viz.rows()) assert.ok(terminalTextWidth(row) <= viz.size.columns, row);
+  assert.ok(!has(viz, "RENDER FAULT"));
 }
 
-/** Hit rectangle centre for a bug, computed with the same pure scene the app draws. */
-async function centreOf(e: TestEnv, viz: Viz, id: string): Promise<{ column: number; row: number }> {
-  const sessions = (await e.human().request("list")).sessions as ListedSession[];
-  const now = e.clock.now();
-  const world = buildWorld({ sessions, procs: [], feed: [], connection: "connected", now });
-  const hits: Hit[] = renderScene(world, [], { selectedId: null, filter: null, focus: false, feral: true }, 0, viz.size, now).hits;
-  const hit = hits.find((h) => h.id === id);
-  assert.ok(hit, `no hit rectangle for ${id}`);
-  return { column: hit.column + Math.floor(hit.width / 2), row: hit.row + Math.floor(hit.height / 2) };
-}
-
-test("shows registered sessions by name and reports the connection", async () => {
+test("empty venues and every registered identity are searchable, including archived roster members", async () => {
   env = await startEnv();
-  await fleet(env);
+  const { alpha } = await fleet();
+  await alpha.client.request("unregister");
   const viz = startViz();
-  await viz.until(() => has(viz, "boss-queen") && has(viz, "wrk-alpha") && has(viz, "wrk-beta"), "all sessions drawn");
-  assert.ok(has(viz, "netrunner"));
-  assert.ok(!has(viz, "SIGNAL LOST"));
+  await ready(viz);
+  await viz.search("empty");
+  assert.deepEqual(viz.map.conversation(), { scope: "channel", channel: "empty" });
+  assert.ok(has(viz, "empty"));
+  await viz.search("wrk-alpha");
+  assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: alpha.session.id });
+  assert.ok(has(viz, "wrk-alpha"));
+  await viz.press("I");
+  assert.ok(has(viz, "REMOVED"));
+  within(viz);
 });
 
-test("a session registering after start appears without a manual refresh", async () => {
+test("legacy channel summaries resolve rosters from channel_members, including unresolved identities", async () => {
   env = await startEnv();
-  await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-beta"), "initial world");
-  await env.adapter("opencode", "viz-late", "latecomer");
-  await viz.until(() => has(viz, "latecomer"), "late session event");
-});
-
-test("a message between orchestrator and worker produces a feed row", async () => {
-  env = await startEnv();
-  const { boss, alpha } = await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-alpha"), "initial world");
-  await boss.client.request("send", { to: "wrk-alpha", text: "ship ledger", kind: "task" });
-  await alpha.nextDelivery();
-  await viz.until(() => has(viz, "ship ledger"), "feed row");
-  // later status events for the same message do not duplicate the row
-  await viz.step(100);
-  assert.equal(count(viz, "ship ledger"), 1);
-});
-
-test("a channel post shows in the feed without needing a link", async () => {
-  env = await startEnv();
-  const { boss } = await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-beta"), "initial world");
-  await boss.client.request("channel_send", { channel: "ops", text: "standup in five" });
-  await viz.until(() => has(viz, "standup in five"), "channel post in feed");
-});
-
-test("q resolves run with 0 and releases the terminal once", async () => {
-  env = await startEnv();
-  await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "boss-queen"), "initial world");
-  await viz.press("q");
-  assert.equal(await viz.done, 0);
-  assert.equal(viz.cleanups(), 1);
-  viz.interrupt();
-  assert.equal(viz.cleanups(), 1, "interrupt after quit is a no-op");
-});
-
-test("Escape and the interrupt callback also quit", async () => {
-  env = await startEnv();
-  const escape = startViz();
-  await escape.press("ESCAPE");
-  assert.equal(await escape.done, 0);
-  const interrupted = startViz();
-  interrupted.interrupt();
-  assert.equal(await interrupted.done, 0);
-});
-
-test("f cycles the harness filter and hides sessions of other harnesses", async () => {
-  env = await startEnv();
-  await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-alpha"), "initial world");
-  await viz.press("f"); // claude: only the claude orchestrator (and the netrunner) remain
-  assert.ok(has(viz, "boss-queen"));
-  assert.ok(!has(viz, "wrk-alpha") && !has(viz, "wrk-beta"), viz.rows().join("\n"));
-  await viz.press("f"); // omp: workers plus the orchestrator that leads them
-  assert.ok(has(viz, "wrk-alpha") && has(viz, "wrk-beta") && has(viz, "boss-queen"));
-  await viz.press("f"); // opencode: nothing registered
-  assert.ok(!has(viz, "wrk-alpha") && !has(viz, "boss-queen"));
-  await viz.press("f"); // codex
-  await viz.press("f"); // back to everything
-  assert.ok(has(viz, "wrk-alpha") && has(viz, "boss-queen"));
-});
-
-test("a mouse press on a bug selects it and the TARGET panel shows its name", async () => {
-  env = await startEnv();
-  await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-alpha") && has(viz, "wrk-beta"), "initial world");
-  assert.ok(has(viz, "TARGET"));
-  const before = count(viz, "wrk-alpha");
-  const at = await centreOf(env, viz, await sessionId(env, "wrk-alpha"));
-  await viz.click(at.column, at.row);
-  assert.ok(count(viz, "wrk-alpha") > before, `selected name is repeated in the TARGET panel:\n${viz.rows().join("\n")}`);
-  assert.equal(count(viz, "wrk-beta"), 1, "the other worker is not the target");
-  const other = await centreOf(env, viz, await sessionId(env, "wrk-beta"));
-  await viz.click(other.column, other.row);
-  assert.ok(count(viz, "wrk-beta") > 1 && count(viz, "wrk-alpha") === before);
-});
-
-test("keyboard navigation selects bugs and Tab cycles through them", async () => {
-  env = await startEnv();
-  await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-alpha") && has(viz, "wrk-beta"), "initial world");
-  const names = ["boss-queen", "wrk-alpha", "wrk-beta"];
-  const selected = (): string[] => names.filter((n) => target(viz).includes(n));
-  assert.deepEqual(selected(), [], "initial selection is none");
-  await viz.press("TAB");
-  assert.equal(selected().length, 1, "Tab selects one bug");
-  const seen = new Set(selected());
-  for (let i = 0; i < 6; i++) {
-    await viz.press("TAB");
-    for (const n of selected()) seen.add(n);
-  }
-  assert.equal(seen.size, names.length, "Tab reaches every bug");
-  const first = target(viz);
-  await viz.press("TAB");
-  const second = target(viz);
-  assert.notEqual(second, first, "successive Tab changes the target");
-  await viz.press("SHIFT_TAB");
-  assert.equal(target(viz), first, "Shift-Tab returns to the previous bug");
-  assert.ok(names.some((n) => first.includes(n)), "target names a bug");
-  const unfocused = viz.rows().join("\n");
-  await viz.press("ENTER");
-  assert.notEqual(viz.rows().join("\n"), unfocused, "focus changes the frame");
-  await viz.press("ENTER");
-  assert.equal(viz.rows().join("\n"), unfocused, "focus off restores the frame");
-});
-
-test("a detected codex process draws as codex-<pid> and u toggles feral bugs", async () => {
-  env = await startEnv();
-  const codex: ProcInfo = { pid: 4242, harness: "codex", command: "codex --model x", elapsedSec: 7, cpu: 12 };
-  const viz = startViz({ scan: async () => [codex] });
-  await viz.until(() => has(viz, "codex-4242"), "feral codex bug");
-  await viz.press("u");
-  assert.ok(!has(viz, "codex-4242"));
-  await viz.press("u");
-  assert.ok(has(viz, "codex-4242"));
-});
-
-test("r rescans processes immediately and the 5s poll picks up new ones", async () => {
-  env = await startEnv();
-  let procs: ProcInfo[] = [];
-  let scans = 0;
-  const viz = startViz({ scan: async () => (scans++, procs) });
-  await viz.until(() => scans === 1, "initial scan");
-  procs = [{ pid: 77, harness: "codex", command: "codex", elapsedSec: 1, cpu: 0 }];
-  await viz.step(4900);
-  assert.equal(scans, 1, "no rescan before 5s");
-  assert.ok(!has(viz, "codex-77"));
-  await viz.step(100);
-  await viz.until(() => has(viz, "codex-77"), "scan after 5s");
-  procs = [];
-  await viz.press("r");
-  await viz.until(() => !has(viz, "codex-77"), "manual rescan");
-});
-
-test("the 2s poll relists sessions without any event", async () => {
-  env = await startEnv();
-  await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-alpha"), "initial world");
-  const initial = viz.lists();
-  await viz.step(1900);
-  assert.equal(viz.lists(), initial, "no relist before 2s");
-  await viz.step(100);
-  await viz.until(() => viz.lists() === initial + 1, "relist at 2s");
-  await viz.step(2000);
-  await viz.until(() => viz.lists() === initial + 2, "relist at 4s");
-});
-
-test("a renamed session is drawn under its new name", async () => {
-  env = await startEnv();
-  await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-alpha"), "initial world");
-  await env.human().request("rename", { from: "wrk-alpha", name: "wrk-renamed" });
-  await viz.until(() => has(viz, "wrk-renamed"), "rename event refresh");
-  assert.ok(!has(viz, "wrk-alpha"), "former name is gone from the map");
-});
-
-test("feed rows name the resolved endpoints, including after a rename", async () => {
-  env = await startEnv();
-  const { boss } = await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-beta"), "initial world");
-  await env.human().request("rename", { from: "wrk-beta", name: "wrk-gamma" });
-  await viz.until(() => has(viz, "wrk-gamma"), "renamed session");
-  await boss.client.request("send", { to: "wrk-gamma", text: "after rename", kind: "status" });
-  await viz.until(() => has(viz, "after rename"), "feed row");
-  const row = viz.rows().find((r) => r.includes("after rename"));
-  assert.ok(row?.includes("wrk-gamma") && row.includes("boss-queen"), `feed row names both ends: ${row}`);
-});
-
-test("a gone session lingers flatlined, then vanishes after 30 minutes and clears its selection", async () => {
-  env = await startEnv();
-  const { beta } = await fleet(env);
-  const viz = startViz();
-  await viz.until(() => has(viz, "wrk-beta"), "initial world");
-  const at = await centreOf(env, viz, await sessionId(env, "wrk-beta"));
-  await viz.click(at.column, at.row);
-  assert.ok(count(viz, "wrk-beta") > 1, "selected");
-  const gone = await env.watch(isSession("gone", "wrk-beta"));
-  beta.client.close();
-  await gone.event;
-  env.clock.advance(31 * 60_000);
-  await viz.step(2000);
-  await viz.until(() => !has(viz, "wrk-beta"), "aged-out bug removed (selection cleared with it)");
+  const { alpha } = await fleet();
+  await alpha.client.request("unregister");
+  const viz = startViz({ client: (options) => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const sync = client.sync.bind(client);
+    client.sync = async () => { const s = await sync(); return { ...s, sessions: s.sessions.filter((identity) => identity.id !== alpha.session.id) }; };
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (op === "channel_list") reply.channels = (reply.channels as ChannelSummary[]).map(({ memberIds: _ids, ...channel }) => channel);
+      return reply;
+    };
+    return client;
+  } });
+  await ready(viz);
+  await viz.search("wrk-alpha");
+  assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: alpha.session.id });
   assert.ok(has(viz, "wrk-alpha"));
 });
 
-test("resize redraws at the new size", async () => {
+test("fresh direct and channel traffic animates once; status events deduplicate and expire", async () => {
   env = await startEnv();
-  await fleet(env);
-  const viz = startViz({ columns: 160, rows: 48 });
-  await viz.until(() => has(viz, "wrk-alpha"), "initial world");
-  await viz.resize(100, 30);
-  assert.ok(viz.rows().length <= 30, `${viz.rows().length} rows exceed 30`);
-  assert.ok(has(viz, "boss-queen"));
+  const { boss, alpha } = await fleet();
+  const viz = startViz();
+  await ready(viz);
+  await boss.client.request("send", { to: "wrk-alpha", text: "ship ledger", kind: "task" });
+  await alpha.nextDelivery();
+  await viz.until(() => has(viz, "ship ledger"), "direct feed");
+  assert.equal(viz.map.packetCount, 1);
+  assert.equal(viz.map.animationCount, 1);
+  await boss.client.request("channel_send", { channel: "ops", text: "plain post" });
+  await viz.until(() => has(viz, "plain post"), "channel feed");
+  assert.equal(viz.map.packetCount, 2, "one venue packet, not one per member");
+  await viz.step(1400);
+  assert.equal(viz.map.packetCount, 0);
+  assert.equal(viz.map.animationCount, 0);
 });
 
-test("with no daemon it renders SIGNAL LOST without throwing, then recovers when the daemon appears", async () => {
-  const empty = mkdtempSync(join(tmpdir(), "asenq-viz-"));
-  scratch.push(empty);
-  process.env.ASENQ_HOME = empty;
-  const viz = startViz();
-  await viz.until(() => has(viz, "SIGNAL LOST"), "SIGNAL LOST");
-  assert.ok(has(viz, "netrunner"), "the netrunner node survives a lost signal");
-  await viz.step(2000); // still down: another failed poll must not throw
-  assert.ok(has(viz, "SIGNAL LOST"));
+test("standalone Enter inspects without reading or messaging, including search acceptance", async () => {
   env = await startEnv();
-  await env.adapter("omp", "viz-recover", "wrk-recovered");
+  const { alpha } = await fleet();
+  await alpha.client.request("send", { to: "human", text: "unread incoming" });
+  const viz = startViz();
+  await ready(viz);
+  await viz.search("wrk-alpha");
+  await viz.press("ENTER");
+  assert.ok(has(viz, "wrk-alpha"));
+  assert.equal((await env.human().readState({ scope: "session", sessionId: alpha.session.id })).unread, 1);
+  assert.equal(alpha.deliveries.length, 0);
+});
+
+test("search consumes q and shortcut letters, Escape only cancels search, interrupt always quits", async () => {
+  env = await startEnv();
+  const q = await env.adapter("omp", "viz-query", "qfirst");
+  const viz = startViz();
+  await ready(viz);
+  await viz.search("qfirst");
+  assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: q.session.id });
+  assert.equal(viz.cleanups(), 0);
+  await viz.press("/");
+  await viz.press("q");
+  await viz.press("ESCAPE");
+  assert.equal(viz.cleanups(), 0);
+  await viz.press("CTRL_C");
+  assert.equal(await viz.done, 0);
+  assert.equal(viz.cleanups(), 1);
+  viz.interrupt();
+  assert.equal(viz.cleanups(), 1);
+});
+
+test("Tab cycles every venue and character, filter leaves venue access and uppercase follow is distinct", async () => {
+  env = await startEnv();
+  const { boss, alpha } = await fleet();
+  const viz = startViz();
+  await ready(viz);
+  const scopes = new Set<string>();
+  for (let i = 0; i < 10; i++) { await viz.press("TAB"); scopes.add(JSON.stringify(viz.map.conversation())); }
+  for (const scope of [{ scope: "channel", channel: "empty" }, { scope: "channel", channel: "ops" }, { scope: "session", sessionId: boss.session.id }, { scope: "session", sessionId: alpha.session.id }]) assert.ok(scopes.has(JSON.stringify(scope)));
+  await viz.search("boss-queen");
+  await viz.press("F");
+  assert.ok(!viz.map.flags.includes("FILTER"));
+  await viz.press("f");
+  assert.ok(viz.map.flags.includes("FILTER:claude"));
+  await viz.search("empty");
+  assert.deepEqual(viz.map.conversation(), { scope: "channel", channel: "empty" });
+});
+
+test("detected processes remain inspectable without a conversation and u toggles their candidates", async () => {
+  env = await startEnv();
+  const procs: ProcInfo[] = [{ pid: 4242, harness: "codex", command: "codex", elapsedSec: 7, cpu: 12 }];
+  const viz = startViz({ scan: async () => procs });
+  await ready(viz);
+  await viz.search("codex-4242");
+  assert.deepEqual(viz.map.selected, { kind: "character", id: "proc:4242" });
+  assert.equal(viz.map.conversation(), undefined);
+  await viz.press("ENTER");
+  assert.ok(has(viz, "4242") && has(viz, "inferred"));
+  await viz.press("ESCAPE");
+  await viz.press("u");
+  assert.ok(viz.map.flags.includes("FERAL OFF"));
+});
+
+test("two-second snapshots and five-second process scans are manually driven; r refreshes immediately", async () => {
+  env = await startEnv();
+  await fleet();
+  let scans = 0;
+  const viz = startViz({ scan: async () => (scans++, []) });
+  await ready(viz);
+  const lists = viz.lists();
+  await viz.step(1900);
+  assert.equal(viz.lists(), lists);
+  await viz.step(100);
+  assert.equal(viz.lists(), lists + 1);
+  await viz.step(3000);
+  assert.equal(scans, 2);
+  await viz.press("r");
+  assert.equal(scans, 3);
+});
+
+test("snapshot failure retains selected city; full list/channel bundle restores connection", async () => {
+  env = await startEnv();
+  const { alpha } = await fleet();
+  let outage = false;
+  const viz = startViz({ client: (options) => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => { if (op === "channel_list" && outage) throw new Error("no channel signal"); return request(op, params); };
+    return client;
+  } });
+  await ready(viz);
+  await viz.search("wrk-alpha");
+  outage = true;
   await viz.step(2000);
-  await viz.until(() => has(viz, "wrk-recovered"), "recovery on the next poll");
+  assert.ok(has(viz, "SIGNAL LOST") && has(viz, "wrk-alpha"));
+  assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: alpha.session.id });
+  assert.equal(viz.map.packetCount, 0);
+  assert.equal(viz.map.animationCount, 0);
+  outage = false;
+  await viz.step(2000);
   assert.ok(!has(viz, "SIGNAL LOST"));
 });
 
-async function sessionId(e: TestEnv, name: string): Promise<string> {
-  const sessions = (await e.human().request("list")).sessions as { id: string; name: string }[];
-  const found = sessions.find((s) => s.name === name);
-  assert.ok(found, `no session ${name}`);
-  return found.id;
-}
+test("reconnect pages replay before snapshot watermark, preserves observed rename, ignores duplicates and never animates history", async () => {
+  env = await startEnv();
+  const { boss, alpha } = await fleet();
+  let receive: ClientOpts["onPush"];
+  let reconnect: ClientOpts["onReconnect"];
+  let hold = false;
+  const held: PositionedEvent[] = [];
+  const viz = startViz({ client: (options) => {
+    receive = options.onPush;
+    reconnect = options.onReconnect;
+    const client = new AsenqClient({ ...options, autoStart: false, onPush: (p) => {
+      if (hold && p.push === "event") held.push({ position: p.position, event: p.event });
+      else options.onPush?.(p);
+    } });
+    const replay = client.replay.bind(client);
+    client.replay = async (after) => replay(after, 1);
+    return client;
+  } });
+  await ready(viz);
+  await viz.search("ops");
+  const selected = viz.map.selected;
+  hold = true;
+  await env.human().request("channel_rename", { channel: "ops", name: "renamed" });
+  await boss.client.request("send", { to: "wrk-alpha", text: "missed while offline" });
+  await alpha.nextDelivery();
+  await reconnect?.();
+  await viz.app.idle();
+  assert.deepEqual(viz.map.selected, selected);
+  assert.deepEqual(viz.map.conversation(), { scope: "channel", channel: "renamed" });
+  assert.equal(viz.map.packetCount, 0);
+  assert.equal(viz.map.animationCount, 0);
+  assert.ok(has(viz, "missed while offline"));
+  for (const item of held) receive?.({ push: "event", ...item });
+  await viz.app.idle();
+  assert.equal(viz.map.packetCount, 0);
+});
+
+test("replay gap adopts authoritative snapshot with visible HISTORY GAP, not guessed channel rename", async () => {
+  env = await startEnv();
+  await fleet();
+  let reconnect: ClientOpts["onReconnect"];
+  let gap = false;
+  const viz = startViz({ client: (options) => {
+    reconnect = options.onReconnect;
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const replay = client.replay.bind(client);
+    client.replay = async (after) => { const r = await replay(after); return gap ? { ...r, events: [], gap: true, hasMore: false } : r; };
+    return client;
+  } });
+  await ready(viz);
+  gap = true;
+  await reconnect?.();
+  await viz.app.idle();
+  assert.ok(has(viz, "HISTORY GAP"));
+  await viz.search("empty");
+  assert.deepEqual(viz.map.conversation(), { scope: "channel", channel: "empty" });
+});
+
+test("Unicode former names stay searchable through resize, pan, zoom, compact mode and mouse selection", async () => {
+  env = await startEnv();
+  const session = await env.adapter("omp", "viz-unicode", "city-界");
+  const viz = startViz();
+  await ready(viz);
+  await env.human().request("rename", { from: "city-界", name: "renamed-city" });
+  await viz.until(() => has(viz, "renamed-city"), "rename applied");
+  for (const [columns, rows] of [[160, 48], [80, 24], [40, 16], [1, 1], [160, 48]]) {
+    await viz.resize(columns, rows);
+    await viz.search("city-界");
+    assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: session.session.id });
+    within(viz);
+  }
+  for (const key of ["RIGHT", "+", "-", "0"]) await viz.press(key);
+  const row = viz.rows().findIndex((line) => line.includes("renamed-city"));
+  assert.ok(row >= 0);
+  await viz.mouse("press", viz.rows()[row].indexOf("renamed-city"), row);
+  assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: session.session.id });
+  within(viz);
+});
+
+test("settings warnings and reduced motion are visible and busy frames remain static", async () => {
+  env = await startEnv();
+  const { alpha } = await fleet();
+  await alpha.client.request("session_status", { busy: true });
+  const viz = startViz({ reducedMotion: true, settings: () => ({ settings: { reducedMotion: false, sessions: {}, harnesses: {} }, warning: "viz.json: appearance.sessions.bad: invalid outfit" }) });
+  await ready(viz);
+  await viz.search("wrk-alpha");
+  await viz.press("I");
+  assert.ok(has(viz, "REDUCED MOTION") && has(viz, "viz.json:"));
+  const before = viz.rows();
+  await viz.step(50);
+  assert.deepEqual(viz.rows(), before);
+  assert.ok(has(viz, "neutral") && has(viz, "unknown"));
+});
+
+test("CLI rejects invalid and repeated reduced-motion arguments before creating a terminal", () => {
+  for (const command of ["viz", "tui"]) for (const args of [["--bogus"], ["--reduced-motion", "--reduced-motion"]]) {
+    const result = spawnSync(process.execPath, ["dist/src/cli.js", command, ...args], { encoding: "utf8" });
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr.trim(), `usage: asenq ${command} [--reduced-motion]`);
+  }
+});

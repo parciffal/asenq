@@ -33,8 +33,8 @@ const USAGE = `usage: asenq <command>
   channel read <ch> [--limit n] | channel send <ch> <text…>
   daemon run|start|stop|status
   setup [--remove]
-  tui                                  interactive human messaging console
-  viz                                  live cyberpunk bug-map of every running agent session
+  tui [--reduced-motion]                interactive human messaging console
+  viz [--reduced-motion]                live cyberpunk city map of channels and sessions
   doctor`;
 
 async function main(argv: string[]): Promise<number> {
@@ -68,12 +68,12 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === "tui") {
     // Lazy by design: hook and MCP invocations must not initialize terminal input or renderer dependencies.
     const { runTui } = await import("./tui/app.js");
-    return runTui();
+    return runTui(argv.slice(1));
   }
   if (cmd === "viz") {
     // Lazy for the same reason as `tui`: no terminal renderer may load on hook/MCP paths.
     const { runViz } = await import("./viz/app.js");
-    return runViz();
+    return runViz(argv.slice(1));
   }
   const { runCommand } = await import("./cli/commands.js");
   return runCommand(cmd, argv.slice(1), USAGE);
