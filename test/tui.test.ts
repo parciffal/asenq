@@ -468,7 +468,10 @@ test("the Map tab stays mouse reachable at compact widths and exposes compact in
     const column = header.includes("Map") ? header.indexOf("Map") : header.indexOf("M");
     assert.ok(column >= 0 && column < header.indexOf("●"), `Map precedes the connection symbol at ${columns}: ${header}`);
     await ui.click(column);
-    assert.ok(ui.rows().at(-1)?.includes("arrows pan"), `Map opened at ${columns}:\n${ui.rows().join("\n")}`);
+    assert.ok(activeMap(ui), `Map opened at ${columns}:\n${ui.rows().join("\n")}`);
+    await searchMap(ui, "operator");
+    assert.deepEqual(mapOf(ui).selected, { kind: "character", id: "human" });
+    assert.ok(ui.rows().some((row) => row.includes("operator")), "compact inspection reaches the operator");
     assertWithin(ui);
   }
 });
@@ -2690,12 +2693,14 @@ const mapOf = (ui: Console): VizMap => {
   const inner = ui.app as unknown as { map: VizMap };
   return inner.map;
 };
-const mapShown = (ui: Console): boolean => {
+const activeMap = (ui: Console): boolean => {
   const header = ui.frame().lines[0];
-  const footer = ui.rows().at(-1) ?? "";
-  const active = header !== undefined && typeof header !== "string"
+  return header !== undefined && typeof header !== "string"
     && header.some((span) => span.style?.inverse && ["Map", "M"].includes(span.text.trim()));
-  return active && (footer.includes("arrows pan") || footer.includes("switch"));
+};
+const mapShown = (ui: Console): boolean => {
+  const footer = ui.rows().at(-1) ?? "";
+  return activeMap(ui) && (footer.includes("arrows pan") || footer.includes("switch"));
 };
 async function searchMap(ui: Console, query: string): Promise<void> {
   await ui.press("/");
@@ -2860,8 +2865,11 @@ test("selection and focused inspection do not read; explicit Enter opens the exi
   await ui.press("I");
   assert.ok(hasRow(ui, "wrk-alpha"));
   assert.equal(await unread(env.human(), alpha.session.id), 1, "search acceptance and inspector leave unread untouched");
+  const focused = ui.rows();
   await ui.press("ESCAPE");
-  assert.ok(mapShown(ui), "local inspector Escape does not leave Map");
+  assert.ok(activeMap(ui), "local inspector Escape does not leave Map");
+  assert.notDeepEqual(ui.rows(), focused, "Escape returns from focused inspection to the city");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
   await ui.press("ENTER");
   await ui.until(() => hasRow(ui, "please read me") && !mapShown(ui), "existing transcript opened");
   assert.equal(await unread(env.human(), alpha.session.id), 0, "normal visible transcript read rules apply after opening");
@@ -3104,24 +3112,43 @@ test("city name labels remain selectable below the tab bar at compact heights", 
   }
 });
 
-test("the console footer carries the Map's filter, focus and feral flags", async () => {
+test("Map filter and process visibility change navigation candidates and survive focused inspection", async () => {
   env = await startEnv();
-  await mapFleet(env);
-  const ui = await openMap();
-  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
+  const { boss, alpha } = await mapFleet(env);
+  const ui = await openMap(160, 48, { scan: async () => [{ pid: 4242, harness: "codex", command: "codex", elapsedSec: 7, cpu: 12 }] });
   const footer = (): string => ui.rows().at(-1)!;
-  assert.ok(!/FILTER|FOCUS|FERAL OFF/.test(footer()), footer());
-  await ui.press("f");
-  assert.ok(footer().includes("FILTER:claude") && footer().includes("refresh"), footer());
+  await searchMap(ui, "codex-4242");
+  assert.deepEqual(mapOf(ui).selected, { kind: "character", id: "proc:4242" });
+  const showingProcesses = footer();
   await ui.press("u");
-  assert.ok(footer().includes("FERAL OFF"), footer());
-  await ui.press("TAB");
+  assert.notEqual(footer(), showingProcesses, "footer reflects changed process visibility");
+  const candidates = new Set<string>();
+  for (let i = 0; i < 12; i++) {
+    await ui.press("TAB");
+    candidates.add(JSON.stringify(mapOf(ui).selected));
+  }
+  assert.ok(!candidates.has(JSON.stringify({ kind: "character", id: "proc:4242" })), "hidden process is not navigable");
+  await ui.press("u");
+  await searchMap(ui, "codex-4242");
+  assert.deepEqual(mapOf(ui).selected, { kind: "character", id: "proc:4242" });
+  const unfiltered = footer();
+  await ui.press("f");
+  assert.notEqual(footer(), unfiltered, "footer reflects changed harness filtering");
+  candidates.clear();
+  for (let i = 0; i < 12; i++) {
+    await ui.press("TAB");
+    candidates.add(JSON.stringify(mapOf(ui).conversation()));
+  }
+  assert.ok(candidates.has(JSON.stringify({ scope: "session", sessionId: boss.session.id })));
+  assert.ok(!candidates.has(JSON.stringify({ scope: "session", sessionId: alpha.session.id })), "nonmatching identity is not a navigation candidate");
+  await searchMap(ui, "boss-queen");
   await ui.press("SPACE");
-  assert.ok(footer().includes("FOCUS"), footer());
+  const focusedFooter = footer();
   await ui.press("I");
-  assert.ok(footer().includes("FOCUS") && footer().includes("FERAL OFF"), "focused inspection preserves map flags");
+  assert.equal(footer(), focusedFooter, "focused inspector retains current map modes");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: boss.session.id });
   await ui.press("s");
-  assert.ok(!/FILTER|FOCUS|FERAL OFF/.test(footer()), "other tabs show no map flags");
+  assert.ok(!activeMap(ui));
 });
 
 test("embedded snapshots publish list and channels together and retain the previous city on partial failure", async () => {
@@ -3217,9 +3244,11 @@ test("secondary membership Enter opens archived identity, not its venue, and the
   const target = mapOf(ui).selected;
   assert.ok(target?.kind === "membership" && target.id === alpha.session.id, "secondary marker is reachable");
   assert.equal(await unread(env.human(), alpha.session.id), 1);
-  const row = ui.rows().findIndex((line) => line.includes("@") && line.includes("wrk-alpha"));
-  assert.ok(row > 0, "selected membership marker is drawn");
-  await ui.click(ui.rows()[row].indexOf("wrk-alpha"), row);
+  const row = ui.rows().findIndex((line) => line.includes("@"));
+  assert.ok(row > 0, "secondary membership has a visible marker anchor");
+  await ui.click(ui.rows()[row].indexOf("@"), row);
+  assert.deepEqual(mapOf(ui).selected, target, "the marker glyph selects the local membership, not its canonical character");
+  assert.equal(await unread(env.human(), alpha.session.id), 1, "marker inspection does not read");
   assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
   await ui.press("ENTER");
   await ui.until(() => hasRow(ui, "archived-city-incoming") && !mapShown(ui), "archived session transcript opened");
