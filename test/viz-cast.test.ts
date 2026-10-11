@@ -7,6 +7,7 @@ import { appearanceOf, identityHash } from "../src/viz/appearance.js";
 import type { Appearance, Pose } from "../src/viz/appearance.js";
 import { CharacterAnimator, poseFor } from "../src/viz/animate.js";
 import { compactPixels, detailedPixels } from "../src/viz/cast.js";
+import { DETAILED } from "../src/viz/cast-detailed.js";
 import { DEFAULT_VIZ_SETTINGS, readVizSettings } from "../src/viz/settings.js";
 import { rasterize, shade } from "../src/viz/sprites.js";
 import type { CityCharacter, RoutePath } from "../src/viz/types.js";
@@ -97,6 +98,71 @@ test("compact operator retains polo, side-swept hair, stubble, yellow trim and c
     const colors = new Set(pixels.flat());
     for (const color of ["#1e1a1a", "#8a6a52", "#f0eee8", "#2f3036", "#f5c518", "#2fd6e6"]) assert.ok(colors.has(color), `${pose} retains ${color}`);
   }
+});
+
+test("detailed operator renders a near-white polo distinct from the face and charcoal jacket", () => {
+  const a: Appearance = { outfit: "operator", variant: 0, reason: "operator" };
+  const whites = new Set(DETAILED.operator[0]!.palette.filter((hex) => {
+    const rgb = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16));
+    const max = Math.max(...rgb), min = Math.min(...rgb);
+    return max / 255 >= 0.85 && (max - min) / max <= 0.25;
+  }));
+  assert.ok(whites.size > 0, "source white survives palette construction");
+  const pixels = detailedPixels(a, "idle_a");
+  const torso = pixels.slice(9, 14).flatMap((row) => row.slice(8, 12));
+  assert.ok(torso.filter((pixel) => pixel !== null && whites.has(pixel)).length >= 6, "white forms a visible torso patch, not an isolated glint");
+  assert.ok(whites.has(pixels[10]![8]!));
+  assert.ok(!whites.has(pixels[6]![9]!));
+  assert.notEqual(pixels[10]![8], pixels[6]![9], "polo must not collapse into skin");
+  assert.notEqual(pixels[10]![8], pixels[11]![12], "polo stays distinct from jacket");
+});
+
+test("compact neutral retains each visible hairstyle and skin tone but renders scarf and collar graphite", () => {
+  const heads = [
+    { y: 0, x: 2, color: "#3c3434" }, { y: 0, x: 1, color: "#543424" },
+    { y: 0, x: 2, color: "#f4cca4" }, { y: 0, x: 1, color: "#342424" },
+    { y: 0, x: 2, color: "#343434" }, // Hair is covered by this variant's unchanged cap.
+    { y: 1, x: 2, color: "#241c1c" },
+  ];
+  const skins = ["#e0ab84", "#f2c9a6", "#f2c9a6", "#5e3a24", "#f2c9a6", "#f2c9a6"];
+  for (let variant = 0; variant < 6; variant++) {
+    const neutral = compactPixels({ outfit: "neutral", variant, reason: "no-model-metadata" }, "idle_a", "compact");
+    const mistral = compactPixels({ outfit: "mistral", variant, reason: "session-mapping" }, "idle_a", "compact");
+    const head = heads[variant]!;
+    assert.equal(neutral[head.y]![head.x], head.color);
+    assert.equal(neutral[head.y]![head.x], mistral[head.y]![head.x]);
+    assert.equal(neutral[5]![0], skins[variant]);
+    assert.equal(neutral[5]![0], mistral[5]![0]);
+    if (variant < 2) {
+      assert.equal(neutral[4]![3], "#6a6e77");
+      assert.notEqual(neutral[4]![3], mistral[4]![3], "neutral scarf/collar is not the source garment accent");
+    }
+  }
+});
+
+test("detailed neutral keeps brown faces and hair while actual coat pixels become graphite", () => {
+  const facePoints = [
+    { y: 8, x: 9 }, { y: 6, x: 7 }, { y: 6, x: 7 },
+    { y: 5, x: 10 }, { y: 6, x: 9 }, { y: 7, x: 10 },
+  ];
+  const coatPoints = [
+    { y: 11, x: 6 }, { y: 11, x: 6 }, { y: 11, x: 6 },
+    { y: 11, x: 6 }, { y: 12, x: 5 }, { y: 12, x: 5 },
+  ];
+  for (let variant = 0; variant < 6; variant++) {
+    const neutral = detailedPixels({ outfit: "neutral", variant, reason: "no-model-metadata" }, "idle_a");
+    const mistral = detailedPixels({ outfit: "mistral", variant, reason: "session-mapping" }, "idle_a");
+    const face = facePoints[variant]!, coat = coatPoints[variant]!;
+    assert.equal(neutral[face.y]![face.x], mistral[face.y]![face.x], `variant ${variant + 1} keeps its actual face color`);
+    assert.notEqual(neutral[coat.y]![coat.x], mistral[coat.y]![coat.x], `variant ${variant + 1} changes its actual coat`);
+    const graphite = neutral[coat.y]![coat.x]!;
+    const r = parseInt(graphite.slice(1, 3), 16), g = parseInt(graphite.slice(3, 5), 16), b = parseInt(graphite.slice(5, 7), 16);
+    assert.equal(r, g);
+    assert.equal(b, Math.min(255, g + 8));
+  }
+  const fourth = detailedPixels({ outfit: "neutral", variant: 3, reason: "no-model-metadata" }, "idle_a");
+  assert.equal(fourth[5]![10], "#b35415", "brown face shadow must not turn gray");
+  assert.equal(fourth[5]![11], "#af7649", "brown face midtone must not turn gray");
 });
 
 test("rasterizer preserves transparent scenery and both pixel colors, tones and NO_COLOR silhouettes", () => {

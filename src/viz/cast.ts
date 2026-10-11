@@ -67,7 +67,10 @@ const TRAITS: Record<Outfit | "operator", readonly Trait[]> = {
   neutral: [],
   operator: [{ hair: "swept", H: "#1e1a1a", skin: "L2", stubble: true, wrist: true }],
 };
-TRAITS.neutral = TRAITS.mistral;
+TRAITS.neutral = TRAITS.mistral.map((trait) => ({
+  ...trait,
+  ...(trait.X === undefined ? {} : { X: "#6a6e77" }),
+}));
 
 const HAIR: Partial<Record<Hair, Readonly<Record<number, string>>>> = {
   spiky: { 0: ".H.H.H." }, curly: { 0: ".HHHHH.", 2: ".H___H." },
