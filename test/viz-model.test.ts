@@ -388,13 +388,18 @@ test("following a selected membership marker centers its canonical registered ch
   assert.deepEqual(marker && { kind: marker.kind, id: marker.kind === "venue" ? undefined : marker.id },
     { kind: "membership", id: "a" });
   const localMarker = map.frame(CITY_SIZE);
-  assert.ok(cityHas(localMarker, "OMP [-] MEMBER"), "the first search result is the secondary membership marker");
+  const markerPosition = screenPosition(localMarker, "[alpha]");
+  assert.ok(markerPosition, "the secondary marker name is visible in the city region, not just the inspector");
+  assert.equal(map.mouse({ name: "press", column: markerPosition.column, row: markerPosition.row, action: "press", button: "left", ctrl: false, alt: false, shift: false }), true);
+  assert.deepEqual(map.selected, marker, "the rendered secondary marker hit selects that membership identity");
 
   map.key(key("F", "F"));
   const canonicalView = map.frame(CITY_SIZE);
   assert.deepEqual(map.selected, marker, "following changes only the camera, not the selected membership anchor");
-  assert.ok(screenPosition(canonicalView, "[alpha]"), "the canonical identity is centered and visible");
-  assert.equal(cityHas(canonicalView, "OMP [-] MEMBER"), false, "the distant marker is not mistaken for the canonical home");
+  const canonicalPosition = screenPosition(canonicalView, "[alpha]");
+  assert.ok(canonicalPosition, "the canonical character name is visible in the city region, not just the inspector");
+  assert.equal(map.mouse({ name: "press", column: canonicalPosition.column, row: canonicalPosition.row, action: "press", button: "left", ctrl: false, alt: false, shift: false }), true);
+  assert.deepEqual(map.selected, { kind: "character", id: "a" }, "the rendered canonical hit selects the same registered identity");
 });
 
 test("session follow tracks the drawn walk during movement and settles at the canonical home", () => {
