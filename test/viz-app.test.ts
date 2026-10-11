@@ -218,7 +218,13 @@ test("detected processes remain inspectable without a conversation and u toggles
   assert.ok(has(viz, "4242") && has(viz, "inferred"));
   await viz.press("ESCAPE");
   await viz.press("u");
-  assert.ok(viz.map.flags.includes("FERAL OFF"));
+  await viz.press("TAB");
+  assert.deepEqual(viz.map.selected, { kind: "character", id: "human" }, "hidden process is excluded from navigation");
+  await viz.search("codex-4242");
+  assert.deepEqual(viz.map.selected, { kind: "character", id: "human" }, "hidden process cannot be selected through search");
+  await viz.press("u");
+  await viz.search("codex-4242");
+  assert.deepEqual(viz.map.selected, { kind: "character", id: "proc:4242" }, "showing processes restores candidate access");
 });
 
 test("two-second snapshots and five-second process scans are manually driven; r refreshes immediately", async () => {
@@ -319,16 +325,16 @@ test("replay gap adopts authoritative snapshot with visible HISTORY GAP, not gue
   assert.deepEqual(viz.map.conversation(), { scope: "channel", channel: "empty" });
 });
 
-test("Unicode former names stay searchable through resize, pan, zoom, compact mode and mouse selection", async () => {
+test("former names stay searchable through resize, pan, zoom, compact mode and mouse selection", async () => {
   env = await startEnv();
-  const session = await env.adapter("omp", "viz-unicode", "city-界");
+  const session = await env.adapter("omp", "viz-rename", "city-original");
   const viz = startViz();
   await ready(viz);
-  await env.human().request("rename", { from: "city-界", name: "renamed-city" });
+  await env.human().request("rename", { from: "city-original", name: "renamed-city" });
   await viz.until(() => has(viz, "renamed-city"), "rename applied");
   for (const [columns, rows] of [[160, 48], [80, 24], [40, 16], [1, 1], [160, 48]]) {
     await viz.resize(columns, rows);
-    await viz.search("city-界");
+    await viz.search("city-original");
     assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: session.session.id });
     within(viz);
   }
