@@ -1,4 +1,7 @@
 node_modules/
 dist/
-.claude/index/
 docs/
+site/
+.omp/
+.claude/*
+!.claude/skills/
