@@ -6,6 +6,7 @@ import { TerminalAdapter, TerminalUnavailableError } from "../tui/terminal.js";
 import type { KeyInput, MouseInput, TerminalAdapterOptions } from "../tui/terminal.js";
 import { REQUEST_TIMEOUT_MS, TICK_MS, VizMap, within } from "./map.js";
 import type { MapDue } from "./map.js";
+import { rebaseCitySnapshot } from "./model.js";
 import { scanProcesses } from "./scan.js";
 import type { ProcInfo } from "./scan.js";
 import { readVizSettings } from "./settings.js";
@@ -152,22 +153,17 @@ export class VizApp {
       if (this.closed || attempt !== this.loadSeq) return;
       for (const item of bundle.events) this.applyEvent(item, false);
       this.watermark = Math.max(this.watermark, bundle.watermark);
+      const pending = [...this.pending.values()].filter((item) => item.position > this.watermark).sort((a, b) => a.position - b.position);
+      rebaseCitySnapshot(bundle, pending);
       this.identities = bundle.identities;
-      let changed = false;
-      for (const item of [...this.pending.values()].sort((a, b) => a.position - b.position)) {
-        if (item.position <= this.watermark) continue;
-        this.applyEvent(item, item.animate);
-        changed ||= item.event.type !== "message";
-      }
+      for (const item of pending) this.applyEvent(item, item.animate);
       this.pending.clear();
       if (bundle.gap) this.map.setNotice("HISTORY GAP · missing channel renames cannot be recovered");
-      if (!changed) {
-        this.map.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
-        this.map.setConnection("connected");
-        this.subscribed = true;
-        this.hydrated = true;
-      }
-      if (changed) this.refreshAgain = true;
+      this.map.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
+      this.map.setConnection("connected");
+      this.subscribed = true;
+      this.hydrated = true;
+      if (pending.some((item) => item.event.type === "session" || item.event.type === "channel" || item.event.type === "ping")) this.refreshAgain = true;
     } catch {
       if (this.closed || attempt !== this.loadSeq) return;
       this.subscribed = false;

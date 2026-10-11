@@ -3356,6 +3356,95 @@ test("embedded viz settings and forced reduced motion are shown; polling does no
   assertWithin(ui);
 });
 
+test("a slow first Map bundle publishes even when a refresh is coalesced and its retry fails", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  const captured = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let lists = 0;
+  const gated = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (op === "list") {
+        lists++;
+        if (lists === 1) { captured.resolve(); await release.promise; }
+        else throw new Error("coalesced retry failed");
+      }
+      return reply;
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, gated, { scan: async () => [] });
+  const opening = ui.press("m");
+  await captured.promise;
+  const refreshing = ui.press("r");
+  release.resolve();
+  await Promise.all([opening, refreshing]);
+  assert.equal(lists, 2, "refresh requests coalesce into one follow-up");
+  assert.ok(hasRow(ui, "SIGNAL LOST"), "retry failure honestly marks the retained city stale");
+  await searchMap(ui, "wrk-alpha");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id }, "first successful bundle was published and retained");
+  await searchMap(ui, "ops");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "channel", channel: "ops" });
+});
+
+test("embedded in-flight rename and session events rebase the city before publication, despite a failed follow-up", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  const capturedList = Promise.withResolvers<void>();
+  const capturedChannels = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let hold = false;
+  let held = false;
+  const gated = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (hold && op === "channel_list") capturedChannels.resolve();
+      if (hold && op === "list") {
+        if (held) throw new Error("event follow-up failed");
+        held = true;
+        capturedList.resolve();
+        await release.promise;
+      }
+      return reply;
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, gated, { scan: async () => [] });
+  await ui.press("m");
+  await searchMap(ui, "ops");
+  const selected = mapOf(ui).selected;
+  hold = true;
+  const refreshing = ui.press("r");
+  await Promise.all([capturedList.promise, capturedChannels.promise]);
+  await env.human().request("channel_rename", { channel: "ops", name: "rebase-ops" });
+  await turns(() => {
+    const scope = mapOf(ui).conversation();
+    return scope?.scope === "channel" && scope.channel === "rebase-ops";
+  }, "rename applied before the old bundle settles");
+  await env.human().request("rename", { from: "wrk-alpha", name: "rebase-alpha" });
+  const observing = ui.app as unknown as { activity: PositionedEvent[] };
+  await turns(() => observing.activity.some((item) => item.event.type === "session" && item.event.session.name === "rebase-alpha"), "newer session event applied during the held fetch");
+  release.resolve();
+  await refreshing;
+  assert.deepEqual(mapOf(ui).selected, selected, "late bundle preserves the already-renamed immutable venue key");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "channel", channel: "rebase-ops" });
+  const venues = new Set<string>();
+  for (let i = 0; i < 12; i++) {
+    await ui.press("TAB");
+    const scope = mapOf(ui).conversation();
+    if (scope?.scope === "channel") venues.add(scope.channel);
+  }
+  assert.ok(venues.has("rebase-ops") && !venues.has("ops"), "old channel summary cannot resurrect its name");
+  await searchMap(ui, "rebase-alpha");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
+  assert.ok(hasRow(ui, "rebase-alpha"), "listed details are rebased over the newer identity event");
+});
+
 test("channel rename updates the channel list and header in the TUI", async () => {
   env = await startEnv();
   const human = env.human();
