@@ -21,6 +21,11 @@
     "claude": { "4": ["walk_a", "walk_b"] },
     "mistral": { "2": ["send_a"] }
   },
-  "neutral": { "hueMin": 22, "hueMax": 48, "saturationMin": 0.6, "valueMin": 0.35 },
-  "neutralKeep": {}
+  "neutral": { "hueMin": 8, "hueMax": 48, "saturationMin": 0.6, "valueMin": 0.35 },
+  "neutralKeep": {
+    "1": [6, 7],
+    "2": [6],
+    "3": [5, 7],
+    "4": [2, 3, 8]
+  }
 }

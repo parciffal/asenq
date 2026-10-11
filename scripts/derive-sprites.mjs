@@ -136,7 +136,15 @@ function paletteOf(sheet, frames) {
     const packed = (sheet.rgba[offset] << 16) | (sheet.rgba[offset + 1] << 8) | sheet.rgba[offset + 2];
     histogram.set(packed, (histogram.get(packed) ?? 0) + 1);
   }
-  let boxes = [[...histogram].sort(([a], [b]) => a - b).map(([packed, count]) => ({ rgb: [packed >> 16, (packed >> 8) & 255, packed & 255], count, packed }))];
+  const pixels = [...histogram].sort(([a], [b]) => a - b).map(([packed, count]) => ({ rgb: [packed >> 16, (packed >> 8) & 255, packed & 255], count, packed }));
+  // Preserve legitimate source whites in their own median-cut box: otherwise a
+  // rare white polo/cap can be averaged into a much larger skin-color population.
+  const white = [], other = [];
+  for (const pixel of pixels) {
+    const { sat, val } = hsv(pixel.rgb);
+    (val >= 0.85 && sat <= 0.25 ? white : other).push(pixel);
+  }
+  let boxes = [other, white].filter((box) => box.length > 0);
   while (boxes.length < config.paletteSize) {
     let selected = -1, channel = 0, widest = -1;
     for (let i = 0; i < boxes.length; i++) {
@@ -220,6 +228,7 @@ function deriveVariant(sheet, frames, outfit, variant) {
   let population = 0;
   for (const frame of frames) for (const p of frame) { frequencies[indexOf(p)]++; population++; }
   const features = palette.map((rgb, i) => { const { sat, val } = hsv(rgb); return sat >= 0.55 && val >= 0.65 && frequencies[i] / population < 0.04; });
+  const whiteFeatures = palette.map((rgb) => { const { sat, val } = hsv(rgb); return val >= 0.85 && sat <= 0.25; });
   const grids = frames.map((frame, frameIndex) => {
     const box = boxes[frameIndex];
     const torso = torsoCenters[frameIndex];
@@ -242,12 +251,13 @@ function deriveVariant(sheet, frames, outfit, variant) {
     return Array.from({ length: config.height }, (_, y) => Array.from({ length: config.width }, (_, x) => {
       const p = y * config.width + x;
       if (area[p] < config.coverage) return ".";
-      let best = 0, feature = -1;
+      let best = 0, feature = -1, whiteFeature = -1;
       for (let i = 0; i < palette.length; i++) {
         if (votes[p][i] > votes[p][best]) best = i;
         if (features[i] && votes[p][i] >= 0.2 && (feature < 0 || votes[p][i] > votes[p][feature])) feature = i;
+        if (whiteFeatures[i] && votes[p][i] >= 0.2 && (whiteFeature < 0 || votes[p][i] > votes[p][whiteFeature])) whiteFeature = i;
       }
-      return (feature >= 0 ? feature : best).toString(12);
+      return (feature >= 0 ? feature : whiteFeature >= 0 ? whiteFeature : best).toString(12);
     }));
   });
   const headCentroid = (grid) => {
