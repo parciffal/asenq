@@ -28,7 +28,7 @@ import { scanProcesses } from "../viz/scan.js";
 import type { ProcInfo } from "../viz/scan.js";
 import { readVizSettings } from "../viz/settings.js";
 import type { VizSettings } from "../viz/settings.js";
-import { rebaseCitySnapshot } from "../viz/app.js";
+import { rebaseCitySnapshot } from "../viz/model.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
