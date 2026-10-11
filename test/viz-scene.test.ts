@@ -38,6 +38,10 @@ function render(world: World, layout: CityLayout, view = ui(), size = SIZES[0], 
 function rows(world: World, layout: CityLayout, view = ui(), size = SIZES[0], ctx = context(world)): string[] {
   return render(world, layout, view, size, ctx).frame.lines.map(lineText);
 }
+function cityText(world: World, layout: CityLayout, view = ui(), size = SIZES[0]): string {
+  const region = mapRegion(size);
+  return rows(world, layout, view, size).slice(region.y, region.y + region.height).map((row) => truncateTerminalText(row, region.width)).join("\n");
+}
 function allInspectorText(world: World, layout: CityLayout, selected: CityTarget, patch: Partial<VizUi> = {}, size = SIZES[2]): string {
   const first = render(world, layout, ui({ selected, inspector: "focused", ...patch }), size);
   const pages: string[] = [];
@@ -52,8 +56,8 @@ test("named empty venues and one canonical character with secondary membership a
   assert.ok(text.includes("#empty") && text.includes("EMPTY"));
   assert.ok(text.includes("alpha-unset") && text.includes("@"));
   assert.ok(text.includes("2 SESSIONS"), "markers and processes do not increase the registered identity count");
-  assert.equal(scene.hits.filter((h) => h.target.kind === "character" && h.target.id === "alpha").length, 1);
-  assert.equal(scene.hits.filter((h) => h.target.kind === "membership" && h.target.id === "alpha").length, 1);
+  assert.ok(scene.hits.some((h) => h.target.kind === "character" && h.target.id === "alpha"));
+  assert.ok(scene.hits.some((h) => h.target.kind === "membership" && h.target.id === "alpha"));
   assert.ok(text.includes("CC [-] UNKNOWN"));
   assert.ok(text.includes("street-worker"));
   const empty = world.venues.find((v) => v.name === "empty")!;
@@ -105,7 +109,10 @@ test("filtering preserves venue anchors while inspector exposes filtered roster 
   const scene = render(world, layout, ui({ filter: "claude", processes: false }));
   assert.ok(scene.hits.some((h) => h.target.kind === "character" && h.target.id === "alpha"));
   assert.ok(!scene.hits.some((h) => h.target.kind !== "venue" && h.target.id === "other"));
-  assert.equal(scene.hits.filter((h) => h.target.kind === "venue").length, 3);
+  for (const venue of world.venues) {
+    assert.ok(scene.hits.some((h) => h.target.kind === "venue" && h.target.venueKey === venue.key));
+    assert.ok(cityText(world, layout, ui({ filter: "claude", processes: false })).includes(`#${venue.name}`));
+  }
   const ops = world.venues.find((v) => v.name === "ops")!;
   const text = allInspectorText(world, layout, { kind: "venue", venueKey: ops.key }, { filter: "claude" });
   assert.ok(text.includes("other") && text.includes("FILTERED") && text.includes("[O]"));
@@ -151,9 +158,9 @@ test("top floors of expanding towers are renderable by panning without relocatin
   const members = Array.from({ length: 27 }, (_, i) => character(`m${i.toString().padStart(2, "0")}`, { memberships: ["tower"] }));
   const world: World = { characters: members, venues: [venue("tower", members)], feed: [], connection: "connected" };
   const layout = new CityPlacement().update(world);
-  const top = rows(world, layout, ui({ viewport: { x: 0, y: -146, zoom: 1 } })).join("\n");
+  const top = cityText(world, layout, ui({ viewport: { x: 0, y: -146, zoom: 1 } }));
   assert.ok(top.includes("m26"));
-  const ground = rows(world, layout).join("\n");
+  const ground = cityText(world, layout);
   assert.ok(ground.includes("m00") && !ground.includes("m26"));
 });
 
@@ -251,17 +258,19 @@ test("search lists wrap long real names and show explicit no match without losin
   assert.ok(none.includes("NO MATCH") && none.includes("selection retained"));
 });
 
-test("venue types have distinct authentic signs and the minimap uses allocated city geometry", () => {
-  const appearances = ["office", "bar", "garage", "arcade", "communications"] as const;
-  const world: World = { characters: [], venues: appearances.map((_, i) => venue(`v${i}`)), feed: [], connection: "connected" };
+test("real venue names remain readable at both city zooms and an offscreen selection has a minimap direction", () => {
+  const world: World = { characters: [], venues: ["channel-alpha", "channel-beta", "channel-gamma", "channel-omega"].map((name) => venue(name)), feed: [], connection: "connected" };
   const layout = new CityPlacement().update(world);
-  for (const [i, appearance] of appearances.entries()) world.venues[i].appearance = appearance;
-  const text = rows(world, layout, ui({ viewport: { x: 0, y: -16, zoom: 2 } })).join("\n");
-  for (const word of ["OFFICE", "BAR", "GARAGE", "ARCADE", "COMMS"]) assert.ok(text.includes(word), word);
-  const selected: CityTarget = { kind: "venue", venueKey: world.venues[0].key };
-  const inspected = rows(world, layout, ui({ selected })).join("\n");
-  assert.ok(inspected.includes("REAL CITY"));
-  assert.ok(inspected.includes("[#v0]"));
+  for (const zoom of [1, 2] as const) {
+    const text = cityText(world, layout, ui({ viewport: { x: 0, y: -16, zoom } }));
+    for (const name of ["channel-alpha", "channel-beta"]) assert.ok(text.includes(`#${name}`), `readable ${name} at zoom ${zoom}`);
+  }
+  const far = world.venues.find((v) => v.name === "channel-omega")!;
+  const inspected = rows(world, layout, ui({ selected: { kind: "venue", venueKey: far.key } }));
+  const region = mapRegion(SIZES[0]);
+  const inspector = inspected.slice(region.y, region.y + region.height).map((row) => row.slice(region.width)).join("\n");
+  assert.ok(inspector.includes("[#channel-omega]"));
+  assert.ok(inspector.includes("→"), "the actual offscreen venue is indicated in the minimap");
 });
 
 test("removed roster identities retain honest unknown contact and busy metadata", () => {

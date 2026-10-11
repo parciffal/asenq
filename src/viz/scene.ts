@@ -169,7 +169,8 @@ function drawVenue(c: Canvas, placed: PlacedVenue, ui: VizUi, region: Rect, hits
     if (!intersects(fr, region)) continue;
     line(c, { x: fr.x, y: fr.y + fr.height - 1 }, { x: fr.x + fr.width - 1, y: fr.y + fr.height - 1 }, sid, region);
     const mid = screen({ x: placed.entrance.x, y }, ui, region);
-    line(c, mid, { x: mid.x, y: fr.y + fr.height - 2 }, detail, region);
+    // Keep the screen-space venue sign clear, including at compressed zoom.
+    line(c, { x: mid.x, y: Math.max(mid.y, r.y + 2) }, { x: mid.x, y: fr.y + fr.height - 2 }, detail, region);
     const decor = placed.venue.appearance === "bar" ? "┬──┬  BAR" : placed.venue.appearance === "garage" ? "▤ ▤ GARAGE" : placed.venue.appearance === "arcade" ? "▣ ▣ ARCADE" : placed.venue.appearance === "communications" ? "┴ /\\ COMMS" : "┬ ┬ OFFICE";
     if (ui.viewport.zoom === 1) text(c, fr.x + 1, fr.y + fr.height - 2, decor, detail, region, fr.width - 2);
   }
