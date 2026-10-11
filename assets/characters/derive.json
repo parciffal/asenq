@@ -1,0 +1,26 @@
+{
+  "maskAlpha": 250,
+  "pixelAlpha": 128,
+  "bodyMinPixels": 800,
+  "componentMinPixels": 15,
+  "kmeansIterations": 50,
+  "width": 20,
+  "height": 24,
+  "baseline": 23,
+  "anchorX": 9.5,
+  "paletteSize": 12,
+  "coverage": 0.4,
+  "clipLimit": 0.02,
+  "scaleFit": {
+    "policy": "affected-variants-only; maximal shared scale <= 23/idle_a bbox height satisfying <=2% opaque-area clipping for every pose",
+    "iterations": 40
+  },
+  "headFix": {
+    "codex": { "2": ["work_a"], "3": ["work_a"], "5": ["work_a"], "6": ["work_a", "walk_a"] },
+    "qwen": { "5": ["walk_a", "walk_b"] },
+    "claude": { "4": ["walk_a", "walk_b"] },
+    "mistral": { "2": ["send_a"] }
+  },
+  "neutral": { "hueMin": 22, "hueMax": 48, "saturationMin": 0.6, "valueMin": 0.35 },
+  "neutralKeep": {}
+}
