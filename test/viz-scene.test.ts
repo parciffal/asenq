@@ -171,7 +171,7 @@ test("mini and no-color sprites remain silhouettes with explicit bracketed selec
     const scene = render(world, layout, view, SIZES[0], context(world, { color: false }));
     const city = scene.frame.lines.map(lineText).slice(2, 2 + mapRegion(SIZES[0]).height).map((s) => s.slice(0, 128)).join("\n");
     assert.match(city, /[█▀▄]/);
-    assert.match(city, zoom === 1 ? /\[alpha-unset\]/ : /\[alpha…\]/);
+    assert.match(city, /\[[a-z][^\]\n]*\]/, "the selected name has complete brackets at either sprite scale");
   }
 });
 
@@ -258,12 +258,12 @@ test("search lists wrap long real names and show explicit no match without losin
   assert.ok(none.includes("NO MATCH") && none.includes("selection retained"));
 });
 
-test("real venue names remain readable at both city zooms and an offscreen selection has a minimap direction", () => {
+test("venue inspection retains full real names and an offscreen selection has a minimap direction", () => {
   const world: World = { characters: [], venues: ["channel-alpha", "channel-beta", "channel-gamma", "channel-omega"].map((name) => venue(name)), feed: [], connection: "connected" };
   const layout = new CityPlacement().update(world);
-  for (const zoom of [1, 2] as const) {
-    const text = cityText(world, layout, ui({ viewport: { x: 0, y: -16, zoom } }));
-    for (const name of ["channel-alpha", "channel-beta"]) assert.ok(text.includes(`#${name}`), `readable ${name} at zoom ${zoom}`);
+  for (const channel of world.venues) {
+    const text = allInspectorText(world, layout, { kind: "venue", venueKey: channel.key });
+    assert.ok(text.includes(channel.name));
   }
   const far = world.venues.find((v) => v.name === "channel-omega")!;
   const inspected = rows(world, layout, ui({ selected: { kind: "venue", venueKey: far.key } }));
@@ -298,12 +298,97 @@ test("reduced motion busy and unknown city sprites do not vary with clock steps"
   assert.ok(a.frame.lines.map(lineText).join("\n").includes("BUSY"));
 });
 
-test("wide graphemes crossing a viewport boundary leave no orphan half-cell", () => {
+
+test("compressed rooms keep neighboring glyphs and labels separate across floor and viewport boundaries", () => {
+  const members = ["a", "b", "c", "d"].map((id) => character(id, { name: id.repeat(18), memberships: ["venue-long-real-name", "secondary-real-name"] }));
+  const world: World = { characters: members, venues: [venue("venue-long-real-name", members), venue("secondary-real-name", members)], feed: [], connection: "connected" };
+  const layout = new CityPlacement().update(world);
+  for (const zoom of [1, 2, 4] as const) for (const x of [0, 1, 2, 3]) {
+    const scene = render(world, layout, ui({ viewport: { x, y: -36, zoom } }));
+    const region = mapRegion(SIZES[0]);
+    const filtered = render(world, layout, ui({ filter: "codex", viewport: { x, y: -36, zoom } }));
+    for (let row = region.y; row < region.y + region.height; row++) {
+      const sign = truncateTerminalText(lineText(filtered.frame.lines[row]), region.width);
+      if (sign.includes("#")) assert.equal(truncateTerminalText(lineText(scene.frame.lines[row]), region.width), sign, "canonical sprites and secondary markers never overwrite venue names or cues");
+    }
+    const local = scene.hits.filter((h) => h.priority !== 10 && h.target.kind !== "venue");
+    for (const member of members) {
+      assert.ok(local.some((h) => h.target.kind === "character" && h.target.id === member.id), `canonical ${member.id} at zoom ${zoom}`);
+      assert.ok(local.some((h) => h.target.kind === "membership" && h.target.id === member.id), `secondary ${member.id} at zoom ${zoom}`);
+    }
+    for (let i = 0; i < local.length; i++) for (let j = i + 1; j < local.length; j++) {
+      const a = local[i], b = local[j];
+      if (targetKey(a.target) === targetKey(b.target)) continue;
+      assert.ok(a.column + a.width <= b.column || b.column + b.width <= a.column || a.row + a.height <= b.row || b.row + b.height <= a.row, "different targets never overwrite one another's drawn glyph/label cells");
+    }
+    const text = scene.frame.lines.slice(region.y, region.y + region.height).map((row) => truncateTerminalText(lineText(row), region.width)).join("\n");
+    for (const id of ["a", "b", "c", "d"]) assert.ok(text.includes(id.repeat(2)), `readable name prefix for ${id}`);
+    assert.ok(text.includes("@"), "secondary membership stays visibly distinct from a canonical character");
+    for (const row of scene.frame.lines) assert.ok(terminalTextWidth(lineText(row)) <= SIZES[0].columns);
+  }
+});
+
+test("selected Unicode names keep whole brackets without painting over neighboring glyphs", () => {
   const { world, placement } = fixture();
-  world.characters[1].name = "漢字🙂e\u0301";
+  world.characters[1].name = "\u001b[31m漢字🙂e\u0301\u001b[0m\u202e-long-name";
   const layout = placement.update(world);
-  const left = rows(world, layout, ui({ viewport: { x: 51, y: -16, zoom: 1 } }));
-  assert.ok(left[10].startsWith(" 字🙂e\u0301"), "the partly clipped first grapheme is omitted as a whole");
-  const right = rows(world, layout, ui({ viewport: { x: -77, y: -16, zoom: 1 } }));
-  assert.ok(!truncateTerminalText(right[10], mapRegion(SIZES[0]).width).includes("漢"), "a two-cell grapheme cannot start in the city's last cell");
+  for (const zoom of [1, 2, 4] as const) for (const x of [40, 48, 50, 51, 52, 53, 54]) {
+    const scene = render(world, layout, ui({ selected: { kind: "character", id: "alpha" }, viewport: { x, y: -16, zoom } }));
+    const region = mapRegion(SIZES[0]);
+    const selectedText = scene.frame.lines.slice(region.y, region.y + region.height).map((row) => {
+      if (typeof row === "string") return "";
+      let column = 0, text = "";
+      for (const span of row) {
+        const available = Math.max(0, region.width - column);
+        if (span.style?.foreground === "#f4e45a") text += truncateTerminalText(span.text, available);
+        column += terminalTextWidth(span.text);
+      }
+      return text;
+    }).join("\n");
+    assert.match(selectedText, /\[[^\]\n]+\]/u, "selection remains a complete bracketed, possibly ellipsized name");
+    for (const line of scene.frame.lines) {
+      const text = lineText(line);
+      assert.equal(sanitizeTerminalText(text), text);
+      assert.ok(terminalTextWidth(text) <= SIZES[0].columns);
+    }
+  }
+});
+
+test("compact and focused headers retain target counts without inventing an offscreen number", () => {
+  const { world, layout } = fixture();
+  for (const size of [SIZES[0], SIZES[2]]) {
+    const scene = render(world, layout, ui({ selected: { kind: "character", id: "alpha" }, inspector: "focused" }), size);
+    const header = lineText(scene.frame.lines[0]);
+    assert.ok(header.includes(`${layout.targets.length} TOTAL`));
+    assert.ok(header.includes(`${matchingTargets(world, layout, ui()).length} MATCH`));
+    assert.doesNotMatch(header, /\d+ OFF(?:SCREEN)?/);
+  }
+});
+
+test("every compressed empty venue retains zero occupancy, an entrance and its appearance cue after rename and selection", () => {
+  const initialNames = new Map<CityVenue["appearance"], string>();
+  for (let i = 0; i < 100 && initialNames.size < 5; i++) {
+    const world: World = { characters: [], venues: [venue(`theme-${i}`)], feed: [], connection: "connected" };
+    new CityPlacement().update(world);
+    initialNames.set(world.venues[0].appearance, world.venues[0].name);
+  }
+  assert.equal(initialNames.size, 5, "fixtures include all five real allocated venue types");
+  for (const zoom of [1, 2, 4] as const) for (const selected of [false, true]) {
+    const cues: string[] = [];
+    for (const initialName of initialNames.values()) {
+      const world: World = { characters: [], venues: [venue(initialName)], feed: [], connection: "connected" };
+      const placement = new CityPlacement();
+      placement.update(world);
+      placement.renameChannel(initialName, "operations-control-plane-with-a-very-long-real-name");
+      world.venues[0].name = "operations-control-plane-with-a-very-long-real-name";
+      const layout = placement.update(world);
+      const view = ui({ selected: selected ? { kind: "venue", venueKey: world.venues[0].key } : null, viewport: { x: 0, y: -16, zoom } });
+      const text = cityText(world, layout, view);
+      assert.match(text, /(?:EMPTY|∅).*0/);
+      assert.ok(text.includes("╥"), "the real entrance remains available at every zoom");
+      if (selected) assert.match(text, /\[#[^\]\n]+\]/);
+      cues.push(text);
+    }
+    assert.equal(new Set(cues).size, 5, "identical long names cannot erase distinct venue appearances");
+  }
 });
