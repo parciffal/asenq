@@ -29,6 +29,32 @@ const message = (id: string, overrides: Partial<StoredMessage> = {}): StoredMess
   status: "delivered", ...overrides,
 });
 const rows = (lines: readonly TerminalLine[]): string => lines.map((l) => typeof l === "string" ? l : l.map((s) => s.text).join("")).join("\n");
+const CITY_SIZE = { columns: 160, rows: 48 } as const;
+const plainLine = (line: TerminalLine): string => typeof line === "string" ? line : line.map((span) => span.text).join("");
+function screenPosition(lines: readonly TerminalLine[], text: string, cityWidth = 128): { column: number; row: number } | undefined {
+  for (let row = 0; row < lines.length; row++) {
+    const line = plainLine(lines[row]!);
+    let column = line.indexOf(text);
+    while (column >= 0) {
+      if (column < cityWidth) return { column, row };
+      column = line.indexOf(text, column + 1);
+    }
+  }
+  return undefined;
+}
+function cityHas(lines: readonly TerminalLine[], text: string, cityWidth = 128): boolean {
+  return lines.some((line) => plainLine(line).slice(0, cityWidth).includes(text));
+}
+function packetCells(lines: readonly TerminalLine[], cityWidth = 128): { column: number; row: number }[] {
+  const found: { column: number; row: number }[] = [];
+  for (let row = 0; row < lines.length; row++) {
+    for (const match of plainLine(lines[row]!).slice(0, cityWidth).matchAll(/[⠁⠂⠄⡀⠒]/gu)) {
+      if (match.index !== undefined) found.push({ column: match.index, row });
+    }
+  }
+  return found;
+}
+
 function search(map: VizMap, query: string): void {
   map.key(key("/", "/"));
   map.key(key(query, query));
@@ -305,30 +331,127 @@ test("membership targets open the same identity and process targets never expose
   assert.equal(map.key(key("ESCAPE")), true);
 });
 
-test("pan, drag, zoom and follow operate on camera only and keep a selected identity", () => {
+test("traffic follow centers a relevant route packet, ignores unrelated traffic, then returns to the selected identity", () => {
+  const channels = Array.from({ length: 101 }, (_, i) => channel(`venue-${String(i).padStart(3, "0")}`,
+    i === 0 ? ["a"] : i === 100 ? ["b", "c"] : []));
   const map = new VizMap({ now: () => NOW });
-  map.setSnapshot([session({ id: "a", name: "alpha" })], [channel("ops", ["a"])], []);
-  map.frame({ columns: 160, rows: 48 });
+  map.setSnapshot([session({ id: "a", name: "alpha" }), session({ id: "b", name: "beta" }), session({ id: "c", name: "gamma" })], channels, []);
+  map.frame(CITY_SIZE);
   search(map, "alpha");
-  const selected = map.selected;
-  map.key(key("F", "F"));
-  assert.match(map.flags, /FOLLOW:session/);
-  map.key(key("RIGHT"));
-  assert.doesNotMatch(map.flags, /FOLLOW/);
-  map.key(key("-", "-"));
-  map.key(key("+", "+"));
-  map.key(key("0", "0"));
-  map.mouse({ name: "drag", column: 20, row: 10, action: "drag", button: "left", ctrl: false, alt: false, shift: false, from: { column: 10, row: 10 } });
-  assert.deepEqual(map.selected, selected);
-  map.key(key("f", "f"));
-  assert.match(map.flags, /FILTER:claude/);
-  assert.deepEqual(map.selected, selected, "filtering must leave the selected identity inspectable");
-  assert.deepEqual(map.conversation(), { scope: "session", sessionId: "a" });
-  map.key(key("F", "F"));
-  assert.match(map.flags, /FOLLOW:session/);
   map.key(key("T", "T"));
-  assert.match(map.flags, /FOLLOW:traffic/);
-  assert.match(rows(map.frame({ columns: 80, rows: 24 })), /alpha/);
+  assert.deepEqual(map.selected, { kind: "character", id: "a" });
+  map.onMessage(message("relevant"), true);
+  map.step(700);
+  const traveling = map.frame(CITY_SIZE);
+  const relevantDots = packetCells(traveling);
+  assert.ok(relevantDots.some((p) => Math.abs(p.column - 64) <= 1 && Math.abs(p.row - 22) <= 1),
+    "the followed packet should render at the camera center along the long city route");
+  assert.equal(screenPosition(traveling, "[alpha]"), undefined, "the camera should leave the selected endpoint while following its packet");
+
+  map.onMessage(message("unrelated", { from: "beta", fromSessionId: "b", to: "gamma", toSessionId: "c" }), true);
+  const withUnrelated = map.frame(CITY_SIZE);
+  assert.deepEqual(packetCells(withUnrelated), relevantDots, "traffic unrelated to the selection must not move the camera");
+
+  map.step(800);
+  const returned = map.frame(CITY_SIZE);
+  const alpha = screenPosition(returned, "[alpha]");
+  assert.ok(alpha && alpha.column >= 55 && alpha.column <= 65, "after its packet expires, follow returns to the selected canonical character");
+  assert.deepEqual(packetCells(returned), [], "the unrelated packet remains outside the selected character's view");
+});
+
+test("manual mouse pan releases traffic follow while the packet is still moving", () => {
+  const map = new VizMap({ now: () => NOW });
+  map.setSnapshot([session({ id: "a", name: "alpha" }), session({ id: "b", name: "beta" })], [], []);
+  map.frame(CITY_SIZE);
+  search(map, "alpha");
+  map.key(key("T", "T"));
+  map.onMessage(message("pan-live"), true);
+  const beforePan = screenPosition(map.frame(CITY_SIZE), "[alpha]")!;
+
+  assert.equal(map.mouse({ name: "wheel-up", column: 0, row: 10, action: "wheel-up", ctrl: false, alt: false, shift: false }), true);
+  const panned = screenPosition(map.frame(CITY_SIZE), "[alpha]")!;
+  assert.equal(panned.row, beforePan.row + 3, "manual wheel pan changes the rendered character position");
+
+  map.step(500);
+  const activePacket = map.frame(CITY_SIZE);
+  assert.deepEqual(screenPosition(activePacket, "[alpha]"), panned, "later packet progress must not reclaim a manually panned camera");
+  assert.ok(packetCells(activePacket).length > 0, "the packet must still be visible while the camera stays panned");
+});
+
+test("following a selected membership marker centers its canonical registered character", () => {
+  const channels = [channel("home", ["a"]), ...Array.from({ length: 4 }, (_, i) => channel(`middle-${i}`)), channel("secondary", ["a"])];
+  const map = new VizMap({ now: () => NOW });
+  map.setSnapshot([session({ id: "a", name: "alpha" })], channels, []);
+  map.frame(CITY_SIZE);
+  search(map, "alpha");
+  const marker = map.selected;
+  assert.deepEqual(marker && { kind: marker.kind, id: marker.kind === "venue" ? undefined : marker.id },
+    { kind: "membership", id: "a" });
+  const localMarker = map.frame(CITY_SIZE);
+  assert.ok(cityHas(localMarker, "OMP [-] MEMBER"), "the first search result is the secondary membership marker");
+
+  map.key(key("F", "F"));
+  const canonicalView = map.frame(CITY_SIZE);
+  assert.deepEqual(map.selected, marker, "following changes only the camera, not the selected membership anchor");
+  assert.ok(screenPosition(canonicalView, "[alpha]"), "the canonical identity is centered and visible");
+  assert.equal(cityHas(canonicalView, "OMP [-] MEMBER"), false, "the distant marker is not mistaken for the canonical home");
+});
+
+test("session follow tracks the drawn walk during movement and settles at the canonical home", () => {
+  const alpha = session({ id: "a", name: "alpha" });
+  const map = new VizMap({ now: () => NOW });
+  map.setSnapshot([alpha], [channel("a", ["a"]), channel("z")], []);
+  map.frame(CITY_SIZE);
+  search(map, "alpha");
+  map.key(key("F", "F"));
+  const before = map.frame(CITY_SIZE);
+  const oldVenue = screenPosition(before, "#a")!;
+  assert.ok(oldVenue);
+
+  map.setSnapshot([alpha], [channel("a"), channel("z", ["a"])], []);
+  const movementStart = map.frame(CITY_SIZE);
+  assert.ok(cityHas(movementStart, "MOVING"));
+  assert.ok(screenPosition(movementStart, "[alpha]"), "follow stays on the actually drawn character at movement start");
+  assert.deepEqual(screenPosition(movementStart, "#a"), oldVenue, "the walk begins from its prior visible home");
+
+  map.step(250);
+  const inMotion = map.frame(CITY_SIZE);
+  assert.ok(cityHas(inMotion, "MOVING"), "the snapshot-driven walk remains active before its minimum duration");
+  assert.ok(screenPosition(inMotion, "[alpha]"), "the followed character remains in view during movement");
+  assert.notDeepEqual(screenPosition(inMotion, "#a"), oldVenue, "the surrounding city moves as the camera follows the interpolated position");
+
+  map.step(4000);
+  const settled = map.frame(CITY_SIZE);
+  assert.equal(cityHas(settled, "MOVING"), false, "the movement label ends after the walk");
+  assert.ok(screenPosition(settled, "[alpha]"), "follow settles on the character's canonical home");
+});
+
+test("suspending the map prevents hidden traffic from replaying when the map returns", () => {
+  const channels = Array.from({ length: 101 }, (_, i) => channel(`venue-${String(i).padStart(3, "0")}`,
+    i === 0 ? ["a"] : i === 100 ? ["b"] : []));
+  const sessions = [session({ id: "a", name: "alpha" }), session({ id: "b", name: "beta" })];
+  const map = new VizMap({ now: () => NOW });
+  map.setSnapshot(sessions, channels, []);
+  map.frame(CITY_SIZE);
+  search(map, "alpha");
+  map.key(key("T", "T"));
+  map.onMessage(message("before-suspend"), true);
+  map.step(700);
+  assert.ok(packetCells(map.frame(CITY_SIZE)).length > 0, "the visible city has a live observed packet before suspension");
+
+  map.suspend();
+  const hidden = message("hidden-while-suspended");
+  map.onMessage(hidden, false);
+  map.setSnapshot(sessions, channels, []);
+  assert.deepEqual(packetCells(map.frame(CITY_SIZE)), [], "returning to the map does not resurrect packets from before or during suspension");
+  map.onMessage(hidden, true);
+  assert.deepEqual(packetCells(map.frame(CITY_SIZE)), [], "re-delivering the hidden event after return does not animate history");
+
+  map.onMessage(message("fresh-after-return"), true);
+  map.step(700);
+  const fresh = map.frame(CITY_SIZE);
+  assert.ok(packetCells(fresh).some((p) => Math.abs(p.column - 64) <= 1 && Math.abs(p.row - 22) <= 1),
+    "fresh traffic after return is followed normally");
 });
 
 // ---------------------------------------------------------------- scan: classify / parsePs
