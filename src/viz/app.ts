@@ -24,6 +24,55 @@ export type VizDeps = {
   reducedMotion?: boolean;
 };
 
+/** A fetched bundle, rebased over authoritative events received while requests were in flight. */
+export type CitySnapshot = { sessions: ListedSession[]; channels: ChannelSummary[]; identities: SessionIdentity[] };
+export function rebaseCitySnapshot(bundle: CitySnapshot, events: readonly PositionedEvent[]): void {
+  for (const { event } of events) {
+    if (event.type === "session") {
+      const identity = event.session;
+      const at = bundle.identities.findIndex((session) => session.id === identity.id);
+      if (at < 0) bundle.identities.push(identity);
+      else bundle.identities[at] = identity;
+      const live = bundle.sessions.findIndex((session) => session.id === identity.id);
+      if (live < 0) continue; // Identity events do not report contact or availability.
+      if (identity.state === "removed") bundle.sessions.splice(live, 1);
+      else {
+        const session = bundle.sessions[live];
+        bundle.sessions[live] = {
+          ...session, name: identity.name, previousNames: identity.previousNames,
+          harness: identity.harness === "unknown" ? session.harness : identity.harness,
+          cwd: identity.cwd ?? session.cwd, state: identity.state, inbound: identity.inbound, role: identity.role ?? null,
+        };
+      }
+    } else if (event.type === "channel") {
+      const previous = bundle.channels.find((channel) => channel.name === event.channel.name
+        || (event.action === "renamed" && channel.name === event.oldName));
+      const channel = { ...event.channel };
+      if (channel.memberIds === undefined && previous?.memberIds !== undefined) channel.memberIds = previous.memberIds;
+      // A later post may already be included in the fetched summary.
+      if (previous && previous.lastOrder > channel.lastOrder) {
+        channel.count = previous.count;
+        channel.lastAt = previous.lastAt;
+        channel.lastOrder = previous.lastOrder;
+      }
+      if (event.action === "renamed" && event.oldName) bundle.channels = bundle.channels.filter((item) => item.name !== event.oldName);
+      const at = bundle.channels.findIndex((item) => item.name === channel.name);
+      if (at < 0) bundle.channels.push(channel);
+      else bundle.channels[at] = channel;
+    } else if (event.type === "ping") {
+      const session = bundle.sessions.find((session) => session.id === event.sessionId);
+      if (session?.state === "live") session.ping = event.ping;
+    } else if (event.type === "message" && event.status === "posted" && event.msg.channel !== undefined) {
+      const channel = bundle.channels.find((channel) => channel.name === event.msg.channel);
+      if (channel && event.msg.order > channel.lastOrder) {
+        channel.count++;
+        channel.lastAt = event.msg.createdAt;
+        channel.lastOrder = event.msg.order;
+      }
+    }
+  }
+}
+
 /** Standalone full-screen `asenq viz`: a client, a timer and a screen around a `VizMap`. */
 export class VizApp {
   private readonly screen: Screen;
@@ -152,22 +201,17 @@ export class VizApp {
       if (this.closed || attempt !== this.loadSeq) return;
       for (const item of bundle.events) this.applyEvent(item, false);
       this.watermark = Math.max(this.watermark, bundle.watermark);
+      const pending = [...this.pending.values()].filter((item) => item.position > this.watermark).sort((a, b) => a.position - b.position);
+      rebaseCitySnapshot(bundle, pending);
       this.identities = bundle.identities;
-      let changed = false;
-      for (const item of [...this.pending.values()].sort((a, b) => a.position - b.position)) {
-        if (item.position <= this.watermark) continue;
-        this.applyEvent(item, item.animate);
-        changed ||= item.event.type !== "message";
-      }
+      for (const item of pending) this.applyEvent(item, item.animate);
       this.pending.clear();
       if (bundle.gap) this.map.setNotice("HISTORY GAP · missing channel renames cannot be recovered");
-      if (!changed) {
-        this.map.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
-        this.map.setConnection("connected");
-        this.subscribed = true;
-        this.hydrated = true;
-      }
-      if (changed) this.refreshAgain = true;
+      this.map.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
+      this.map.setConnection("connected");
+      this.subscribed = true;
+      this.hydrated = true;
+      if (pending.some((item) => item.event.type === "session" || item.event.type === "channel" || item.event.type === "ping")) this.refreshAgain = true;
     } catch {
       if (this.closed || attempt !== this.loadSeq) return;
       this.subscribed = false;

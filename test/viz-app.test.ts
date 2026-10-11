@@ -361,6 +361,113 @@ test("settings warnings and reduced motion are visible and busy frames remain st
   assert.ok(has(viz, "neutral") && has(viz, "unknown"));
 });
 
+test("initial successful snapshots publish during continuous session and ping events, and survive a failing retry", async () => {
+  env = await startEnv();
+  const { alpha } = await fleet();
+  const fetched = Array.from({ length: 4 }, () => Promise.withResolvers<void>());
+  const release = Array.from({ length: 4 }, () => Promise.withResolvers<void>());
+  let attempts = 0;
+  let sessionEvents = 0;
+  let pingEvents = 0;
+  const viz = startViz({ client: (options) => {
+    const client = new AsenqClient({ ...options, autoStart: false, onPush: (push) => {
+      options.onPush?.(push);
+      if (push.push === "event" && push.event.type === "session") sessionEvents++;
+      if (push.push === "event" && push.event.type === "ping") pingEvents++;
+    } });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (op === "list") {
+        const at = attempts++;
+        fetched[at]?.resolve();
+        await release[at]?.promise;
+        if (at === 3) throw new Error("retry lost signal");
+      }
+      return reply;
+    };
+    return client;
+  } });
+  let current = "wrk-alpha";
+  for (let pass = 0; pass < 3; pass++) {
+    await fetched[pass].promise;
+    const name = `churn-${pass}`;
+    const before = sessionEvents;
+    await env.human().request("rename", { from: current, name });
+    for (let turn = 0; sessionEvents === before && turn < 1000; turn++) await nextTurn();
+    assert.ok(sessionEvents > before, "session change reached the real subscribed host");
+    if (pass === 1) {
+      const beforePing = pingEvents;
+      const probing = env.human().request("ping", { sessionId: alpha.session.id });
+      const ping = await alpha.nextPing();
+      await alpha.client.request("pong", { pingId: ping.pingId });
+      await probing;
+      for (let turn = 0; pingEvents === beforePing && turn < 1000; turn++) await nextTurn();
+      assert.ok(pingEvents > beforePing, "ping transition reached the subscribed host");
+    }
+    release[pass].resolve();
+    await fetched[pass + 1].promise; // The follow-up is held, exposing the preceding successful publication.
+    assert.ok(!has(viz, "SIGNAL LOST"), "event churn cannot veto a complete successful bundle");
+    assert.ok(has(viz, name), "newer session identity rebases over the fetched old name");
+    current = name;
+  }
+  release[3].resolve();
+  await viz.app.idle();
+  assert.ok(has(viz, "SIGNAL LOST"), "only the failing retry loses the signal");
+  await viz.search(current);
+  assert.deepEqual(viz.map.conversation(), { scope: "session", sessionId: alpha.session.id }, "last successful rebased city remains inspectable");
+});
+
+test("a standalone in-flight channel rename rebases the successful bundle without resurrecting its old venue", async () => {
+  env = await startEnv();
+  await fleet();
+  const captured = Promise.withResolvers<void>();
+  const capturedChannels = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const renameSeen = Promise.withResolvers<void>();
+  let hold = false;
+  let held = false;
+  const viz = startViz({ client: (options) => {
+    const client = new AsenqClient({ ...options, autoStart: false, onPush: (push) => {
+      options.onPush?.(push);
+      if (push.push === "event" && push.event.type === "channel" && push.event.action === "renamed") renameSeen.resolve();
+    } });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (op === "channel_list" && hold) capturedChannels.resolve();
+      if (op === "list" && hold) {
+        if (held) throw new Error("rename follow-up failed");
+        held = true;
+        captured.resolve();
+        await release.promise;
+      }
+      return reply;
+    };
+    return client;
+  } });
+  await ready(viz);
+  await viz.search("ops");
+  const selected = viz.map.selected;
+  hold = true;
+  const refreshing = viz.press("r");
+  await Promise.all([captured.promise, capturedChannels.promise]);
+  await env.human().request("channel_rename", { channel: "ops", name: "new-ops" });
+  await renameSeen.promise;
+  release.resolve();
+  await refreshing;
+  assert.deepEqual(viz.map.selected, selected, "observed rename keeps the immutable venue target");
+  assert.deepEqual(viz.map.conversation(), { scope: "channel", channel: "new-ops" });
+  const venues = new Set<string>();
+  for (let i = 0; i < 12; i++) {
+    await viz.press("TAB");
+    const scope = viz.map.conversation();
+    if (scope?.scope === "channel") venues.add(scope.channel);
+  }
+  assert.ok(venues.has("new-ops") && venues.has("empty"));
+  assert.ok(!venues.has("ops"), "a late fetched old summary never recreates the retired channel name");
+});
+
 test("CLI rejects invalid and repeated reduced-motion arguments before creating a terminal", () => {
   for (const command of ["viz", "tui"]) for (const args of [["--bogus"], ["--reduced-motion", "--reduced-motion"]]) {
     const result = spawnSync(process.execPath, ["dist/src/cli.js", command, ...args], { encoding: "utf8" });

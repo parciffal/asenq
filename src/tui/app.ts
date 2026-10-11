@@ -28,6 +28,7 @@ import { scanProcesses } from "../viz/scan.js";
 import type { ProcInfo } from "../viz/scan.js";
 import { readVizSettings } from "../viz/settings.js";
 import type { VizSettings } from "../viz/settings.js";
+import { rebaseCitySnapshot } from "../viz/app.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -237,6 +238,8 @@ export class ConsoleApp {
   private mapAgain = false;
   private mapScanning = false;
   private scanAgain = false;
+  /** Events arriving during the active city fetch; cleared after that pass settles. */
+  private mapEvents: PositionedEvent[] | null = null;
   /** Bumped whenever the Map stops being active; fetches started before are discarded when they settle. */
   private mapGen = 0;
   /** Screen row and height of the map region, for translating clicks; height is 0 while it is not drawn. */
@@ -522,6 +525,12 @@ export class ConsoleApp {
       if (this.activity.length > 200) this.activity.shift();
     }
     const e = item.event;
+    if (this.mapEvents) {
+      this.mapEvents.push({
+        position: item.position,
+        event: e.type === "channel" ? { ...e, channel: { ...e.channel } } : e,
+      });
+    }
     if (e.type === "message") {
       this.map.onMessage(e.msg, animate && this.mapActive());
       if (e.failedCount !== undefined) this.failedCount = e.failedCount;
@@ -1266,6 +1275,8 @@ export class ConsoleApp {
       do {
         this.mapAgain = false;
         const gen = this.mapGen;
+        const events: PositionedEvent[] = [];
+        this.mapEvents = events;
         try {
           const bundle = await within((async () => {
             const [list, channelList] = await Promise.all([this.client.request("list"), this.client.request("channel_list")]);
@@ -1283,7 +1294,8 @@ export class ConsoleApp {
             return { sessions, channels, identities };
           })(), REQUEST_TIMEOUT_MS);
           if (this.closed) return;
-          if (gen === this.mapGen && !this.mapAgain) {
+          if (gen === this.mapGen) {
+            rebaseCitySnapshot(bundle, events);
             for (const identity of bundle.identities) if (!this.session(identity.id)) this.sessions.push(identity);
             this.map.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
             this.map.setConnection("connected");
@@ -1295,6 +1307,8 @@ export class ConsoleApp {
             this.map.setConnection("offline");
             this.render();
           }
+        } finally {
+          if (this.mapEvents === events) this.mapEvents = null;
         }
       } while (this.mapAgain && this.mapActive());
     } finally {
