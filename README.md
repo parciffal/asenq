@@ -295,6 +295,10 @@ Close/purge/replacement previews require `y`; `n`/Esc cancel, Enter and paste ne
 
 `asenq viz` is a full-screen, read-only terminal city of real channels and session identities. Empty channels have venues too. Each registered identity has one character at its canonical home; other memberships have `@` markers, not duplicate characters. Sessions without memberships and detected processes occupy street workstations, alongside the human operator. Harness, role (including unset), and actual state appear as text badges, independently of costume.
 
+![Standalone and embedded ASENQ city preview](assets/asenq-city-wide.gif)
+
+[Narrow-terminal preview](assets/asenq-city-narrow.gif) · [Character lineup](assets/screenshots/city-lineup.png)
+
 The city grows streets and floors as rosters grow. Coordinates remain stable during this map's lifetime across polling, rename, filter, zoom and resize; removing a canonical membership may move its character to another membership or the street. Small terminals switch to compact inspection, not a dead end: Tab and search still reach offscreen targets and full rosters. `I` opens focused inspection; PageUp/PageDown expose the remaining metadata, memberships and observed exchanges.
 
 Only observed traffic animates: a plain channel post travels once to its venue, never to every member. Actual mention-copy direct messages travel separately between canonical homes. Unknown endpoints remain feed-only. Repeated delivery updates and reconnect history do not replay motion. Unknown availability is **UNKNOWN**, never invented IDLE; CPU activity for an unregistered process is explicitly inferred. A failed snapshot retains the last successful city with **SIGNAL LOST / STALE SNAPSHOT**, clears animations and resumes after a successful fetch.
