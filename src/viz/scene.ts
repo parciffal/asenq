@@ -5,12 +5,17 @@ import { compactPixels, detailedPixels } from "./cast.js";
 import { matchingTargets, sampleRoute, targetKey } from "./place.js";
 import { rasterize, shade } from "./sprites.js";
 import type { SpriteCell, SpriteTone } from "./sprites.js";
-import type { CityCharacter, CityLayout, CityRenderContext, CityTarget, FeedLine, Hit, Packet, PlacedVenue, Point, Rect, SceneResult, VizUi, World } from "./types.js";
+import type { CityCharacter, CityLayout, CityRenderContext, CityTarget, CityVenue, FeedLine, Hit, Packet, PlacedVenue, Point, Rect, SceneResult, VizUi, World } from "./types.js";
 
 const PAL = { void: "#100609", room: "#281018", border: "#a52b3a", cream: "#e8dec8", cyan: "#55ced1", yellow: "#f4e45a", alert: "#ff4355", muted: "#887780" } as const;
 const KIND_COLOR: Record<FeedLine["kind"], string> = { chat: PAL.cream, task: PAL.yellow, result: PAL.cyan, status: PAL.cyan, control: PAL.alert };
 const KIND_TAG: Record<FeedLine["kind"], string> = { chat: "CHAT", task: "TASK", result: "RESULT", status: "STATUS", control: "CTRL" };
 const HARNESS: Record<NonNullable<CityCharacter["harness"]>, string> = { claude: "CC", codex: "CX", omp: "OMP", opencode: "OC" };
+/** Venue appearance cues: a full sign for wide facades, a fixed-width glyph row otherwise. The cue never shares its budget with the name. */
+const VENUE_SIGN: Record<CityVenue["appearance"], string> = { office: "OFFICE", bar: "BAR", garage: "GARAGE", arcade: "ARCADE", communications: "COMMS" };
+const VENUE_GLYPH: Record<CityVenue["appearance"], string> = { office: "⌂", bar: "▦", garage: "⌷", arcade: "◉", communications: "≋" };
+/** Minimum name cells kept before the reserved cue so a selected bracketed name never erases the venue identity. */
+const VENUE_NAME_MIN = 6;
 const TONE: Record<SpriteTone, number> = { live: 1, lost: 0.6, gone: 0.4, offline: 0.55, dim: 0.3 };
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const PACKET_MS = 1400;
@@ -36,19 +41,20 @@ export function mapRegion(size: TerminalSize, embedded = false): Rect {
 
 // One screen-sized pooled canvas. Styles are interned per frame, never per clock phase.
 interface Canvas {
-  cols: number; rows: number; ch: string[]; styles: number[]; owners: Int32Array; widths: Uint8Array;
+  cols: number; rows: number; ch: string[]; styles: number[]; owners: Int32Array; widths: Uint8Array; occupied: Uint8Array;
   palette: TerminalStyle[]; styleIds: Map<string, number>;
 }
 let pool: Canvas | null = null;
 function acquire(cols: number, rows: number): Canvas {
   const n = cols * rows;
   if (!pool || pool.cols !== cols || pool.rows !== rows) pool = {
-    cols, rows, ch: new Array<string>(n), styles: new Array<number>(n), owners: new Int32Array(n), widths: new Uint8Array(n), palette: [], styleIds: new Map(),
+    cols, rows, ch: new Array<string>(n), styles: new Array<number>(n), owners: new Int32Array(n), widths: new Uint8Array(n), occupied: new Uint8Array(n), palette: [], styleIds: new Map(),
   };
   pool.palette.length = 0;
   pool.styleIds.clear();
   style(pool, PAL.cream);
   pool.ch.fill(" "); pool.styles.fill(0); pool.owners.fill(-1); pool.widths.fill(0);
+  pool.occupied.fill(0);
   return pool;
 }
 function style(c: Canvas, fg: string = PAL.cream, bg: string = PAL.void, dim = false): number {
@@ -68,10 +74,11 @@ function eraseGlyph(c: Canvas, at: number): void {
     c.ch[owner + k] = " "; c.owners[owner + k] = -1; c.widths[owner + k] = 0;
   }
 }
-function glyph(c: Canvas, x: number, y: number, ch: string, sid: number, clip: Rect): void {
+function glyph(c: Canvas, x: number, y: number, ch: string, sid: number, clip: Rect, protectSign = false): void {
   const w = ch.length === 1 && ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) <= 126 ? 1 : terminalTextWidth(ch);
   if (w < 1 || !inside({ x, y }, clip) || x + w > clip.x + clip.width || x < 0 || y < 0 || x + w > c.cols || y >= c.rows) return;
   const at = y * c.cols + x;
+  if (protectSign && c.occupied[at] === 2) return;
   for (let k = 0; k < w; k++) eraseGlyph(c, at + k);
   c.ch[at] = ch; c.widths[at] = w;
   for (let k = 0; k < w; k++) { c.styles[at + k] = sid; c.owners[at + k] = at; if (k) c.ch[at + k] = ""; }
@@ -113,6 +120,10 @@ function hit(hits: Hit[], target: CityTarget, r: Rect, clip: Rect, priority = 0)
   const height = Math.min(r.y + r.height, clip.y + clip.height) - y;
   if (width > 0 && height > 0) hits.push({ target, column: x, row: y, width, height, priority });
 }
+function reserve(c: Canvas, r: Rect, clip: Rect, priority: number): void {
+  for (let y = Math.max(0, r.y, clip.y); y < Math.min(c.rows, r.y + r.height, clip.y + clip.height); y++)
+    for (let x = Math.max(0, r.x, clip.x); x < Math.min(c.cols, r.x + r.width, clip.x + clip.width); x++) c.occupied[y * c.cols + x] = priority;
+}
 function screen(p: Point, ui: VizUi, region: Rect): Point {
   return { x: region.x + Math.floor((p.x - ui.viewport.x) / ui.viewport.zoom), y: region.y + Math.floor((p.y - ui.viewport.y) / ui.viewport.zoom) };
 }
@@ -152,80 +163,156 @@ function drawVenue(c: Canvas, placed: PlacedVenue, ui: VizUi, region: Rect, hits
   box(c, r, sid, region);
   const target: CityTarget = { kind: "venue", venueKey: placed.venue.key };
   hit(hits, target, r, region);
-  const label = `#${placed.venue.name}`;
-  const sign = placed.venue.appearance === "communications" ? "COMMS /\\" : placed.venue.appearance.toUpperCase();
-  text(c, r.x + 1, r.y + 1, fit(`${label} · ${sign}`, r.width - 2), style(c, PAL.cream, PAL.room, dim), region);
+  const selected = ui.selected?.kind === "venue" && ui.selected.venueKey === placed.venue.key;
+  // The appearance cue owns a reserved band that the name can never consume, at every zoom and selection state.
+  const name = `#${placed.venue.name}`;
+  const sign = VENUE_SIGN[placed.venue.appearance];
+  const glyphCue = VENUE_GLYPH[placed.venue.appearance];
+  const inner = r.width - 2;
+  // A screen-space sign band sits above the floors, or at the viewport edge when the roof is offscreen.
+  const titleY = Math.max(region.y, r.y - 1);
+  const titleClip = { x: Math.max(r.x + 1, region.x), y: titleY, width: Math.max(0, Math.min(r.x + r.width - 1, region.x + region.width) - Math.max(r.x + 1, region.x)), height: 1 };
   const roof = placed.venue.appearance === "communications" ? "/|\\ /|\\" : placed.venue.appearance === "garage" ? "╤══════╤" : placed.venue.appearance === "arcade" ? "/ ▣ ▣ \\" : placed.venue.appearance === "bar" ? "/── BAR ──\\" : "┌─┬─┬─┐";
   if (ui.viewport.zoom === 1) text(c, r.x + 2, r.y, roof, detail, region, r.width - 4);
-  if (ui.viewport.zoom === 4) return;
-  // Compute only the intersecting floor range; an enormous tower costs only visible screen rows.
-  const view = viewWorld(ui, region);
-  const ground = placed.rect.y + placed.rect.height - 10;
-  const first = Math.max(0, Math.floor((ground - (view.y + view.height)) / 10));
-  const last = Math.min(placed.floors - 1, Math.ceil((ground + 10 - view.y) / 10));
-  for (let floor = first; floor <= last; floor++) {
-    const y = ground - floor * 10;
-    const fr = screenRect({ x: placed.rect.x + 1, y, width: placed.rect.width - 2, height: 10 }, ui, region);
-    if (!intersects(fr, region)) continue;
-    line(c, { x: fr.x, y: fr.y + fr.height - 1 }, { x: fr.x + fr.width - 1, y: fr.y + fr.height - 1 }, sid, region);
-    const mid = screen({ x: placed.entrance.x, y }, ui, region);
-    // Keep the screen-space venue sign clear, including at compressed zoom.
-    line(c, { x: mid.x, y: Math.max(mid.y, r.y + 2) }, { x: mid.x, y: fr.y + fr.height - 2 }, detail, region);
-    const decor = placed.venue.appearance === "bar" ? "┬──┬  BAR" : placed.venue.appearance === "garage" ? "▤ ▤ GARAGE" : placed.venue.appearance === "arcade" ? "▣ ▣ ARCADE" : placed.venue.appearance === "communications" ? "┴ /\\ COMMS" : "┬ ┬ OFFICE";
-    if (ui.viewport.zoom === 1) text(c, fr.x + 1, fr.y + fr.height - 2, decor, detail, region, fr.width - 2);
+  if (ui.viewport.zoom < 4) {
+    // Compute only the intersecting floor range; an enormous tower costs only visible screen rows.
+    const view = viewWorld(ui, region);
+    const ground = placed.rect.y + placed.rect.height - 10;
+    const first = Math.max(0, Math.floor((ground - (view.y + view.height)) / 10));
+    const last = Math.min(placed.floors - 1, Math.ceil((ground + 10 - view.y) / 10));
+    for (let floor = first; floor <= last; floor++) {
+      const y = ground - floor * 10;
+      const fr = screenRect({ x: placed.rect.x + 1, y, width: placed.rect.width - 2, height: 10 }, ui, region);
+      if (!intersects(fr, region)) continue;
+      line(c, { x: fr.x, y: fr.y + fr.height - 1 }, { x: fr.x + fr.width - 1, y: fr.y + fr.height - 1 }, sid, region);
+      const mid = screen({ x: placed.entrance.x, y }, ui, region);
+      // Keep the screen-space venue sign clear, including at compressed zoom.
+      line(c, { x: mid.x, y: Math.max(mid.y, r.y + 2) }, { x: mid.x, y: fr.y + fr.height - 2 }, detail, region);
+      const decor = placed.venue.appearance === "bar" ? "┬──┬  BAR" : placed.venue.appearance === "garage" ? "▤ ▤ GARAGE" : placed.venue.appearance === "arcade" ? "▣ ▣ ARCADE" : placed.venue.appearance === "communications" ? "┴ /\\ COMMS" : "┬ ┬ OFFICE";
+      if (ui.viewport.zoom === 1) text(c, fr.x + 1, fr.y + fr.height - 2, decor, detail, region, fr.width - 2);
+    }
   }
   const entrance = screen(placed.entrance, ui, region);
   glyph(c, entrance.x, entrance.y, "╥", style(c, PAL.cyan, PAL.room, dim), region);
-  if (!placed.venue.roster.length) text(c, r.x + 2, r.y + Math.min(3, r.height - 2), "EMPTY · 0 MEMBERS", style(c, PAL.muted, PAL.room, dim), region, r.width - 4);
+  if (!placed.venue.roster.length) {
+    // Emptiness stays truthful and readable at every zoom, including the compressed facade.
+    const caption = inner >= 7 ? "EMPTY 0" : "∅ 0";
+    text(c, r.x + 1, r.y + r.height - 1, fit(caption, Math.max(0, inner)), style(c, PAL.muted, PAL.room, dim), region, Math.max(0, inner));
+  }
+  fill(c, titleClip, style(c, PAL.cream, PAL.room, dim), region);
+  reserve(c, titleClip, region, 2);
+  hit(hits, target, titleClip, region);
+  const wideFacade = inner >= VENUE_NAME_MIN + 3 + sign.length + 2;
+  const titleSid = style(c, selected ? PAL.yellow : PAL.cream, PAL.room, dim);
+  if (wideFacade) {
+    const nameBudget = inner - sign.length - 3;
+    text(c, r.x + 1, titleY, selected ? `[${fit(name, nameBudget - 2)}]` : fit(name, nameBudget), titleSid, region, nameBudget);
+    text(c, r.x + 1 + nameBudget + 1, titleY, `· ${sign}`, detail, region, sign.length + 2);
+  } else if (inner >= VENUE_NAME_MIN + 2) {
+    const nameBudget = inner - 2;
+    text(c, r.x + 1, titleY, selected ? `[${fit(name, nameBudget - 2)}]` : fit(name, nameBudget), titleSid, region, nameBudget);
+    glyph(c, r.x + r.width - 2, titleY, glyphCue, detail, region);
+  } else {
+    text(c, r.x + 1, titleY, fit(name, Math.max(0, inner - 2)), titleSid, region, Math.max(0, inner - 2));
+    glyph(c, r.x + r.width - 2, titleY, glyphCue, detail, region);
+  }
 }
 
-interface Label { target: CityTarget; x: number; y: number; width: number; name: string; detail: string; selected: boolean; dim: boolean; }
+interface Label { target: CityTarget; slot: Rect; y: number; name: string; detail: string; selected: boolean; dim: boolean; }
+
 function drawCharacters(c: Canvas, world: World, layout: CityLayout, ui: VizUi, region: Rect, ctx: CityRenderContext, hits: Hit[]): Label[] {
   const labels: Label[] = [];
   const byId = new Map(world.characters.map((ch) => [ch.id, ch]));
+  const draw = (ch: CityCharacter, target: CityTarget, worldRect: Rect, anchor: Point, membership: boolean): void => {
+    if (!matches(ch, ui)) return;
+    const info = poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion);
+    const appearance = ctx.appearances.get(ch.id);
+    if (!appearance) return;
+    const a = screen(worldRect, ui, region);
+    const end = screen({ x: worldRect.x + worldRect.width, y: worldRect.y + worldRect.height }, ui, region);
+    // Half-open projected slots have the actual alternating 4/5-cell pitch at zoom 4, without shared boundary cells.
+    const slot: Rect = { x: Math.max(a.x, region.x), y: Math.max(a.y, region.y), width: Math.max(0, Math.min(end.x, region.x + region.width) - Math.max(a.x, region.x)), height: Math.max(0, Math.min(end.y, region.y + region.height) - Math.max(a.y, region.y)) };
+    if (slot.width < 1 || slot.height < 1) return;
+    while (slot.height > 0) {
+      let signRow = false;
+      for (let col = slot.x; col < slot.x + slot.width; col++) if (c.occupied[slot.y * c.cols + col] === 2) { signRow = true; break; }
+      if (!signRow) break;
+      slot.y++; slot.height--;
+    }
+    if (!slot.height) return;
+    const selected = same(ui.selected, target) || (!membership && ui.selected?.kind === "membership" && ui.selected.id === ch.id);
+    const dim = ui.focus && ui.selected !== null && !selected;
+    const compact = !membership && ui.viewport.zoom === 1 && slot.width >= 7 && slot.height >= 6;
+    const mini = !membership && !compact && ui.viewport.zoom <= 2 && slot.width >= 3 && slot.height >= 4;
+    let artWidth = compact ? 7 : mini ? 3 : 1, artHeight = compact ? 4 : mini ? 2 : 1;
+    const pos = screen(anchor, ui, region);
+    let x = artWidth === 1 ? slot.x : Math.max(slot.x, Math.min(pos.x, slot.x + slot.width - artWidth));
+    const labelRows = Math.min(2, slot.height - artHeight);
+    let y = Math.max(slot.y, Math.min(pos.y, slot.y + slot.height - artHeight - labelRows));
+    let blocked = false;
+    for (let row = y; row < y + artHeight; row++) for (let col = x; col < x + artWidth; col++) if (c.occupied[row * c.cols + col]) blocked = true;
+    if (blocked) {
+      // A real moving character may enter another occupied slot. Retain a separate glyph, never erase its neighbor.
+      artWidth = 1; artHeight = 1;
+      let found = false;
+      for (let row = slot.y; row < slot.y + slot.height && !found; row++) for (let col = slot.x; col < slot.x + slot.width; col++) {
+        if (!c.occupied[row * c.cols + col]) { x = col; y = row; found = true; break; }
+      }
+      if (!found) return;
+    }
+    if (artWidth > 1) {
+      const cells = rasterize(compactPixels(appearance, info.pose, compact ? "compact" : "mini"), dim ? "dim" : info.tone, ctx.color);
+      for (let row = 0; row < cells.length; row++) for (let col = 0; col < cells[row].length; col++) {
+        const cell = cells[row][col], at = (y + row) * c.cols + x + col;
+        if (cell && !c.occupied[at]) {
+          glyph(c, x + col, y + row, cell.ch, style(c, cell.fg ?? PAL.cream, cell.bg ?? PAL.room, dim), slot);
+          c.occupied[at] = 1;
+        }
+      }
+    } else {
+      const color = compactPixels(appearance, "idle_a", "mini")[2][0] ?? PAL.cream;
+      glyph(c, x, y, membership ? "@" : ch.source === "human" ? "◆" : ch.source === "process" ? "○" : "●", style(c, selected ? PAL.yellow : ctx.color ? shade(color, TONE[dim ? "dim" : info.tone]) : PAL.cream, PAL.room, dim), slot);
+      c.occupied[y * c.cols + x] = 1;
+    }
+    reserve(c, { x, y, width: artWidth, height: artHeight }, slot, 1);
+    hit(hits, target, { x, y, width: artWidth, height: artHeight }, region, selected ? 3 : 1);
+    labels.push({ target, slot, y: y + artHeight, name: ch.name, detail: membership ? `${badge(ch)} MEMBER` : ch.source === "process" ? `${ch.harness === null ? "?" : HARNESS[ch.harness]} PID ${ch.pid ?? "?"} CPU${ch.cpu ?? "?"}%*` : `${badge(ch)} ${info.label}`, selected, dim });
+  };
   for (const placed of layout.characters) {
     const ch = placed.character;
     if (!matches(ch, ui)) continue;
     const info = poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion);
-    const animated = info.label === "MOVING" ? ctx.animator.position(ch.id, ctx.clock) : null;
-    const anchor = animated ?? placed.anchor;
-    const pos = screen(anchor, ui, region);
-    const appearance = ctx.appearances.get(ch.id);
-    if (!appearance) continue;
-    const target: CityTarget = { kind: "character", id: ch.id };
-    const selected = same(ui.selected, target) || (ui.selected?.kind === "membership" && ui.selected.id === ch.id);
-    const dim = ui.focus && ui.selected !== null && !selected;
-    const compact = ui.viewport.zoom === 1;
-    const artHeight = compact ? 4 : ui.viewport.zoom === 2 ? 2 : 1;
-    const x = pos.x, y = pos.y;
-    const rect = { x: pos.x - (compact ? 4 : 2), y, width: compact ? 16 : 8, height: artHeight + 2 };
-    if (!intersects(rect, region)) continue;
-    if (placed.home === null && !animated) {
-      const station = screenRect(placed.rect, ui, region);
+    const anchor = info.label === "MOVING" ? ctx.animator.position(ch.id, ctx.clock) ?? placed.anchor : placed.anchor;
+    const r = { ...placed.rect, x: placed.rect.x + anchor.x - placed.anchor.x, y: placed.rect.y + anchor.y - placed.anchor.y };
+    if (placed.home === null && info.label !== "MOVING") {
+      const station = screenRect(r, ui, region);
       box(c, station, style(c, ch.source === "process" ? PAL.muted : PAL.border), region, ch.source === "process");
-      if (ch.source === "process") text(c, station.x + 1, station.y, " PROCESS ", style(c, PAL.muted), region, station.width - 2);
+      if (ch.source === "process" && ui.viewport.zoom === 1) text(c, station.x + 1, station.y, " PROCESS ", style(c, PAL.muted), region, station.width - 2);
     }
-    if (ui.viewport.zoom === 4) {
-      const color = compactPixels(appearance, "idle_a", "mini")[2][0] ?? PAL.cream;
-      glyph(c, x, y, ch.source === "human" ? "◆" : ch.source === "process" ? "○" : "●", style(c, ctx.color ? shade(color, TONE[dim ? "dim" : info.tone]) : PAL.cream, PAL.room, dim), region);
-    } else sprite(c, rasterize(compactPixels(appearance, info.pose, compact ? "compact" : "mini"), dim ? "dim" : info.tone, ctx.color), x, y, region, dim);
-    labels.push({ target, x: rect.x, y: pos.y + artHeight, width: rect.width, name: ch.name, detail: ch.source === "process" ? `${ch.harness === null ? "?" : HARNESS[ch.harness]} PID ${ch.pid ?? "?"} CPU${ch.cpu ?? "?"}%*` : `${badge(ch)} ${info.label}`, selected, dim });
-    hit(hits, target, rect, region, selected ? 2 : 1);
+    draw(ch, { kind: "character", id: ch.id }, r, anchor, false);
   }
   for (const placed of layout.venues) for (const room of placed.rooms) {
     if (room.canonical) continue;
     const ch = byId.get(room.id);
-    if (!ch || !matches(ch, ui)) continue;
-    const pos = screen(room.anchor, ui, region);
-    const target: CityTarget = { kind: "membership", id: ch.id, venueKey: placed.venue.key };
-    const selected = same(ui.selected, target);
-    const rect = { x: pos.x - (ui.viewport.zoom === 1 ? 4 : 2), y: pos.y, width: ui.viewport.zoom === 1 ? 16 : 8, height: 3 };
-    if (!intersects(rect, region)) continue;
-    glyph(c, pos.x, pos.y, "@", style(c, selected ? PAL.yellow : PAL.cyan, PAL.room, ui.focus && ui.selected !== null && !selected), region);
-    labels.push({ target, x: rect.x, y: pos.y + 1, width: rect.width, name: ch.name, detail: `${badge(ch)} MEMBER`, selected, dim: ui.focus && ui.selected !== null && !selected });
-    hit(hits, target, rect, region, selected ? 3 : 1);
+    if (ch) draw(ch, { kind: "membership", id: ch.id, venueKey: placed.venue.key }, room.rect, room.anchor, true);
   }
   return labels;
+}
+
+/** Find the widest unoccupied run inside a target's slot, never expanding into a neighbor's allocation. */
+function labelRun(c: Canvas, label: Label, start: number, minimum: number): Rect | null {
+  const slot = label.slot;
+  for (let y = Math.max(slot.y, start); y < slot.y + slot.height; y++) {
+    let best: Rect | null = null;
+    for (let x = slot.x; x < slot.x + slot.width;) {
+      if (c.occupied[y * c.cols + x]) { x++; continue; }
+      const left = x;
+      while (x < slot.x + slot.width && !c.occupied[y * c.cols + x]) x++;
+      if (x - left >= minimum && (!best || x - left > best.width)) best = { x: left, y, width: x - left, height: 1 };
+    }
+    if (best) return best;
+  }
+  return null;
 }
 function targetName(target: CityTarget, world: World): string {
   if (target.kind === "venue") return "#" + (world.venues.find((v) => v.key === target.venueKey)?.name ?? "unknown channel");
@@ -379,8 +466,9 @@ export function renderScene(world: World, layout: CityLayout, packets: readonly 
   const focused = narrow || ui.inspector === "focused" || ui.search;
   const wide = cols >= 110 && rows >= 26;
   const hints = embedded ? 0 : 1;
-  const offscreen = focused ? candidates.length : candidates.length - onScreen;
-  const header = cols < 60 ? `${layout.targets.length} TOTAL/${candidates.length} MATCH/${offscreen} OFF · ${registered} SESSIONS` : `CITY · ${layout.targets.length} TOTAL · ${candidates.length} MATCH · ${offscreen} OFFSCREEN · ${registered} SESSIONS · ${world.venues.length} VENUES`;
+  // The OFFSCREEN count only exists when a city viewport is on screen; inspection modes list targets instead of inventing a count.
+  const offscreen = focused ? null : candidates.length - onScreen;
+  const header = cols < 60 ? `${layout.targets.length} TOTAL/${candidates.length} MATCH${offscreen === null ? "/INSPECT" : `/${offscreen} OFF`} · ${registered} SESSIONS` : `CITY · ${layout.targets.length} TOTAL · ${candidates.length} MATCH${offscreen === null ? " · INSPECT" : ` · ${offscreen} OFFSCREEN`} · ${registered} SESSIONS · ${world.venues.length} VENUES`;
   text(c, 0, 0, fit(header, cols), style(c, PAL.cream), full);
   const notice = [world.connection === "offline" ? "SIGNAL LOST / STALE SNAPSHOT" : "LINK ESTABLISHED", context.reducedMotion ? "REDUCED MOTION" : "", ui.notice ?? "", context.settingsWarning ?? ""].filter(Boolean).join(" · ");
   text(c, 0, 1, fit(notice, cols), style(c, world.connection === "offline" ? PAL.alert : PAL.cyan), full);
@@ -403,23 +491,33 @@ export function renderScene(world: World, layout: CityLayout, packets: readonly 
       if (p.ageMs < 0 || p.ageMs >= PACKET_MS) continue;
       const dist = p.path.length * p.ageMs / PACKET_MS;
       const at = sampleRoute(p.path, dist);
-      if (at) { const point = screen(at, ui, region); glyph(c, point.x, point.y, ["⠁", "⠂", "⠄", "⡀"][Math.floor(p.ageMs / 100) % 4], style(c, KIND_COLOR[p.kind]), region); }
+      if (at) { const point = screen(at, ui, region); glyph(c, point.x, point.y, ["⠁", "⠂", "⠄", "⡀"][Math.floor(p.ageMs / 100) % 4], style(c, KIND_COLOR[p.kind]), region, true); }
       const tail = sampleRoute(p.path, Math.max(0, dist - 3 * ui.viewport.zoom));
-      if (tail) { const point = screen(tail, ui, region); glyph(c, point.x, point.y, "⠒", style(c, KIND_COLOR[p.kind]), region); }
+      if (tail) { const point = screen(tail, ui, region); glyph(c, point.x, point.y, "⠒", style(c, KIND_COLOR[p.kind]), region, true); }
     }
     const labels = drawCharacters(c, world, layout, ui, region, context, hits);
-    // All labels after all sprites; selected labels last. No sprite can erase a name.
+    // Geometry bounds ordinary labels; occupancy protects every glyph and sign. Selected names paint last.
     labels.sort((a, b) => Number(a.selected) - Number(b.selected));
     for (const label of labels) {
       const sid = style(c, label.selected ? PAL.yellow : PAL.cream, PAL.room, label.dim);
-      const name = label.selected ? `[${fit(label.name, label.width - 2)}]` : fit(label.name, label.width);
-      fill(c, { x: label.x, y: label.y, width: label.width, height: 2 }, sid, region);
-      text(c, label.x, label.y, name, sid, region, label.width);
-      text(c, label.x, label.y + 1, fit(label.detail, label.width), sid, region, label.width);
-    }
-    if (ui.selected?.kind === "venue") {
-      const placed = layout.byVenue.get(ui.selected.venueKey);
-      if (placed) { const r = screenRect(placed.rect, ui, region); text(c, r.x + 1, r.y + 1, `[${fit("#" + placed.venue.name, r.width - 4)}]`, style(c, PAL.yellow, PAL.room), region, r.width - 2); }
+      let run = labelRun(c, label, label.y, label.selected ? 3 : 1) ?? labelRun(c, label, label.slot.y, label.selected ? 3 : 1);
+      if (!run && label.selected) {
+        const floating = { ...label, slot: region };
+        run = labelRun(c, floating, label.y, 3) ?? labelRun(c, floating, region.y, 3);
+      }
+      if (!run) continue;
+      const name = label.selected ? `[${fit(label.name, run.width - 2)}]` : fit(label.name, run.width);
+      fill(c, run, sid, region);
+      text(c, run.x, run.y, name, sid, region, run.width);
+      reserve(c, run, region, 1);
+      hit(hits, label.target, run, region, label.selected ? 4 : 1);
+      const detail = labelRun(c, label, run.y + 1, 1);
+      if (detail && ui.viewport.zoom < 4) {
+        fill(c, detail, sid, region);
+        text(c, detail.x, detail.y, fit(label.detail, detail.width), sid, region, detail.width);
+        reserve(c, detail, region, 1);
+        hit(hits, label.target, detail, region, 1);
+      }
     }
     const inspector = wide ? { x: region.width, y: 2, width: 32, height: region.height } : { x: 0, y: region.y + region.height, width: cols, height: 7 };
     const info = drawInspector(c, world, layout, ui, context, now, inspector, hits, false);
