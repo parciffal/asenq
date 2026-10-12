@@ -43,11 +43,13 @@ async function main() {
   hud.setScene(scene);
 
   const closeEvents = api.events({
-    state: (wire) => store.setState(wire),
+    state: (wire) => hud.handleState(wire),
     packet: (packet) => scene.handlePacket(packet),
     message: (data) => hud.handleMessage(data),
+    read: (data) => hud.handleRead(data),
     connection: (open) => store.setConnectionState(open ? "open" : "reconnecting"),
   });
+  hud.refreshConversations();
   const close = () => {
     closeEvents();
     hud.destroy();
