@@ -557,7 +557,11 @@ export class CityHud {
     if (oldVenue) {
       const venue = this.store.venuesByKey.get(oldVenue.key);
       if (!venue) this.closeChat();
-      else if (venue.name !== scope.channel) this.openChat({ scope: "channel", channel: venue.name });
+      else if (venue.name !== scope.channel) {
+        const { composerDraft, composerOptions } = this;
+        this.openChat({ scope: "channel", channel: venue.name });
+        Object.assign(this, { composerDraft, composerOptions });
+      }
     }
     if (signature !== this.conversationStateSignature) {
       this.conversationStateSignature = signature;

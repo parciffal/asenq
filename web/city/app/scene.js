@@ -877,9 +877,10 @@ export class CityScene extends Phaser.Scene {
   onKeyDown(event) {
     if (event.defaultPrevented || isTextEntry(event.target) || isTextEntry(document.activeElement)) return;
     const key = event.key;
-    // Browser/OS chords (Cmd+C copy) and activation keys on focused buttons or panel content belong to the page, not the map.
+    // Browser/OS chords (Cmd+C copy) and activation/focus keys on focused buttons or panel content belong to the page, not the map.
     if (event.ctrlKey || event.metaKey || event.altKey) return;
-    if (key !== "Escape" && (event.target?.tagName === "BUTTON" || event.target?.closest?.("#side-panel, #search-layer"))) return;
+    const activation = key === "Enter" || key === " " || key === "Tab";
+    if (activation && (event.target?.tagName === "BUTTON" || event.target?.closest?.("#side-panel, #search-layer"))) return;
     if (this.state.ui.tab !== "map") {
       if (key === "Escape") {
         if (this.state.ui.searchOpen) this.hud?.closeSearch();
