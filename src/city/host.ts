@@ -56,7 +56,6 @@ export class CityHost {
     this.source.start();
     this.stopTicks = this.schedule(() => {
       this.source.fetch(this.map.step(TICK_MS));
-      this.changed();
     }, TICK_MS);
   }
 
