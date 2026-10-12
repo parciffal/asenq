@@ -523,14 +523,11 @@ export class CityHud {
     composer.addEventListener("submit", (event) => { event.preventDefault(); this.submitMessage(scope); });
     this.transcript.append(composer);
     this.transcript.append(element("div", "transcript-note", "Viewing here does not mark messages read."));
-    requestAnimationFrame(() => {
-      if (!messages.isConnected) return;
-      if (previousMessages) {
-        if (prepended) messages.scrollTop = previousTop + Math.max(0, messages.scrollHeight - previousHeight);
-        else if (wasAtBottom) messages.scrollTop = messages.scrollHeight;
-        else messages.scrollTop = Math.min(previousTop, messages.scrollHeight);
-      } else if (history.length) messages.scrollTop = messages.scrollHeight;
-    });
+    if (previousMessages) {
+      if (prepended) messages.scrollTop = previousTop + Math.max(0, messages.scrollHeight - previousHeight);
+      else if (wasAtBottom) messages.scrollTop = messages.scrollHeight;
+      else messages.scrollTop = Math.min(previousTop, messages.scrollHeight);
+    } else if (history.length) messages.scrollTop = messages.scrollHeight;
     if (activeComposer) {
       this.composer.focus();
       this.composer.setSelectionRange(...selection);
