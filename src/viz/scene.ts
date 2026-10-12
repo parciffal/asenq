@@ -1,785 +1,549 @@
-import { homedir } from "node:os";
-import { truncateTerminalText } from "../tui/terminal.js";
-import type { TerminalFrame, TerminalSize, TerminalSpan, TerminalStyle } from "../tui/terminal.js";
-import { MIN_COLUMNS, MIN_ROWS, cleanLabel, edgeKey, hudHeight, layoutScene, textWidth } from "./place.js";
-import type { Layout, Level, Placed } from "./place.js";
-import { GLITCH_CHARS, ORCH_ART, PAL, SPRITE_ROWS, SPRITE_WIDTH, WORKER_ART, artRows, humanRows, mix, shade, speciesOf } from "./sprites.js";
-import type { Hex } from "./sprites.js";
-import type { Bug, Direction, Edge, FeedLine, Hit, Packet, SceneResult, VizUi, World } from "./types.js";
+import { sanitizeTerminalText, terminalTextWidth, truncateTerminalText, wrapTerminalText } from "../tui/terminal.js";
+import type { TerminalSize, TerminalSpan, TerminalStyle } from "../tui/terminal.js";
+import { poseFor } from "./animate.js";
+import { compactPixels, detailedPixels } from "./cast.js";
+import { matchingTargets, sampleRoute, targetKey } from "./place.js";
+import { rasterize, shade } from "./sprites.js";
+import type { SpriteCell, SpriteTone } from "./sprites.js";
+import type { CityCharacter, CityLayout, CityRenderContext, CityTarget, CityVenue, FeedLine, Hit, Packet, PlacedVenue, Point, Rect, SceneResult, VizUi, World } from "./types.js";
 
+const PAL = { void: "#100609", room: "#281018", border: "#a52b3a", cream: "#e8dec8", cyan: "#55ced1", yellow: "#f4e45a", alert: "#ff4355", muted: "#887780" } as const;
+const KIND_COLOR: Record<FeedLine["kind"], string> = { chat: PAL.cream, task: PAL.yellow, result: PAL.cyan, status: PAL.cyan, control: PAL.alert };
+const KIND_TAG: Record<FeedLine["kind"], string> = { chat: "CHAT", task: "TASK", result: "RESULT", status: "STATUS", control: "CTRL" };
+const HARNESS: Record<NonNullable<CityCharacter["harness"]>, string> = { claude: "CC", codex: "CX", omp: "OMP", opencode: "OC" };
+/** Venue appearance cues: a full sign for wide facades, a fixed-width glyph row otherwise. The cue never shares its budget with the name. */
+const VENUE_SIGN: Record<CityVenue["appearance"], string> = { office: "OFFICE", bar: "BAR", garage: "GARAGE", arcade: "ARCADE", communications: "COMMS" };
+const VENUE_GLYPH: Record<CityVenue["appearance"], string> = { office: "⌂", bar: "▦", garage: "⌷", arcade: "◉", communications: "≋" };
+/** Minimum name cells kept before the reserved cue so a selected bracketed name never erases the venue identity. */
+const VENUE_NAME_MIN = 6;
+const TONE: Record<SpriteTone, number> = { live: 1, lost: 0.6, gone: 0.4, offline: 0.55, dim: 0.3 };
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const PACKET_MS = 1400;
-/** Linger of the arrival flash after a packet lands. */
-const FLASH_FROM_MS = 1200;
-const FLASH_TO_MS = 1900;
-const KIND_COLOR: Record<FeedLine["kind"], Hex> = {
-  task: PAL.yellow, result: PAL.green, status: PAL.cyan, chat: PAL.white, control: PAL.alert,
+const ASCII = /^[\x20-\x7e]*$/;
+const safe = (s: string): string => sanitizeTerminalText(s);
+const fit = (s: string, width: number): string => {
+  const text = safe(s);
+  return width <= 0 ? "" : terminalTextWidth(text) <= width ? text : truncateTerminalText(text, width - 1) + "…";
 };
-const KIND_TAG: Record<FeedLine["kind"], string> = { task: "TASK", result: "RESULT", status: "STATUS", chat: "CHAT", control: "CTRL" };
-const LINK_COLORS: Hex[] = [PAL.orange, PAL.cyan, PAL.green, PAL.magenta, PAL.cyan];
-const HARNESS_INDEX: Record<string, number> = { claude: 0, omp: 1, opencode: 2, codex: 3 };
-const BOX = " ╵╶└╷│┌├╴┘─┴┐┤┬┼";
-const ARROW = 16;
-const STATE_WORD: Record<Bug["state"], string> = { working: "WORKING", idle: "IDLE", lost: "LOST", dead: "DEAD" };
-const CLASS_TAG: Record<Bug["kind"], string> = { human: "NETRUNNER", orchestrator: "HIVE QUEEN", worker: "WORKER", feral: "FERAL" };
+const same = (a: CityTarget | null, b: CityTarget): boolean => a !== null && targetKey(a) === targetKey(b);
+const inside = (p: Point, r: Rect): boolean => p.x >= r.x && p.y >= r.y && p.x < r.x + r.width && p.y < r.y + r.height;
+const intersects = (a: Rect, b: Rect): boolean => a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 
-// ---- visibility -------------------------------------------------------------------------------------------------
-
-export function visibleBugs(world: World, ui: VizUi): Bug[] {
-  const matches = (bug: Bug): boolean => ui.filter === null || bug.harness === ui.filter;
-  const keep = new Set<string>();
-  for (const bug of world.bugs) {
-    if (bug.kind === "human" || (bug.kind === "feral" ? ui.feral && matches(bug) : matches(bug))) keep.add(bug.id);
-  }
-  // An orchestrator stays when any bug it links to stays (it carries the link); repeat for nested orchestrators.
-  const orchestrators = new Set(world.bugs.filter((bug) => bug.kind === "orchestrator").map((bug) => bug.id));
-  for (let changed = true; changed;) {
-    changed = false;
-    for (const edge of world.edges) {
-      if (keep.has(edge.to) && orchestrators.has(edge.from) && !keep.has(edge.from)) {
-        keep.add(edge.from);
-        changed = true;
-      }
-    }
-  }
-  return world.bugs.filter((bug) => keep.has(bug.id));
+/** Screen-space city region. Camera geometry never changes world placement. */
+export function mapRegion(size: TerminalSize, embedded = false): Rect {
+  const width = Math.max(0, Math.floor(size.columns));
+  const height = Math.max(0, Math.floor(size.rows));
+  if (width < 60 || height < 20) return { x: 0, y: Math.min(2, height), width, height: Math.max(0, height - 2 - (embedded ? 0 : 1)) };
+  const wide = width >= 110 && height >= 26;
+  const hints = embedded ? 0 : 1;
+  return { x: 0, y: 2, width: width - (wide ? 32 : 0), height: Math.max(0, height - 2 - hints - (wide ? 4 : 9)) };
 }
 
-/**
- * An embedded scene has no key-hint row: it lays out as the standalone scene would one row taller (same HUD and
- * minimum, minus that row), so the HUD's panels end on the region's last row.
- */
-const layoutRows = (size: TerminalSize, embedded: boolean): number => size.rows + (embedded ? 1 : 0);
-const isTooSmall = (size: TerminalSize, embedded: boolean): boolean => size.columns < MIN_COLUMNS || layoutRows(size, embedded) < MIN_ROWS;
-
-/** Filter / focus / feral state flags; the standalone scene draws them on its hint row, embedders show them elsewhere. */
-export function viewFlags(ui: VizUi): string {
-  return [ui.filter !== null ? `FILTER:${ui.filter}` : "", ui.focus ? "FOCUS" : "", ui.feral ? "" : "FERAL OFF"].filter(Boolean).join(" ");
-}
-
-function prepare(world: World, ui: VizUi, size: TerminalSize, embedded: boolean): { bugs: Bug[]; edges: Edge[]; lay: Layout } {
-  const bugs = visibleBugs(world, ui);
-  const ids = new Set(bugs.map((bug) => bug.id));
-  const edges = world.edges.filter((edge) => ids.has(edge.from) && ids.has(edge.to));
-  return { bugs, edges, lay: layoutScene(bugs, edges, { columns: size.columns, rows: layoutRows(size, embedded) }) };
-}
-
-// ---- canvas -----------------------------------------------------------------------------------------------------
-
-const styleTable: TerminalStyle[] = [];
-const styleIds = new Map<string, number>();
-function sid(fg: string, bg: string = PAL.void, bold = false): number {
-  const key = `${fg}${bg}${bold ? "b" : ""}`;
-  let id = styleIds.get(key);
-  if (id === undefined) {
-    id = styleTable.length;
-    styleTable.push({ foreground: fg as Hex, background: bg as Hex, ...(bold ? { bold: true } : {}) });
-    styleIds.set(key, id);
-  }
-  return id;
-}
-
+// One screen-sized pooled canvas. Styles are interned per frame, never per clock phase.
 interface Canvas {
-  cols: number;
-  rows: number;
-  ch: string[];
-  st: number[];
-  occ: Uint8Array;
-  mask: Uint8Array;
-  act: Uint8Array;
-  phase: Int16Array;
-  lcol: Uint8Array;
-  lfocus: Uint8Array;
-  touched: number[];
+  cols: number; rows: number; ch: string[]; styles: number[]; owners: Int32Array; widths: Uint8Array; occupied: Uint8Array;
+  palette: TerminalStyle[]; styleIds: Map<string, number>;
 }
 let pool: Canvas | null = null;
-
-function acquire(cols: number, rows: number, base: number): Canvas {
-  const cells = cols * rows;
-  if (!pool || pool.cols !== cols || pool.rows !== rows) {
-    pool = {
-      cols, rows, ch: new Array<string>(cells), st: new Array<number>(cells), occ: new Uint8Array(cells), mask: new Uint8Array(cells),
-      act: new Uint8Array(cells), phase: new Int16Array(cells), lcol: new Uint8Array(cells), lfocus: new Uint8Array(cells), touched: [],
-    };
-  }
-  pool.ch.fill(" ");
-  pool.st.fill(base);
-  pool.occ.fill(0);
-  pool.mask.fill(0);
-  pool.act.fill(0);
-  pool.lfocus.fill(0);
-  pool.touched.length = 0;
+function acquire(cols: number, rows: number): Canvas {
+  const n = cols * rows;
+  if (!pool || pool.cols !== cols || pool.rows !== rows) pool = {
+    cols, rows, ch: new Array<string>(n), styles: new Array<number>(n), owners: new Int32Array(n), widths: new Uint8Array(n), occupied: new Uint8Array(n), palette: [], styleIds: new Map(),
+  };
+  pool.palette.length = 0;
+  pool.styleIds.clear();
+  style(pool, PAL.cream);
+  pool.ch.fill(" "); pool.styles.fill(0); pool.owners.fill(-1); pool.widths.fill(0);
+  pool.occupied.fill(0);
   return pool;
 }
-
-function put(c: Canvas, x: number, y: number, ch: string, style: number): void {
-  if (x < 0 || y < 0 || x >= c.cols || y >= c.rows) return;
-  const i = y * c.cols + x;
-  c.ch[i] = ch;
-  c.st[i] = style;
-  c.occ[i] = 1;
+function style(c: Canvas, fg: string = PAL.cream, bg: string = PAL.void, dim = false): number {
+  const key = `${fg}/${bg}/${dim}`;
+  const old = c.styleIds.get(key);
+  if (old !== undefined) return old;
+  const id = c.palette.length;
+  c.palette.push({ foreground: fg as `#${string}`, background: bg as `#${string}`, ...(dim ? { dim: true } : {}) });
+  c.styleIds.set(key, id);
+  return id;
 }
-
-const ASCII_ONLY = /^[\x20-\x7e]*$/;
-
-/** Writes already-sanitized text, at most `maxWidth` cells; returns the cells written. */
-function putText(c: Canvas, x: number, y: number, text: string, style: number, maxWidth = c.cols - x): number {
-  let used = 0;
-  if (ASCII_ONLY.test(text)) {
-    for (let i = 0; i < text.length && used < maxWidth; i++, used++) put(c, x + used, y, text[i], style);
-    return used;
+function eraseGlyph(c: Canvas, at: number): void {
+  const owner = c.owners[at];
+  if (owner < 0) return;
+  const width = c.widths[owner];
+  for (let k = 0; k < width; k++) {
+    c.ch[owner + k] = " "; c.owners[owner + k] = -1; c.widths[owner + k] = 0;
   }
-  for (const { segment } of GRAPHEMES.segment(text)) {
-    const w = textWidth(segment);
-    if (w === 0) continue;
-    if (used + w > maxWidth) break;
-    put(c, x + used, y, segment, style);
-    for (let k = 1; k < w; k++) put(c, x + used + k, y, "", style);
+}
+function glyph(c: Canvas, x: number, y: number, ch: string, sid: number, clip: Rect, protectSign = false): void {
+  const w = ch.length === 1 && ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) <= 126 ? 1 : terminalTextWidth(ch);
+  if (w < 1 || !inside({ x, y }, clip) || x + w > clip.x + clip.width || x < 0 || y < 0 || x + w > c.cols || y >= c.rows) return;
+  const at = y * c.cols + x;
+  if (protectSign && c.occupied[at] === 2) return;
+  for (let k = 0; k < w; k++) eraseGlyph(c, at + k);
+  c.ch[at] = ch; c.widths[at] = w;
+  for (let k = 0; k < w; k++) { c.styles[at + k] = sid; c.owners[at + k] = at; if (k) c.ch[at + k] = ""; }
+}
+function text(c: Canvas, x: number, y: number, raw: string, sid: number, clip: Rect, width = clip.x + clip.width - x): void {
+  let used = 0;
+  const value = safe(raw);
+  if (ASCII.test(value)) {
+    for (let i = Math.max(0, clip.x - x); i < Math.min(value.length, width, clip.x + clip.width - x); i++) glyph(c, x + i, y, value[i], sid, clip);
+    return;
+  }
+  for (const { segment } of GRAPHEMES.segment(value)) {
+    const w = terminalTextWidth(segment);
+    if (!w) continue;
+    if (used + w > width) break;
+    glyph(c, x + used, y, segment, sid, clip);
     used += w;
   }
-  return used;
 }
-
-type Seg = readonly [text: string, style: number];
-
-function putSegs(c: Canvas, x: number, y: number, segs: readonly Seg[], maxWidth: number): number {
-  let used = 0;
-  for (const [text, style] of segs) {
-    if (used >= maxWidth) break;
-    used += putText(c, x + used, y, text, style, maxWidth - used);
+function fill(c: Canvas, rect: Rect, sid: number, clip: Rect): void {
+  for (let y = Math.max(rect.y, clip.y, 0); y < Math.min(rect.y + rect.height, clip.y + clip.height, c.rows); y++)
+    for (let x = Math.max(rect.x, clip.x, 0); x < Math.min(rect.x + rect.width, clip.x + clip.width, c.cols); x++) glyph(c, x, y, " ", sid, clip);
+}
+function box(c: Canvas, r: Rect, sid: number, clip: Rect, dashed = false): void {
+  if (r.width < 1 || r.height < 1) return;
+  const right = r.x + r.width - 1, bottom = r.y + r.height - 1;
+  for (let x = Math.max(r.x + 1, clip.x); x < Math.min(right, clip.x + clip.width); x++) {
+    glyph(c, x, r.y, dashed ? "╌" : "─", sid, clip); glyph(c, x, bottom, dashed ? "╌" : "─", sid, clip);
   }
-  return used;
-}
-
-function clear(c: Canvas, x: number, y: number, w: number, h: number, style: number): void {
-  for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) put(c, xx, yy, " ", style);
-}
-
-/** Truncate sanitized text to `width` cells, ending in an ellipsis. */
-function fitText(text: string, width: number): string {
-  if (width <= 0) return "";
-  return textWidth(text) <= width ? text : `${truncateTerminalText(text, width - 1)}…`;
-}
-
-function mixHash(a: number, b = 0, d = 0): number {
-  let h = Math.imul(a | 0, 0x9e3779b1) ^ Math.imul(b | 0, 0x85ebca6b) ^ Math.imul(d | 0, 0xc2b2ae35);
-  h ^= h >>> 15;
-  h = Math.imul(h, 0x2c1b3c6d);
-  h ^= h >>> 12;
-  return h >>> 1;
-}
-const seedCache = new Map<string, number>();
-function seedOf(id: string): number {
-  let seed = seedCache.get(id);
-  if (seed === undefined) {
-    if (seedCache.size > 1024) seedCache.clear();
-    seed = 0;
-    for (let i = 0; i < id.length; i++) seed = mixHash(seed, id.charCodeAt(i));
-    seedCache.set(id, seed);
+  for (let y = Math.max(r.y + 1, clip.y); y < Math.min(bottom, clip.y + clip.height); y++) {
+    glyph(c, r.x, y, dashed ? "┊" : "│", sid, clip); glyph(c, right, y, dashed ? "┊" : "│", sid, clip);
   }
-  return seed;
+  glyph(c, r.x, r.y, "/", sid, clip); glyph(c, right, r.y, "\\", sid, clip);
+  glyph(c, r.x, bottom, "└", sid, clip); glyph(c, right, bottom, "┘", sid, clip);
 }
-/** Triangle wave in [0,1] with the given period. */
-const tri = (t: number, period: number): number => Math.abs((((t % period) + period) % period) - period / 2) / (period / 2);
-
-// ---- drawing ----------------------------------------------------------------------------------------------------
-
-interface Ctx {
-  tick: number;
-  now: number;
-  lay: Layout;
-  lv: Level;
-  selected: string | null;
-  /** Bugs kept bright in focus mode; null when not focusing. */
-  focus: Set<string> | null;
-  flash: Map<string, Hex>;
+function hit(hits: Hit[], target: CityTarget, r: Rect, clip: Rect, priority = 0): void {
+  const x = Math.max(r.x, clip.x), y = Math.max(r.y, clip.y);
+  const width = Math.min(r.x + r.width, clip.x + clip.width) - x;
+  const height = Math.min(r.y + r.height, clip.y + clip.height) - y;
+  if (width > 0 && height > 0) hits.push({ target, column: x, row: y, width, height, priority });
 }
-
-function drawBug(c: Canvas, p: Placed, ctx: Ctx): void {
-  const { bug } = p;
-  const { lv, tick } = ctx;
-  const isHuman = p.cls === "human";
-  const seed = seedOf(bug.id);
-  const dimmed = ctx.focus !== null && !ctx.focus.has(bug.id);
-  const dm = (color: Hex): Hex => (dimmed ? shade(color, 0.3) : color);
-  const sp = speciesOf(bug.harness);
-  let base: Hex = isHuman ? PAL.yellow : sp.color;
-  if (bug.kind === "feral") base = mix(base, PAL.ghost, 0.4);
-  const flash = ctx.flash.get(bug.id);
-  let body: Hex;
-  if (flash) body = tick & 1 ? PAL.white : flash;
-  else if (bug.state === "dead") body = shade(PAL.ghost, 0.9);
-  else if (bug.state === "lost") body = mixHash(seed, tick >> 1) % 3 === 0 ? PAL.alert : shade(base, 0.45);
-  else if (bug.state === "idle") body = shade(base, 0.55 + 0.25 * tri(tick + seed, 16));
-  else body = base;
-  body = dm(body);
-  const bodyId = sid(body);
-  clear(c, p.x, p.y, p.w, p.h, sid(PAL.white));
-
-  let spriteRows = 0;
-  if (lv.sprite !== "none") {
-    const rowsSel = SPRITE_ROWS[lv.sprite][p.cls];
-    spriteRows = rowsSel.length;
-    const leg = bug.state === "working" ? tick & 1 : bug.state === "dead" ? 0 : bug.state === "lost" ? mixHash(seed, tick >> 1) & 1 : (tick >> 3) & 1;
-    const harness = bug.harness ?? "omp";
-    const art: string[] = isHuman ? humanRows(tick) : artRows((p.cls === "orch" ? ORCH_ART : WORKER_ART)[harness], leg as 0 | 1);
-    const sw = SPRITE_WIDTH[p.cls];
-    const sx = p.x + ((p.w - sw) >> 1);
-    const eyeGlyph = bug.state === "working" ? (tick & 1 ? "◉" : "●") : bug.state === "lost" ? "?" : bug.state === "dead" ? "x" : (tick + seed) % 36 < 2 ? "─" : "●";
-    const eyeId = sid(PAL.void, body);
-    const stripId = sid(dm(PAL.cyan));
-    rowsSel.forEach((ri, k) => {
-      const row = art[ri];
-      for (let i = 0; i < row.length; i++) {
-        const ch = row[i];
-        if (ch === " ") continue;
-        if (ch === "E") put(c, sx + i, p.y + k, eyeGlyph, eyeId);
-        else put(c, sx + i, p.y + k, ch, isHuman && ri === 1 && "░▒▓█".includes(ch) ? stripId : bodyId);
-      }
-    });
-    if (bug.state === "lost" || (bug.kind === "feral" && mixHash(seed, tick) % 7 === 0)) {
-      for (let k = 0; k < 2; k++) {
-        const r = mixHash(seed, tick, k);
-        if (r % 3 === 0) continue;
-        const color = [PAL.cyan, PAL.magenta, PAL.alert][(r >> 4) % 3];
-        put(c, sx + ((r >> 3) % sw), p.y + ((r >> 9) % spriteRows), GLITCH_CHARS[(r >> 6) % GLITCH_CHARS.length], sid(dm(color)));
-      }
-    }
-    if (bug.state === "lost" && (tick & 2) === 0) put(c, sx + sw, p.y, "?", sid(dm(PAL.alert), PAL.void, true));
-    if (bug.state === "working") {
-      const r = mixHash(seed, tick);
-      put(c, r & 1 ? sx - 1 : sx + sw, p.y + ((r >> 4) % spriteRows), "*+·'"[(r >> 8) & 3], sid(dm(r & 2 ? PAL.yellow : PAL.white)));
+function reserve(c: Canvas, r: Rect, clip: Rect, priority: number): void {
+  for (let y = Math.max(0, r.y, clip.y); y < Math.min(c.rows, r.y + r.height, clip.y + clip.height); y++)
+    for (let x = Math.max(0, r.x, clip.x); x < Math.min(c.cols, r.x + r.width, clip.x + clip.width); x++) c.occupied[y * c.cols + x] = priority;
+}
+function screen(p: Point, ui: VizUi, region: Rect): Point {
+  return { x: region.x + Math.floor((p.x - ui.viewport.x) / ui.viewport.zoom), y: region.y + Math.floor((p.y - ui.viewport.y) / ui.viewport.zoom) };
+}
+function screenRect(r: Rect, ui: VizUi, region: Rect): Rect {
+  const p = screen(r, ui, region);
+  const end = screen({ x: r.x + r.width - 1, y: r.y + r.height - 1 }, ui, region);
+  return { ...p, width: end.x - p.x + 1, height: end.y - p.y + 1 };
+}
+function viewWorld(ui: VizUi, region: Rect): Rect {
+  return { x: ui.viewport.x, y: ui.viewport.y, width: region.width * ui.viewport.zoom, height: region.height * ui.viewport.zoom };
+}
+function line(c: Canvas, a: Point, b: Point, sid: number, clip: Rect, ch?: string): void {
+  if (a.y === b.y) {
+    for (let x = Math.max(Math.min(a.x, b.x), clip.x); x <= Math.min(Math.max(a.x, b.x), clip.x + clip.width - 1); x++) glyph(c, x, a.y, ch ?? "─", sid, clip);
+  } else if (a.x === b.x) {
+    for (let y = Math.max(Math.min(a.y, b.y), clip.y); y <= Math.min(Math.max(a.y, b.y), clip.y + clip.height - 1); y++) glyph(c, a.x, y, ch ?? "│", sid, clip);
+  }
+}
+function sprite(c: Canvas, cells: readonly (readonly SpriteCell[])[], x: number, y: number, clip: Rect, dim = false): void {
+  for (let row = 0; row < cells.length; row++) for (let col = 0; col < cells[row].length; col++) {
+    const cell = cells[row][col];
+    if (cell) glyph(c, x + col, y + row, cell.ch, style(c, cell.fg ?? PAL.cream, cell.bg ?? PAL.room, dim), clip);
+  }
+}
+function matches(c: CityCharacter, ui: VizUi): boolean {
+  return c.source === "human" || ((c.source !== "process" || ui.processes) && (ui.filter === null || c.harness === ui.filter));
+}
+function badge(c: CityCharacter): string {
+  return c.source === "human" ? "[H]" : `${c.harness === null ? "?" : HARNESS[c.harness]} ${c.role === "orchestrator" ? "[O]" : c.role === "worker" ? "[W]" : "[-]"}`;
+}
+function drawVenue(c: Canvas, placed: PlacedVenue, ui: VizUi, region: Rect, hits: Hit[]): void {
+  const r = screenRect(placed.rect, ui, region);
+  if (!intersects(r, region)) return;
+  const dim = ui.focus && ui.selected !== null && !(ui.selected.kind === "venue" && ui.selected.venueKey === placed.venue.key);
+  const sid = style(c, PAL.border, PAL.room, dim), detail = style(c, PAL.muted, PAL.room, dim);
+  fill(c, r, style(c, PAL.cream, PAL.room, dim), region);
+  box(c, r, sid, region);
+  const target: CityTarget = { kind: "venue", venueKey: placed.venue.key };
+  hit(hits, target, r, region);
+  const selected = ui.selected?.kind === "venue" && ui.selected.venueKey === placed.venue.key;
+  // The appearance cue owns a reserved band that the name can never consume, at every zoom and selection state.
+  const name = `#${placed.venue.name}`;
+  const sign = VENUE_SIGN[placed.venue.appearance];
+  const glyphCue = VENUE_GLYPH[placed.venue.appearance];
+  const inner = r.width - 2;
+  // A screen-space sign band sits above the floors, or at the viewport edge when the roof is offscreen.
+  const titleY = Math.max(region.y, r.y - 1);
+  const titleClip = { x: Math.max(r.x + 1, region.x), y: titleY, width: Math.max(0, Math.min(r.x + r.width - 1, region.x + region.width) - Math.max(r.x + 1, region.x)), height: 1 };
+  const roof = placed.venue.appearance === "communications" ? "/|\\ /|\\" : placed.venue.appearance === "garage" ? "╤══════╤" : placed.venue.appearance === "arcade" ? "/ ▣ ▣ \\" : placed.venue.appearance === "bar" ? "/── BAR ──\\" : "┌─┬─┬─┐";
+  if (ui.viewport.zoom === 1) text(c, r.x + 2, r.y, roof, detail, region, r.width - 4);
+  if (ui.viewport.zoom < 4) {
+    // Compute only the intersecting floor range; an enormous tower costs only visible screen rows.
+    const view = viewWorld(ui, region);
+    const ground = placed.rect.y + placed.rect.height - 10;
+    const first = Math.max(0, Math.floor((ground - (view.y + view.height)) / 10));
+    const last = Math.min(placed.floors - 1, Math.ceil((ground + 10 - view.y) / 10));
+    for (let floor = first; floor <= last; floor++) {
+      const y = ground - floor * 10;
+      const fr = screenRect({ x: placed.rect.x + 1, y, width: placed.rect.width - 2, height: 10 }, ui, region);
+      if (!intersects(fr, region)) continue;
+      line(c, { x: fr.x, y: fr.y + fr.height - 1 }, { x: fr.x + fr.width - 1, y: fr.y + fr.height - 1 }, sid, region);
+      const mid = screen({ x: placed.entrance.x, y }, ui, region);
+      // Keep the screen-space venue sign clear, including at compressed zoom.
+      line(c, { x: mid.x, y: Math.max(mid.y, r.y + 2) }, { x: mid.x, y: fr.y + fr.height - 2 }, detail, region);
+      const decor = placed.venue.appearance === "bar" ? "┬──┬  BAR" : placed.venue.appearance === "garage" ? "▤ ▤ GARAGE" : placed.venue.appearance === "arcade" ? "▣ ▣ ARCADE" : placed.venue.appearance === "communications" ? "┴ /\\ COMMS" : "┬ ┬ OFFICE";
+      if (ui.viewport.zoom === 1) text(c, fr.x + 1, fr.y + fr.height - 2, decor, detail, region, fr.width - 2);
     }
   }
-
-  // Plate: state glyph + name, then tag line (or one row at the smallest level).
-  const inner = p.w - 2;
-  const ix = p.x + 1;
-  const label = cleanLabel(bug.name);
-  const selected = ctx.selected === bug.id;
-  const glyph = isHuman ? "◉" : bug.state === "working" ? "●" : bug.state === "idle" ? "○" : bug.state === "lost" ? "?" : "×";
-  const glyphColor = isHuman ? PAL.yellow : bug.state === "lost" ? ((tick >> 1) & 1 ? PAL.alert : shade(PAL.alert, 0.4)) : bug.state === "dead" ? shade(PAL.ghost, 0.9) : bug.state === "idle" ? shade(base, 0.7) : base;
-  const nameColor = selected ? PAL.yellow
-    : bug.state === "working" ? PAL.white : bug.state === "idle" ? shade(PAL.white, 0.78)
-    : bug.state === "lost" ? (mixHash(seed, tick >> 1) % 4 === 0 ? PAL.alert : shade(PAL.white, 0.55)) : shade(PAL.ghost, 1.1);
-  const plateY = p.y + spriteRows;
-  const orchMark = lv.plateRows === 1 && p.cls === "orch";
-  const nameText = fitText(label.text, inner - 2 - (orchMark ? 2 : 0));
-  const nameW = textWidth(nameText);
-  const tagWord = isHuman ? "OPERATOR" : speciesOf(bug.harness).tag;
-  const tail = lv.plateRows === 1 && inner - 2 - (orchMark ? 2 : 0) - nameW >= tagWord.length + 1 ? ` ${tagWord}` : "";
-  const total = (orchMark ? 2 : 0) + 2 + nameW + tail.length;
-  let at = ix + ((inner - total) >> 1);
-  if (orchMark) at += putText(c, at, plateY, "◈ ", sid(dm(PAL.yellow)));
-  at += putText(c, at, plateY, `${glyph} `, sid(dm(glyphColor), PAL.void, bug.state === "working"));
-  at += putText(c, at, plateY, nameText, sid(dm(nameColor), PAL.void, selected));
-  if (tail) putText(c, at, plateY, tail, sid(dm(shade(base, 0.65))));
-
-  if (lv.plateRows === 2) {
-    const tag = sid(dm(bug.state === "dead" ? shade(PAL.ghost, 0.9) : shade(base, 0.8)));
-    const mark = sid(dm(PAL.yellow), PAL.void, true);
-    const word = STATE_WORD[bug.state];
-    const candidates: Seg[][] = isHuman ? [[["OPERATOR ▸ ONLINE", tag]], [["OPERATOR", tag]]]
-      : p.cls === "orch" ? [[["◈ ORCH", mark], [` ${tagWord}`, tag]], [["◈ ORCH", mark]]]
-      : bug.kind === "feral" ? [[[`${tagWord} ▸ FERAL`, tag]], [["FERAL", tag]]]
-      : [[[`${tagWord} ▸ ${word}`, tag]], [[tagWord, tag]], [[word, tag]]];
-    const widthOf = (segs: Seg[]): number => segs.reduce((n, [text]) => n + text.length, 0);
-    const pick = candidates.find((segs) => widthOf(segs) <= inner) ?? [[fitText(candidates[candidates.length - 1][0][0], inner), candidates[candidates.length - 1][0][1]] as Seg];
-    putSegs(c, ix + ((inner - widthOf(pick)) >> 1), plateY + 1, pick, inner);
+  const entrance = screen(placed.entrance, ui, region);
+  glyph(c, entrance.x, entrance.y, "╥", style(c, PAL.cyan, PAL.room, dim), region);
+  if (!placed.venue.roster.length) {
+    // Emptiness stays truthful and readable at every zoom, including the compressed facade.
+    const caption = inner >= 7 ? "EMPTY 0" : "∅ 0";
+    text(c, r.x + 1, r.y + r.height - 1, fit(caption, Math.max(0, inner)), style(c, PAL.muted, PAL.room, dim), region, Math.max(0, inner));
   }
+  fill(c, titleClip, style(c, PAL.cream, PAL.room, dim), region);
+  reserve(c, titleClip, region, 2);
+  hit(hits, target, titleClip, region);
+  const wideFacade = inner >= VENUE_NAME_MIN + 3 + sign.length + 2;
+  const titleSid = style(c, selected ? PAL.yellow : PAL.cream, PAL.room, dim);
+  if (wideFacade) {
+    const nameBudget = inner - sign.length - 3;
+    text(c, r.x + 1, titleY, selected ? `[${fit(name, nameBudget - 2)}]` : fit(name, nameBudget), titleSid, region, nameBudget);
+    text(c, r.x + 1 + nameBudget + 1, titleY, `· ${sign}`, detail, region, sign.length + 2);
+  } else if (inner >= VENUE_NAME_MIN + 2) {
+    const nameBudget = inner - 2;
+    text(c, r.x + 1, titleY, selected ? `[${fit(name, nameBudget - 2)}]` : fit(name, nameBudget), titleSid, region, nameBudget);
+    glyph(c, r.x + r.width - 2, titleY, glyphCue, detail, region);
+  } else {
+    text(c, r.x + 1, titleY, fit(name, Math.max(0, inner - 2)), titleSid, region, Math.max(0, inner - 2));
+    glyph(c, r.x + r.width - 2, titleY, glyphCue, detail, region);
+  }
+}
 
+interface Label { target: CityTarget; slot: Rect; y: number; name: string; detail: string; selected: boolean; dim: boolean; }
+
+function drawCharacters(c: Canvas, world: World, layout: CityLayout, ui: VizUi, region: Rect, ctx: CityRenderContext, hits: Hit[]): Label[] {
+  const labels: Label[] = [];
+  const byId = new Map(world.characters.map((ch) => [ch.id, ch]));
+  const draw = (ch: CityCharacter, target: CityTarget, worldRect: Rect, anchor: Point, membership: boolean): void => {
+    if (!matches(ch, ui)) return;
+    const info = poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion);
+    const appearance = ctx.appearances.get(ch.id);
+    if (!appearance) return;
+    const a = screen(worldRect, ui, region);
+    const end = screen({ x: worldRect.x + worldRect.width, y: worldRect.y + worldRect.height }, ui, region);
+    // Half-open projected slots have the actual alternating 4/5-cell pitch at zoom 4, without shared boundary cells.
+    const slot: Rect = { x: Math.max(a.x, region.x), y: Math.max(a.y, region.y), width: Math.max(0, Math.min(end.x, region.x + region.width) - Math.max(a.x, region.x)), height: Math.max(0, Math.min(end.y, region.y + region.height) - Math.max(a.y, region.y)) };
+    if (slot.width < 1 || slot.height < 1) return;
+    while (slot.height > 0) {
+      let signRow = false;
+      for (let col = slot.x; col < slot.x + slot.width; col++) if (c.occupied[slot.y * c.cols + col] === 2) { signRow = true; break; }
+      if (!signRow) break;
+      slot.y++; slot.height--;
+    }
+    if (!slot.height) return;
+    const selected = same(ui.selected, target) || (!membership && ui.selected?.kind === "membership" && ui.selected.id === ch.id);
+    const dim = ui.focus && ui.selected !== null && !selected;
+    const compact = !membership && ui.viewport.zoom === 1 && slot.width >= 7 && slot.height >= 6;
+    const mini = !membership && !compact && ui.viewport.zoom <= 2 && slot.width >= 3 && slot.height >= 4;
+    let artWidth = compact ? 7 : mini ? 3 : 1, artHeight = compact ? 4 : mini ? 2 : 1;
+    const pos = screen(anchor, ui, region);
+    let x = artWidth === 1 ? slot.x : Math.max(slot.x, Math.min(pos.x, slot.x + slot.width - artWidth));
+    const labelRows = Math.min(2, slot.height - artHeight);
+    let y = Math.max(slot.y, Math.min(pos.y, slot.y + slot.height - artHeight - labelRows));
+    let blocked = false;
+    for (let row = y; row < y + artHeight; row++) for (let col = x; col < x + artWidth; col++) if (c.occupied[row * c.cols + col]) blocked = true;
+    if (blocked) {
+      // A real moving character may enter another occupied slot. Retain a separate glyph, never erase its neighbor.
+      artWidth = 1; artHeight = 1;
+      let found = false;
+      for (let row = slot.y; row < slot.y + slot.height && !found; row++) for (let col = slot.x; col < slot.x + slot.width; col++) {
+        if (!c.occupied[row * c.cols + col]) { x = col; y = row; found = true; break; }
+      }
+      if (!found) return;
+    }
+    if (artWidth > 1) {
+      const cells = rasterize(compactPixels(appearance, info.pose, compact ? "compact" : "mini"), dim ? "dim" : info.tone, ctx.color);
+      for (let row = 0; row < cells.length; row++) for (let col = 0; col < cells[row].length; col++) {
+        const cell = cells[row][col], at = (y + row) * c.cols + x + col;
+        if (cell && !c.occupied[at]) {
+          glyph(c, x + col, y + row, cell.ch, style(c, cell.fg ?? PAL.cream, cell.bg ?? PAL.room, dim), slot);
+          c.occupied[at] = 1;
+        }
+      }
+    } else {
+      const color = compactPixels(appearance, "idle_a", "mini")[2][0] ?? PAL.cream;
+      glyph(c, x, y, membership ? "@" : ch.source === "human" ? "◆" : ch.source === "process" ? "○" : "●", style(c, selected ? PAL.yellow : ctx.color ? shade(color, TONE[dim ? "dim" : info.tone]) : PAL.cream, PAL.room, dim), slot);
+      c.occupied[y * c.cols + x] = 1;
+    }
+    reserve(c, { x, y, width: artWidth, height: artHeight }, slot, 1);
+    hit(hits, target, { x, y, width: artWidth, height: artHeight }, region, selected ? 3 : 1);
+    labels.push({ target, slot, y: y + artHeight, name: ch.name, detail: membership ? `${badge(ch)} MEMBER` : ch.source === "process" ? `${ch.harness === null ? "?" : HARNESS[ch.harness]} PID ${ch.pid ?? "?"} CPU${ch.cpu ?? "?"}%*` : `${badge(ch)} ${info.label}`, selected, dim });
+  };
+  for (const placed of layout.characters) {
+    const ch = placed.character;
+    if (!matches(ch, ui)) continue;
+    const info = poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion);
+    const anchor = info.label === "MOVING" ? ctx.animator.position(ch.id, ctx.clock) ?? placed.anchor : placed.anchor;
+    const r = { ...placed.rect, x: placed.rect.x + anchor.x - placed.anchor.x, y: placed.rect.y + anchor.y - placed.anchor.y };
+    if (placed.home === null && info.label !== "MOVING") {
+      const station = screenRect(r, ui, region);
+      box(c, station, style(c, ch.source === "process" ? PAL.muted : PAL.border), region, ch.source === "process");
+      if (ch.source === "process" && ui.viewport.zoom === 1) text(c, station.x + 1, station.y, " PROCESS ", style(c, PAL.muted), region, station.width - 2);
+    }
+    draw(ch, { kind: "character", id: ch.id }, r, anchor, false);
+  }
+  for (const placed of layout.venues) for (const room of placed.rooms) {
+    if (room.canonical) continue;
+    const ch = byId.get(room.id);
+    if (ch) draw(ch, { kind: "membership", id: ch.id, venueKey: placed.venue.key }, room.rect, room.anchor, true);
+  }
+  return labels;
+}
+
+/** Find the widest unoccupied run inside a target's slot, never expanding into a neighbor's allocation. */
+function labelRun(c: Canvas, label: Label, start: number, minimum: number): Rect | null {
+  const slot = label.slot;
+  for (let y = Math.max(slot.y, start); y < slot.y + slot.height; y++) {
+    let best: Rect | null = null;
+    for (let x = slot.x; x < slot.x + slot.width;) {
+      if (c.occupied[y * c.cols + x]) { x++; continue; }
+      const left = x;
+      while (x < slot.x + slot.width && !c.occupied[y * c.cols + x]) x++;
+      if (x - left >= minimum && (!best || x - left > best.width)) best = { x: left, y, width: x - left, height: 1 };
+    }
+    if (best) return best;
+  }
+  return null;
+}
+function targetName(target: CityTarget, world: World): string {
+  if (target.kind === "venue") return "#" + (world.venues.find((v) => v.key === target.venueKey)?.name ?? "unknown channel");
+  return world.characters.find((c) => c.id === target.id)?.name ?? "unknown identity";
+}
+interface InspectorRow { text: string; target?: CityTarget; }
+function inspectorRows(world: World, layout: CityLayout, ui: VizUi, ctx: CityRenderContext, now: number): InspectorRow[] {
+  const selected = ui.selected;
+  const rows: InspectorRow[] = [];
+  if (!selected) return [
+    { text: "Tab / hjkl · / search · I inspect" },
+    ...matchingTargets(world, layout, ui).map(({ target }) => ({ text: targetName(target, world), target })),
+  ];
+  const add = (text: string, target?: CityTarget): void => { rows.push({ text, ...(target ? { target } : {}) }); };
+  add(`[${targetName(selected, world)}]`);
+  if (selected.kind === "venue") {
+    const venue = world.venues.find((v) => v.key === selected.venueKey);
+    if (!venue) return rows;
+    add(`VENUE ${venue.appearance} · ${venue.roster.length} MEMBERS`);
+    add(`POSTS ${venue.postCount} (not members)`);
+    add("ROSTER");
+    for (const member of venue.roster) {
+      const state = poseFor(member, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion).label;
+      add(`${member.name} · ${badge(member)} ${state}${matches(member, ui) ? "" : " · FILTERED"}`, { kind: "membership", id: member.id, venueKey: venue.key });
+    }
+    if (!venue.roster.length) add("EMPTY · no registered members");
+  } else {
+    const ch = world.characters.find((v) => v.id === selected.id);
+    if (!ch) return rows;
+    const appearance = ctx.appearances.get(ch.id);
+    add(`SOURCE ${ch.source.toUpperCase()}${matches(ch, ui) ? "" : " · FILTERED"}`);
+    add(`${badge(ch)} · ${poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion).label}`);
+    if (ch.source === "process") {
+      add(`PID ${ch.pid ?? "unknown"} · CPU ${ch.cpu ?? "unknown"}% (inferred)`);
+      add("Detected process, not registration");
+      add("Detection uses process-surplus heuristic");
+      add("No registered memberships");
+    } else if (ch.source === "registered") {
+      add(`HARNESS ${ch.harness ?? "unknown"} · ROLE ${ch.role ?? "unset"}`);
+      add(`RAW ${ch.state ?? "unknown"} · PING ${ch.ping ?? "unknown"}`);
+      add(`STALE ${ch.stale === null ? "unknown" : ch.stale} · BUSY ${ch.busy === null ? "UNKNOWN ?" : ch.busy}`);
+      add(`CONTACT ${ch.lastSeen === null ? "unknown" : `${Math.max(0, Math.floor((now - ch.lastSeen) / 1000))}s ago`}`);
+    } else add("OPERATOR · local human console");
+    if (appearance) {
+      const reason = appearance.reason === "no-model-metadata" ? "no model metadata" : appearance.reason === "session-mapping" ? "viz.json session" : appearance.reason === "harness-mapping" ? `viz.json harness ${ch.harness}` : appearance.reason === "detected-process" ? "detected process" : "operator";
+      add(`OUTFIT ${appearance.outfit} v${appearance.variant + 1} · ${reason}`);
+    }
+    if (ch.source !== "human") add("MODEL unknown (not reported)");
+    add(`CWD ${ch.cwd ?? "unknown"}`);
+    for (const name of ch.previousNames) add(`FORMER ${name}`);
+    if (ch.source === "registered") {
+      add(`MEMBERSHIPS ${ch.memberships.length}`);
+      const home = layout.byCharacter.get(ch.id)?.home;
+      for (const name of ch.memberships) {
+        const venue = world.venues.find((v) => v.name === name);
+        add(`#${name}${venue?.key === home ? " · HOME" : " · secondary"}`, venue ? { kind: "membership", id: ch.id, venueKey: venue.key } : undefined);
+      }
+      if (!ch.memberships.length) add("Public street workstation");
+    }
+  }
+  if (ui.notice) add(ui.notice);
+  if (ctx.settingsWarning) add(ctx.settingsWarning);
+  if (ctx.reducedMotion) add("REDUCED MOTION");
+  add("OBSERVED EXCHANGES");
+  const channelName = selected.kind === "venue" ? world.venues.find((v) => v.key === selected.venueKey)?.name : undefined;
+  const exchanges = world.feed.filter((f) => selected.kind === "venue" ? f.channelTarget?.venueKey === selected.venueKey || f.channel !== undefined && f.channel === channelName : f.fromId === selected.id || f.toId === selected.id);
+  for (const f of exchanges.slice(-50)) add(`[${KIND_TAG[f.kind]}] ${f.channel !== undefined ? "POST #" + f.channel : `DM ${f.from} → ${f.to}`} ${f.text}`);
+  if (!exchanges.length) add("No observed traffic");
+  return rows;
+}
+function drawInspector(c: Canvas, world: World, layout: CityLayout, ui: VizUi, ctx: CityRenderContext, now: number, r: Rect, hits: Hit[], focused: boolean): { length: number; used: number } {
+  if (r.width < 1 || r.height < 1) return { length: 0, used: 0 };
+  const full = { x: 0, y: 0, width: c.cols, height: c.rows };
+  fill(c, r, style(c, PAL.cream), full);
+  const framed = r.width >= 4 && r.height >= 3;
+  if (framed) box(c, r, style(c, PAL.border), full);
+  const body = { x: r.x + (framed ? 1 : 0), y: r.y + (framed ? 1 : 0), width: Math.max(1, r.width - (framed ? 2 : 0)), height: Math.max(0, r.height - (framed ? 2 : 0)) };
+  if (framed) text(c, r.x + 2, r.y, " INSPECT / PgUp PgDn ", style(c, PAL.cyan), full, r.width - 4);
+  let top = body.y;
+  const selected = ui.selected;
+  const ch = selected && selected.kind !== "venue" ? world.characters.find((ch) => ch.id === selected.id) : undefined;
+  const app = ch ? ctx.appearances.get(ch.id) : undefined;
+  if (selected && !ui.search && body.height > 0) {
+    text(c, body.x, top++, fit(`[${targetName(selected, world)}]`, body.width), style(c, PAL.yellow), body);
+  }
+  // Art is fixed above paginated metadata; changing scroll never hides the selected identity.
+  if (ch && app && !ui.search) {
+    const detailed = focused ? r.width >= 24 && r.height >= 18 : body.width >= 22 && body.height >= 22;
+    const art = detailed ? detailedPixels(app, poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion).pose) : focused && r.width >= 8 && r.height >= 6 || !focused && body.height >= 10 ? compactPixels(app, poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion).pose, "compact") : null;
+    if (art) {
+      const cells = rasterize(art, poseFor(ch, ctx.animator, ctx.clock, world.connection, ctx.reducedMotion).tone, ctx.color);
+      sprite(c, cells, body.x + Math.max(0, Math.floor((body.width - cells[0].length) / 2)), top, body);
+      top += cells.length + 1;
+    }
+  }
+  let source = inspectorRows(world, layout, ui, ctx, now);
+  if (ui.search) source = [{ text: `SEARCH /${ui.query}` }, ...(ui.results.length ? ui.results.map((target, i) => ({ text: `${i === ui.searchCursor ? ">" : " "} ${targetName(target, world)}`, target })) : [{ text: "NO MATCH · selection retained" }])];
+  const wrapped: InspectorRow[] = [];
+  const searchStarts: number[] = [];
+  for (const row of source) {
+    if (ui.search && row.target) searchStarts.push(wrapped.length);
+    for (const part of wrapTerminalText(row.text, body.width)) wrapped.push({ ...row, text: part });
+  }
+  const available = Math.max(0, body.y + body.height - top);
+  const desired = ui.search ? searchStarts[ui.searchCursor] ?? 0 : ui.inspectorScroll;
+  const scroll = Math.min(Math.max(0, desired), Math.max(0, wrapped.length - Math.max(1, available)));
+  for (let i = 0; i < available && scroll + i < wrapped.length; i++) {
+    const row = wrapped[scroll + i];
+    text(c, body.x, top + i, row.text, style(c, i === 0 && scroll === 0 ? PAL.yellow : PAL.cream), body);
+    if (row.target) hit(hits, row.target, { x: body.x, y: top + i, width: body.width, height: 1 }, body, 10);
+  }
+  if (framed && wrapped.length > available) text(c, r.x + 2, r.y + r.height - 1, fit(` ${scroll + 1}-${Math.min(scroll + available, wrapped.length)}/${wrapped.length} PgUp/PgDn `, r.width - 4), style(c, PAL.cyan), full);
+  return { length: wrapped.length, used: top - body.y + Math.min(available, wrapped.length) + 2 };
+}
+function drawMinimap(c: Canvas, layout: CityLayout, ui: VizUi, region: Rect, r: Rect): void {
+  if (r.height < 8 || r.width < 8) return;
+  const full = { x: 0, y: 0, width: c.cols, height: c.rows };
+  box(c, r, style(c, PAL.border), full);
+  text(c, r.x + 2, r.y, " REAL CITY ", style(c, PAL.cyan), full, r.width - 4);
+  const inner = { x: r.x + 1, y: r.y + 1, width: r.width - 2, height: r.height - 2 };
+  const b = layout.bounds;
+  const project = (p: Point): Point => ({ x: inner.x + Math.min(inner.width - 1, Math.max(0, Math.floor((p.x - b.x) / Math.max(1, b.width) * inner.width))), y: inner.y + Math.min(inner.height - 1, Math.max(0, Math.floor((p.y - b.y) / Math.max(1, b.height) * inner.height))) });
+  line(c, project({ x: b.x, y: 0 }), project({ x: b.x + b.width, y: 0 }), style(c, PAL.cyan), inner);
+  for (const v of layout.venues) {
+    const a = project(v.rect), z = project({ x: v.rect.x + v.rect.width, y: v.rect.y + v.rect.height });
+    box(c, { ...a, width: Math.max(1, z.x - a.x + 1), height: Math.max(1, z.y - a.y + 1) }, style(c, PAL.muted), inner);
+  }
+  const view = viewWorld(ui, region), a = project(view), z = project({ x: view.x + view.width, y: view.y + view.height });
+  box(c, { ...a, width: Math.max(1, z.x - a.x + 1), height: Math.max(1, z.y - a.y + 1) }, style(c, PAL.yellow), inner);
+  const selected = ui.selected && layout.targets.find((t) => same(ui.selected, t.target));
   if (selected) {
-    const pulse = sid((tick & 7) < 4 ? PAL.yellow : PAL.white, PAL.void, true);
-    const x2 = p.x + p.w - 1;
-    const y2 = p.y + p.h - 1;
-    if (p.h === 1) {
-      put(c, p.x, p.y, "[", pulse);
-      put(c, x2, p.y, "]", pulse);
-    } else {
-      put(c, p.x, p.y, "┏", pulse);
-      put(c, x2, p.y, "┓", pulse);
-      put(c, p.x, y2, "┗", pulse);
-      put(c, x2, y2, "┛", pulse);
+    const p = project(selected.anchor);
+    const direction = inside(selected.anchor, view) ? "◆" : selected.anchor.x < view.x ? "←" : selected.anchor.x >= view.x + view.width ? "→" : selected.anchor.y < view.y ? "↑" : "↓";
+    glyph(c, p.x, p.y, direction, style(c, PAL.yellow), inner);
+  }
+}
+function feedText(f: FeedLine): string {
+  return `[${KIND_TAG[f.kind]}] ${f.channel !== undefined ? `POST #${f.channel} ${f.from}` : `DM ${f.from} → ${f.to}`} · ${f.text}`;
+}
+
+export function renderScene(world: World, layout: CityLayout, packets: readonly Packet[], ui: VizUi, tick: number, size: TerminalSize, now: number, embedded: boolean, context: CityRenderContext): SceneResult {
+  const cols = Math.max(0, Math.floor(size.columns)), rows = Math.max(0, Math.floor(size.rows));
+  const c = acquire(cols, rows), hits: Hit[] = [];
+  const full: Rect = { x: 0, y: 0, width: cols, height: rows };
+  const region = mapRegion(size, embedded);
+  const candidates = matchingTargets(world, layout, ui);
+  const view = viewWorld(ui, region);
+  const onScreen = candidates.filter((p) => inside(world.connection === "connected" && !context.reducedMotion ? context.animator.position(p.target.kind === "character" ? p.target.id : "", context.clock) ?? p.anchor : p.anchor, view)).length;
+  const registered = world.characters.filter((ch) => ch.source === "registered").length;
+  const narrow = cols < 60 || rows < 20;
+  const focused = narrow || ui.inspector === "focused" || ui.search;
+  const wide = cols >= 110 && rows >= 26;
+  const hints = embedded ? 0 : 1;
+  // The OFFSCREEN count only exists when a city viewport is on screen; inspection modes list targets instead of inventing a count.
+  const offscreen = focused ? null : candidates.length - onScreen;
+  const header = cols < 60 ? `${layout.targets.length} TOTAL/${candidates.length} MATCH${offscreen === null ? "/INSPECT" : `/${offscreen} OFF`} · ${registered} SESSIONS` : `CITY · ${layout.targets.length} TOTAL · ${candidates.length} MATCH${offscreen === null ? " · INSPECT" : ` · ${offscreen} OFFSCREEN`} · ${registered} SESSIONS · ${world.venues.length} VENUES`;
+  text(c, 0, 0, fit(header, cols), style(c, PAL.cream), full);
+  const notice = [world.connection === "offline" ? "SIGNAL LOST / STALE SNAPSHOT" : "LINK ESTABLISHED", context.reducedMotion ? "REDUCED MOTION" : "", ui.notice ?? "", context.settingsWarning ?? ""].filter(Boolean).join(" · ");
+  text(c, 0, 1, fit(notice, cols), style(c, world.connection === "offline" ? PAL.alert : PAL.cyan), full);
+  let inspectorLength = 0;
+  if (focused) {
+    const ir = { x: 0, y: Math.min(rows - hints, rows >= 4 ? 2 : 0), width: cols, height: Math.max(0, rows - hints - (rows >= 4 ? 2 : 0)) };
+    const rendered = drawInspector(c, world, layout, ui, context, now, ir, hits, true);
+    inspectorLength = rendered.length;
+    if (cols > 0 && rows === 1) {
+      const target = ui.selected ?? candidates[0]?.target;
+      if (target) { text(c, 0, 0, fit(targetName(target, world), cols), style(c, PAL.yellow), full); hit(hits, target, full, full, 10); }
     }
-  }
-}
-
-// ---- links and packets ------------------------------------------------------------------------------------------
-
-const ACT: Record<Bug["state"], number> = { working: 4, lost: 3, idle: 2, dead: 1 };
-
-function drawLinks(c: Canvas, ctx: Ctx): void {
-  const { lay, tick } = ctx;
-  const cols = c.cols;
-  const bit = (from: number, to: number): number => {
-    const d = to - from;
-    return d === -cols ? 1 : d === 1 ? 2 : d === cols ? 4 : 8;
-  };
-  for (const route of lay.routes) {
-    const child = lay.byId.get(route.edge.to)?.bug;
-    if (!child) continue;
-    const act = ACT[child.state];
-    const colorIdx = child.harness === null ? 4 : HARNESS_INDEX[child.harness] ?? 4;
-    const lit = ctx.selected !== null && (route.edge.from === ctx.selected || route.edge.to === ctx.selected);
-    const path = route.path;
-    const mark = (idx: number, i: number, bits: number): void => {
-      if (c.mask[idx] === 0) c.touched.push(idx);
-      c.mask[idx] |= bits;
-      if (act > c.act[idx]) {
-        c.act[idx] = act;
-        c.phase[idx] = i;
-        c.lcol[idx] = colorIdx;
-      }
-      if (lit) c.lfocus[idx] = 1;
-    };
-    for (let i = 0; i < path.length - 1; i++) {
-      const bits = (i === 0 ? 1 : bit(path[i], path[i - 1])) | bit(path[i], path[i + 1]);
-      mark(path[i], i, bits);
-    }
-    mark(path[path.length - 1], path.length - 1, ARROW);
-  }
-
-  for (const idx of c.touched) {
-    const act = c.act[idx];
-    const base = LINK_COLORS[c.lcol[idx]];
-    const i = c.phase[idx];
-    let color: Hex;
-    let bold = false;
-    let heavy = false;
-    if (act === 4) {
-      const head = (((i - tick) % 4) + 4) % 4;
-      color = head === 0 ? shade(base, 1.45) : head === 3 ? shade(base, 0.95) : shade(base, 0.68);
-      bold = head === 0;
-      heavy = head === 0;
-    } else if (act === 2) {
-      color = (((i - (tick >> 2)) % 10) + 10) % 10 === 0 ? shade(base, 0.6) : shade(base, 0.3);
-    } else if (act === 3) {
-      const r = mixHash(idx, tick >> 1) % 4;
-      if (r === 0) continue;
-      color = shade(PAL.alert, r === 1 ? 0.9 : 0.45);
-    } else {
-      color = shade(PAL.ghost, 0.6);
-    }
-    if (ctx.focus !== null && c.lfocus[idx] === 0) color = shade(color, 0.3);
-    const m = c.mask[idx];
-    let ch = m & ARROW ? "▶" : BOX[m & 15];
-    if (heavy && !(m & ARROW)) ch = ch === "│" ? "┃" : ch === "─" ? "━" : ch;
-    put(c, idx % cols, Math.floor(idx / cols), ch, sid(color, PAL.void, bold));
-  }
-}
-
-/** Cell route for a packet: a direct edge either way, else up to the common ancestor and back down. */
-function packetPath(lay: Layout, fromId: string, toId: string): number[] | null {
-  const direct = lay.routeByKey.get(edgeKey(fromId, toId));
-  if (direct) return direct;
-  const back = lay.routeByKey.get(edgeKey(toId, fromId));
-  if (back) return [...back].reverse();
-  const chain = (id: string): string[] => {
-    const out = [id];
-    for (let cur = lay.parentOf.get(id); cur !== undefined && out.length < 8 && !out.includes(cur); cur = lay.parentOf.get(cur)) out.push(cur);
-    return out;
-  };
-  const up = chain(fromId);
-  const down = chain(toId);
-  const meet = up.findIndex((id) => down.includes(id));
-  if (meet < 0) return null;
-  const apex = down.indexOf(up[meet]);
-  const cells: number[] = [];
-  const add = (path: readonly number[]): void => {
-    for (const cell of path) if (cells[cells.length - 1] !== cell) cells.push(cell);
-  };
-  for (let i = 0; i < meet; i++) {
-    const hop = lay.routeByKey.get(edgeKey(up[i + 1], up[i]));
-    if (!hop) return null;
-    add([...hop].reverse());
-  }
-  for (let i = apex; i > 0; i--) {
-    const hop = lay.routeByKey.get(edgeKey(down[i], down[i - 1]));
-    if (!hop) return null;
-    add(hop);
-  }
-  return cells.length > 0 ? cells : null;
-}
-
-function drawPackets(c: Canvas, ctx: Ctx, packets: readonly Packet[]): void {
-  const cols = c.cols;
-  for (const packet of packets) {
-    if (!ctx.lay.byId.has(packet.fromId) || !ctx.lay.byId.has(packet.toId)) continue;
-    const path = packetPath(ctx.lay, packet.fromId, packet.toId);
-    if (!path) continue;
-    const color = KIND_COLOR[packet.kind];
-    const fade = ctx.focus !== null && packet.fromId !== ctx.selected && packet.toId !== ctx.selected ? 0.3 : 1;
-    const head = Math.floor(Math.min(1, Math.max(0, packet.ageMs / PACKET_MS)) * (path.length - 1));
-    const trail = ["▓", "▒", "░"];
-    for (let k = trail.length; k >= 1; k--) {
-      const idx = path[head - k];
-      if (idx !== undefined && c.occ[idx]) put(c, idx % cols, Math.floor(idx / cols), trail[k - 1], sid(shade(color, fade * (0.85 - 0.2 * k))));
-    }
-    put(c, path[head] % cols, Math.floor(path[head] / cols), "◆", sid(shade(color, fade * 1.4), PAL.void, true));
-  }
-}
-
-function arrivalFlashes(packets: readonly Packet[], lay: Layout): Map<string, Hex> {
-  const flash = new Map<string, Hex>();
-  for (const packet of packets) {
-    if (packet.ageMs >= FLASH_FROM_MS && packet.ageMs < FLASH_TO_MS && lay.byId.has(packet.toId)) flash.set(packet.toId, KIND_COLOR[packet.kind]);
-  }
-  return flash;
-}
-
-// ---- background -------------------------------------------------------------------------------------------------
-
-function drawBackground(c: Canvas, top: number, bottom: number, tick: number): void {
-  const dot = sid(PAL.grid);
-  const head = sid(shade(PAL.cyan, 0.26));
-  const trail = sid(shade(PAL.cyan, 0.14));
-  const span = bottom - top;
-  for (let y = top; y < bottom; y++) {
-    for (let x = 0; x < c.cols; x++) {
-      const i = y * c.cols + x;
-      if (c.occ[i]) continue;
-      const h = mixHash(x, 0x51);
-      if (h % 13 === 0) {
-        const d = ((y - top - (Math.floor(tick / 6) + (h >> 8)) % (span + 10)) % (span + 10) + span + 10) % (span + 10);
-        if (d === 0) { c.ch[i] = (h >> 5) & 1 ? "1" : "0"; c.st[i] = head; continue; }
-        if (d >= span + 7) { c.ch[i] = "·"; c.st[i] = trail; continue; }
-      }
-      if (x % 8 === 3 && y % 4 === 1) { c.ch[i] = "·"; c.st[i] = dot; }
-    }
-  }
-}
-
-// ---- header / HUD -----------------------------------------------------------------------------------------------
-
-const pad2 = (n: number): string => String(n).padStart(2, "0");
-function clock(ms: number): string {
-  const d = new Date(ms);
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-}
-
-function drawHeader(c: Canvas, world: World, tick: number, now: number): void {
-  const cols = c.cols;
-  const title = "ASENQ // NETWATCH";
-  const glitch = tick % 23 < 2 || mixHash(tick) % 41 === 0;
-  const bad = new Set<number>();
-  if (glitch) {
-    bad.add(mixHash(tick, 1) % title.length);
-    bad.add(mixHash(tick, 2) % title.length);
-  }
-  for (let i = 0; i < title.length; i++) {
-    const bg = bad.has(i) && title[i] !== " ";
-    const color = bg ? PAL.alert : i < 5 ? PAL.yellow : i < 9 ? PAL.magenta : PAL.cyan;
-    put(c, 1 + i, 0, bg ? GLITCH_CHARS[mixHash(tick, i) % GLITCH_CHARS.length] : title[i], sid(color, PAL.void, true));
-  }
-  const counts = (kind: Bug["kind"]): number => world.bugs.filter((bug) => bug.kind === kind).length;
-  const orch = counts("orchestrator");
-  const work = world.bugs.filter((bug) => bug.kind === "worker" && !bug.unassigned).length;
-  const unset = world.bugs.filter((bug) => bug.unassigned).length;
-  const feral = counts("feral");
-  const online = world.connection === "connected";
-  const blink = online || (tick % 8) < 4;
-  const connColor = online ? PAL.green : blink ? PAL.alert : shade(PAL.alert, 0.35);
-  const clockText = clock(now);
-  const connFull = online ? "● LINK ESTABLISHED" : "◌ SIGNAL LOST";
-  const connShort = online ? "● LINK OK" : "◌ NO SIGNAL";
-  const titleEnd = 1 + title.length + 2;
-  const label = sid(shade(PAL.cyan, 0.7));
-  const value = sid(PAL.white, PAL.void, true);
-  const sep = sid(PAL.ghost);
-  let rightW = connFull.length + 2 + clockText.length + 1;
-  let conn = connFull;
-  if (titleEnd + rightW > cols) {
-    conn = connShort;
-    rightW = conn.length + 2 + clockText.length + 1;
-  }
-  const room = cols - rightW - titleEnd;
-  const full: Seg[] = [["ORCH ", label], [String(orch), value], [" · ", sep], ["WORK ", label], [String(work), value], ...(unset ? [[" · ", sep], ["UNSET ", label], [String(unset), value]] as Seg[] : []), [" · ", sep], ["FERAL ", label], [String(feral), value]];
-  const compact: Seg[] = [["O", label], [String(orch), value], [" W", label], [String(work), value], ...(unset ? [[" U", label], [String(unset), value]] as Seg[] : []), [" F", label], [String(feral), value]];
-  const fullW = full.reduce((n, [t]) => n + t.length, 0);
-  const compactW = compact.reduce((n, [t]) => n + t.length, 0);
-  if (room >= fullW + 2) putSegs(c, titleEnd + 1, 0, full, fullW);
-  else if (room >= compactW + 1) putSegs(c, titleEnd, 0, compact, compactW);
-  putText(c, cols - rightW, 0, conn, sid(connColor, PAL.void, true));
-  putText(c, cols - clockText.length - 1, 0, clockText, sid(shade(PAL.white, 0.7)));
-
-  // Rule with a scanning highlight.
-  const pos = ((tick * 2) % (cols + 12)) - 6;
-  for (let x = 0; x < cols; x++) {
-    const d = Math.abs(x - pos);
-    const color = d < 3 ? PAL.cyan : d < 6 ? shade(PAL.magenta, 0.9) : shade(PAL.magenta, 0.4);
-    put(c, x, 1, "━", sid(color));
-  }
-}
-
-function ago(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  if (s < 1) return "just now";
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
-}
-
-function shortenPath(path: string, width: number): string {
-  const home = homedir();
-  const clean = cleanLabel(path).text;
-  const short = home && (clean === home || clean.startsWith(`${home}/`)) ? `~${clean.slice(home.length)}` : clean;
-  if (textWidth(short) <= width) return short;
-  const graphemes = [...GRAPHEMES.segment(short)].map((s) => s.segment);
-  let tail = "";
-  let used = 0;
-  for (let i = graphemes.length - 1; i >= 0; i--) {
-    const w = textWidth(graphemes[i]);
-    if (used + w > width - 1) break;
-    tail = graphemes[i] + tail;
-    used += w;
-  }
-  return `…${tail}`;
-}
-
-function box(c: Canvas, x: number, y: number, w: number, h: number, title: string, color: Hex): void {
-  const edge = sid(shade(color, 0.75));
-  const head = sid(color, PAL.void, true);
-  const row = (yy: number, l: string, mid: string, r: string): void => {
-    put(c, x, yy, l, edge);
-    for (let xx = x + 1; xx < x + w - 1; xx++) put(c, xx, yy, mid, edge);
-    put(c, x + w - 1, yy, r, edge);
-  };
-  row(y, "┌", "─", "┐");
-  row(y + h - 1, "└", "─", "┘");
-  for (let yy = y + 1; yy < y + h - 1; yy++) {
-    put(c, x, yy, "│", edge);
-    put(c, x + w - 1, yy, "│", edge);
-    clear(c, x + 1, yy, w - 2, 1, sid(PAL.white));
-  }
-  putText(c, x + 2, y, ` ${title} `, head, w - 4);
-}
-
-function stateBar(bug: Bug, tick: number, base: Hex): Seg[] {
-  const total = 10;
-  const fill = bug.state === "working" ? total : bug.state === "idle" ? 3 + Math.round(tri(tick, 24) * 2) : bug.state === "lost" ? 1 + (mixHash(tick) % 6) : 0;
-  const color = bug.state === "lost" ? PAL.alert : bug.state === "dead" ? PAL.ghost : bug.state === "idle" ? PAL.cyan : base;
-  const segs: Seg[] = [["[", sid(PAL.ghost)]];
-  for (let i = 0; i < total; i++) {
-    const hot = bug.state === "working" && i === tick % total;
-    segs.push(i < fill ? ["▰", sid(hot ? PAL.white : shade(color, 1 - 0.35 * (i / total)))] : ["▱", sid(shade(PAL.ghost, 0.55))]);
-  }
-  segs.push(["]", sid(PAL.ghost)]);
-  return segs;
-}
-
-function targetLines(world: World, bug: Bug, inner: number, count: number, tick: number, now: number): Seg[][] {
-  const key = sid(shade(PAL.cyan, 0.7));
-  const val = sid(PAL.white);
-  const dim = sid(shade(PAL.ghost, 1.2));
-  const sp = speciesOf(bug.harness);
-  const color = bug.kind === "human" ? PAL.yellow : sp.color;
-  const names = new Map(world.bugs.map((b) => [b.id, cleanLabel(b.name).text]));
-  const up = world.edges.filter((e) => e.to === bug.id).map((e) => names.get(e.from) ?? "?");
-  const down = world.edges.filter((e) => e.from === bug.id).map((e) => names.get(e.to) ?? "?");
-  const label = cleanLabel(bug.name).text;
-  const list = (items: string[]): string => (items.length > 0 ? items.join(", ") : "—");
-  const species = bug.kind === "human" ? "deck" : sp.name;
-  const lines: Seg[][] = [
-    [["▌ ", sid(PAL.yellow)], [label, sid(PAL.yellow, PAL.void, true)], [`  ${bug.unassigned ? "UNASSIGNED" : CLASS_TAG[bug.kind]}`, sid(color, PAL.void, true)], [` · ${bug.harness ?? "local"} ${species}`, dim]],
-    [["STATE ", key], ...stateBar(bug, tick, color), [` ${STATE_WORD[bug.state]}`, sid(bug.state === "lost" ? PAL.alert : bug.state === "dead" ? PAL.ghost : color, PAL.void, true)]],
-    [["CWD ", key], [bug.cwd === null ? "—" : shortenPath(bug.cwd, inner - 4), val]],
-  ];
-  const seen = bug.lastSeen === null ? "n/a" : ago(now - bug.lastSeen);
-  const pid = bug.pid === undefined ? null : String(bug.pid);
-  if (count <= 4) {
-    lines.push([["SEEN ", key], [seen, val], [" · UP ", key], [list(up), val], ...(pid ? [[" · PID ", key] as Seg, [pid, val] as Seg] : [])]);
   } else {
-    lines.push([["CH ", key], [list(bug.channels.map((ch) => cleanLabel(ch).text)), val], ...(pid ? [[" · PID ", key] as Seg, [pid, val] as Seg] : []), [" · SEEN ", key], [seen, val]]);
-    lines.push([["UPLINK ", key], [list(up), val]]);
-    lines.push([["AKA ", key], [list(bug.previousNames.map((n) => cleanLabel(n).text)), val]]);
-    lines.push([["DRONES ", key], [list(down), val]]);
+    for (const route of layout.routes.values()) for (const seg of route.segments) line(c, screen(seg.from, ui, region), screen(seg.to, ui, region), style(c, PAL.cyan, PAL.void, true), region);
+    const street = screen({ x: ui.viewport.x, y: 0 }, ui, region);
+    line(c, street, { x: region.x + region.width - 1, y: street.y }, style(c, PAL.cyan), region, "═");
+    for (const venue of layout.venues) drawVenue(c, venue, ui, region, hits);
+    // Packets are real observed traffic only, and their path is sampled without expanding it into cells.
+    if (world.connection === "connected") for (const p of packets.slice(-100)) {
+      if (p.ageMs < 0 || p.ageMs >= PACKET_MS) continue;
+      const dist = p.path.length * p.ageMs / PACKET_MS;
+      const at = sampleRoute(p.path, dist);
+      if (at) { const point = screen(at, ui, region); glyph(c, point.x, point.y, ["⠁", "⠂", "⠄", "⡀"][Math.floor(p.ageMs / 100) % 4], style(c, KIND_COLOR[p.kind]), region, true); }
+      const tail = sampleRoute(p.path, Math.max(0, dist - 3 * ui.viewport.zoom));
+      if (tail) { const point = screen(tail, ui, region); glyph(c, point.x, point.y, "⠒", style(c, KIND_COLOR[p.kind]), region, true); }
+    }
+    const labels = drawCharacters(c, world, layout, ui, region, context, hits);
+    // Geometry bounds ordinary labels; occupancy protects every glyph and sign. Selected names paint last.
+    labels.sort((a, b) => Number(a.selected) - Number(b.selected));
+    for (const label of labels) {
+      const sid = style(c, label.selected ? PAL.yellow : PAL.cream, PAL.room, label.dim);
+      let run = labelRun(c, label, label.y, label.selected ? 3 : 1) ?? labelRun(c, label, label.slot.y, label.selected ? 3 : 1);
+      if (!run && label.selected) {
+        const floating = { ...label, slot: region };
+        run = labelRun(c, floating, label.y, 3) ?? labelRun(c, floating, region.y, 3);
+      }
+      if (!run) continue;
+      const name = label.selected ? `[${fit(label.name, run.width - 2)}]` : fit(label.name, run.width);
+      fill(c, run, sid, region);
+      text(c, run.x, run.y, name, sid, region, run.width);
+      reserve(c, run, region, 1);
+      hit(hits, label.target, run, region, label.selected ? 4 : 1);
+      const detail = labelRun(c, label, run.y + 1, 1);
+      if (detail && ui.viewport.zoom < 4) {
+        fill(c, detail, sid, region);
+        text(c, detail.x, detail.y, fit(label.detail, detail.width), sid, region, detail.width);
+        reserve(c, detail, region, 1);
+        hit(hits, label.target, detail, region, 1);
+      }
+    }
+    const inspector = wide ? { x: region.width, y: 2, width: 32, height: region.height } : { x: 0, y: region.y + region.height, width: cols, height: 7 };
+    const info = drawInspector(c, world, layout, ui, context, now, inspector, hits, false);
+    inspectorLength = info.length;
+    if (wide && inspector.height - info.used >= 8) drawMinimap(c, layout, ui, region, { x: inspector.x + 1, y: inspector.y + info.used, width: inspector.width - 2, height: inspector.height - info.used });
+    const feedRows = wide ? 4 : 2;
+    const feedTop = rows - hints - feedRows;
+    const feed = world.feed.slice(-Math.min(50, feedRows));
+    for (let i = 0; i < feed.length; i++) text(c, 0, feedTop + i, fit(feedText(feed[i]), cols), style(c, KIND_COLOR[feed[i].kind]), full);
+    if (!feed.length) text(c, 0, feedTop, "OBSERVED TRAFFIC · no messages", style(c, PAL.muted), full);
   }
-  return lines.slice(0, count);
-}
-
-function drawHud(c: Canvas, world: World, bugs: readonly Bug[], ui: VizUi, tick: number, now: number, embedded: boolean): void {
-  const cols = c.cols;
-  const rows = c.rows + (embedded ? 1 : 0);
-  const hud = hudHeight(rows);
-  const top = rows - hud;
-  const panelH = hud - 1;
-  const leftW = Math.max(30, Math.floor(cols * 0.45));
-  const rightW = cols - leftW;
-  box(c, 0, top, leftW, panelH, "TARGET", PAL.yellow);
-  box(c, leftW, top, rightW, panelH, "NETWATCH", PAL.cyan);
-
-  const bug = ui.selectedId === null ? undefined : bugs.find((b) => b.id === ui.selectedId);
-  const lines = panelH - 2;
-  const lx = 2;
-  const lw = leftW - 4;
-  if (!bug) {
-    putSegs(c, lx, top + 1, [["select a bug (arrows/Tab)", sid(shade(PAL.ghost, 1.2))], [(tick & 4) === 0 ? " ▮" : "  ", sid(PAL.yellow)]], lw);
-  } else {
-    targetLines(world, bug, lw, lines, tick, now).forEach((segs, i) => putSegs(c, lx, top + 1 + i, segs, lw));
+  if (!embedded && rows > 1) {
+    const hintsText = ui.search ? "Type to search · ↑↓ results · Enter select · Esc cancel · Ctrl-K finder" : focused ? "Tab targets · / search · I/Esc city · PgUp/PgDn scroll · q quit" : "←↑↓→ pan · hjkl/Tab select · +/- zoom · 0 fit · / search · I inspect · Enter open · Space focus · f filter · u processes · F/T follow · r refresh · q quit";
+    text(c, 0, rows - 1, fit(hintsText, cols), style(c, PAL.cyan), full);
   }
-
-  const rx = leftW + 2;
-  const rw = rightW - 4;
-  const feed = world.feed.slice(-lines);
-  if (feed.length === 0) {
-    putSegs(c, rx, top + 1, [["awaiting traffic", sid(shade(PAL.ghost, 1.2))], [(tick & 4) === 0 ? "_" : " ", sid(PAL.cyan)]], rw);
-  }
-  feed.forEach((line, i) => {
-    const color = KIND_COLOR[line.kind];
-    const withTime = rw >= 34;
-    const tag = `[${KIND_TAG[line.kind]}]`;
-    const room = rw - (withTime ? 9 : 0) - tag.length - 3;
-    const per = Math.max(3, Math.min(14, Math.floor(room / 3)));
-    const from = fitText(cleanLabel(line.from).text, per);
-    const to = fitText(cleanLabel(line.to).text, per);
-    const segs: Seg[] = [];
-    if (withTime) segs.push([`${clock(line.at)} `, sid(shade(PAL.ghost, 1.2))]);
-    segs.push([from, sid(shade(PAL.white, 0.85))], [" ▶ ", sid(shade(color, 0.8))], [to, sid(shade(PAL.white, 0.85))], [` ${tag} `, sid(color, PAL.void, true)], [cleanLabel(line.text).text, sid(shade(PAL.white, 0.6))]);
-    putSegs(c, rx, top + 1 + i, segs, rw);
-  });
-
-  if (embedded) return;
-  // Key hints.
-  const keyId = sid(PAL.yellow, PAL.void, true);
-  const descId = sid(shade(PAL.ghost, 1.25));
-  const dotId = sid(shade(PAL.magenta, 0.6));
-  const variants: [string, string][][] = [
-    [["←↑↓→/Tab", "select"], ["Enter", "focus"], ["f", "filter harness"], ["u", "feral"], ["r", "rescan"], ["q", "quit"]],
-    [["←↑↓→", "select"], ["Enter", "focus"], ["f", "filter"], ["u", "feral"], ["r", "rescan"], ["q", "quit"]],
-    [["Tab", "select"], ["Enter", "focus"], ["f", "filter"], ["u", "feral"], ["r", "rescan"], ["q", "quit"]],
-    [["Tab", "select"], ["f", "filter"], ["u", "feral"], ["q", "quit"]],
-    [["q", "quit"]],
-  ];
-  const widthOf = (v: [string, string][]): number => v.reduce((n, [k, d]) => n + k.length + 1 + d.length, 0) + 3 * (v.length - 1);
-  const flags = viewFlags(ui);
-  const chosen = variants.find((v) => 1 + widthOf(v) <= cols) ?? variants[variants.length - 1];
-  let at = 1;
-  chosen.forEach(([k, d], i) => {
-    if (i > 0) at += putText(c, at, c.rows - 1, " · ", dotId);
-    at += putText(c, at, c.rows - 1, k, keyId);
-    at += putText(c, at, c.rows - 1, ` ${d}`, descId);
-  });
-  if (flags && at + flags.length + 3 <= cols) putText(c, cols - flags.length - 1, c.rows - 1, flags, sid(PAL.magenta, PAL.void, true));
-}
-
-// ---- frame ------------------------------------------------------------------------------------------------------
-
-function tooSmall(size: TerminalSize, embedded: boolean): SceneResult {
-  const base = sid(PAL.white);
-  const rows = Math.max(0, size.rows);
-  const message = truncateTerminalText(embedded ? `MAP TOO SMALL // need ${MIN_COLUMNS}x${MIN_ROWS - 1}` : "TERMINAL TOO SMALL // need 60x20", size.columns);
-  const have = truncateTerminalText(`have ${size.columns}x${size.rows}`, size.columns);
-  const mid = Math.floor(rows / 2);
   const lines: TerminalSpan[][] = [];
   for (let y = 0; y < rows; y++) {
-    const text = y === mid ? message : y === mid + 1 ? have : "";
-    const left = Math.max(0, Math.floor((size.columns - text.length) / 2));
     const spans: TerminalSpan[] = [];
-    if (left > 0) spans.push({ text: " ".repeat(left), style: styleTable[base] });
-    if (text) spans.push({ text, style: styleTable[sid(y === mid ? PAL.alert : shade(PAL.ghost, 1.2), PAL.void, y === mid)] });
-    const rest = Math.max(0, size.columns - left - text.length);
-    if (rest > 0) spans.push({ text: " ".repeat(rest), style: styleTable[base] });
+    let sid = -1, content = "";
+    for (let x = 0; x < cols; x++) {
+      const at = y * cols + x;
+      if (c.styles[at] !== sid) { if (content) spans.push({ text: content, style: c.palette[sid] }); sid = c.styles[at]; content = ""; }
+      content += c.ch[at];
+    }
+    if (content) spans.push({ text: content, style: c.palette[sid] });
     lines.push(spans);
   }
-  return { frame: { lines }, hits: [] };
-}
-
-export function renderScene(world: World, packets: Packet[], ui: VizUi, tick: number, size: TerminalSize, now: number, embedded = false): SceneResult {
-  if (isTooSmall(size, embedded)) return tooSmall(size, embedded);
-  tick = Math.floor(tick);
-  const { bugs, edges, lay } = prepare(world, ui, size, embedded);
-  const c = acquire(size.columns, size.rows, sid(PAL.white));
-  const selected = ui.selectedId !== null && lay.byId.has(ui.selectedId) ? ui.selectedId : null;
-  let focus: Set<string> | null = null;
-  if (ui.focus && selected !== null) {
-    focus = new Set([selected]);
-    for (const edge of edges) {
-      if (edge.from === selected) focus.add(edge.to);
-      else if (edge.to === selected) focus.add(edge.from);
-    }
-  }
-  const ctx: Ctx = { tick, now, lay, lv: lay.level, selected, focus, flash: arrivalFlashes(packets, lay) };
-
-  drawLinks(c, ctx);
-  drawPackets(c, ctx, packets);
-  for (const placed of lay.placed) drawBug(c, placed, ctx);
-  if (lay.feralLabel) {
-    const { x, y, w } = lay.feralLabel;
-    const text = " WILDLINE // UNLINKED ";
-    const line = sid(shade(PAL.alert, 0.35));
-    const lead = Math.max(0, (w - text.length) >> 1);
-    for (let i = 0; i < w; i++) put(c, x + i, y, "╌", line);
-    putText(c, x + lead, y, text, sid(shade(PAL.alert, 0.9), PAL.void, true));
-  }
-  if (lay.dropped > 0) {
-    const text = `+${lay.dropped} more`;
-    putText(c, size.columns - text.length - 1, lay.sceneBottom - 1, text, sid(PAL.yellow, PAL.void, true));
-  }
-  drawBackground(c, lay.sceneTop, lay.sceneBottom, tick);
-  drawHeader(c, world, tick, now);
-  drawHud(c, world, bugs, ui, tick, now, embedded);
-
-  const lines: TerminalSpan[][] = [];
-  for (let y = 0; y < c.rows; y++) {
-    const spans: TerminalSpan[] = [];
-    let start = y * c.cols;
-    let cur = c.st[start];
-    let text = "";
-    for (let i = start; i < (y + 1) * c.cols; i++) {
-      if (c.st[i] !== cur) {
-        spans.push({ text, style: styleTable[cur] });
-        cur = c.st[i];
-        text = "";
-        start = i;
-      }
-      text += c.ch[i];
-    }
-    spans.push({ text, style: styleTable[cur] });
-    lines.push(spans);
-  }
-  const hits: Hit[] = lay.placed.map((p) => ({ id: p.bug.id, column: p.x, row: p.y, width: p.w, height: p.h }));
-  const frame: TerminalFrame = { lines };
-  return { frame, hits };
-}
-
-// ---- navigation -------------------------------------------------------------------------------------------------
-
-const rangeGap = (aLo: number, aHi: number, bLo: number, bHi: number): number => Math.max(0, Math.max(aLo, bLo) - Math.min(aHi, bHi));
-
-export function navigate(world: World, ui: VizUi, size: TerminalSize, dir: Direction, embedded = false): string | null {
-  if (isTooSmall(size, embedded)) return null;
-  const { lay } = prepare(world, ui, size, embedded);
-  if (lay.placed.length === 0) return null;
-  const reading = [...lay.placed].sort((a, b) => a.y - b.y || a.x - b.x);
-  const cur = ui.selectedId === null ? undefined : lay.byId.get(ui.selectedId);
-  if (!cur) return (reading.find((p) => p.cls !== "human") ?? reading[0]).bug.id;
-  if (dir === "next" || dir === "prev") {
-    const n = reading.length;
-    return reading[(reading.indexOf(cur) + (dir === "next" ? 1 : n - 1)) % n].bug.id;
-  }
-  if (dir === "up") {
-    const parent = lay.parentOf.get(cur.bug.id);
-    if (parent !== undefined && lay.byId.has(parent)) return parent;
-  }
-  const horizontal = dir === "left" || dir === "right";
-  const sign = dir === "right" || dir === "down" ? 1 : -1;
-  const mx = cur.x * 2 + cur.w;
-  const my = cur.y * 2 + cur.h;
-  let best: Placed | null = null;
-  let bestScore = Infinity;
-  for (const o of reading) {
-    if (o === cur) continue;
-    const ox = o.x * 2 + o.w;
-    const oy = o.y * 2 + o.h;
-    const primary = ((horizontal ? ox - mx : oy - my)) * sign;
-    if (primary <= 0) continue;
-    const gap = horizontal ? rangeGap(cur.y, cur.y + cur.h, o.y, o.y + o.h) : rangeGap(cur.x, cur.x + cur.w, o.x, o.x + o.w);
-    const score = primary + 100 * gap + Math.abs(horizontal ? oy - my : ox - mx) / 2;
-    if (score < bestScore) {
-      bestScore = score;
-      best = o;
-    }
-  }
-  return (best ?? cur).bug.id;
+  return { frame: { lines }, hits, cityRegion: region, inspectorLength };
 }

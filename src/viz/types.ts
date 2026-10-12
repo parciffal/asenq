@@ -1,83 +1,156 @@
-import type { Harness, Kind } from "../shared/protocol.js";
+import type { Harness, Inbound, Kind, PingStatus, Role } from "../shared/protocol.js";
 import type { TerminalFrame } from "../tui/terminal.js";
+import type { Appearance } from "./appearance.js";
+import type { CharacterAnimator } from "./animate.js";
 
-/** Harnesses the viz can show; Codex has no asenq adapter, so it only ever appears as a process-detected bug. */
+/** Codex is detectable, but has no registration adapter. */
 export type VizHarness = Harness | "codex";
 export const VIZ_HARNESSES: readonly VizHarness[] = ["claude", "omp", "opencode", "codex"];
 
-/** `human` is the single netrunner node; `feral` bugs are agent processes asenq does not know. */
-export type BugKind = "human" | "orchestrator" | "worker" | "feral";
-
-/**
- * working: harness reports busy (or a feral process burns CPU).
- * idle: connected, waiting.
- * lost: registered but stale / not answering pings.
- * dead: session is gone (flatlined).
- */
-export type BugState = "working" | "idle" | "lost" | "dead";
-
-export type Bug = {
-  /** Stable session id, the literal "human", or `proc:<pid>` for feral bugs. */
+export type CityCharacter = {
   id: string;
-  /** Display name: session name, "netrunner" for the human, `<harness>-<pid>` for feral bugs. */
   name: string;
-  kind: BugKind;
-  /** null only for the human. */
-  harness: VizHarness | null;
-  state: BugState;
-  cwd: string | null;
-  /** Session channels; empty for human and feral bugs. */
-  channels: string[];
-  /** Former names; messages addressed to them reach this bug. */
   previousNames: string[];
-  pid?: number;
-  /** Registered session with no role set; drawn like a worker but never labelled one. */
-  unassigned?: true;
-  /** Epoch ms of last harness contact, when known. */
+  source: "registered" | "process" | "human";
+  harness: VizHarness | null;
+  role: Role | null;
+  state: "live" | "stale" | "gone" | "removed" | null;
+  stale: boolean | null;
+  ping: PingStatus | null;
+  busy: boolean | null;
+  cpu: number | null;
+  cwd: string | null;
+  /** Authoritative current channel names, not inferred delivery relationships. */
+  memberships: string[];
   lastSeen: number | null;
+  pid?: number;
+  inbound?: Inbound;
+  ownerPid?: number;
 };
-
-/** A persistent link drawn between two bugs. `from` is always the upstream node (human or orchestrator). */
-export type Edge = { from: string; to: string; via: "channel" | "human" };
-
-/** One recent message shown in the feed and animated as a packet on the link between its endpoints. */
+export type VenueAppearance = "office" | "bar" | "garage" | "arcade" | "communications";
+export type CityVenue = {
+  /** Immutable within this map lifetime, transferred only by observed rename. */
+  key: string;
+  name: string;
+  appearance: VenueAppearance;
+  roster: CityCharacter[];
+  postCount: number;
+};
+export type CityTarget =
+  | { kind: "venue"; venueKey: string }
+  | { kind: "character"; id: string }
+  | { kind: "membership"; id: string; venueKey: string };
 export type FeedLine = {
-  /** Unique, increasing. */
   seq: number;
   at: number;
   fromId: string | null;
   toId: string | null;
   from: string;
   to: string;
-  kind: Kind | "chat";
+  kind: Kind;
   text: string;
+  /** Explicit venue target for posts; sourceChannel on a DM is not a post. */
+  channel?: string;
+  channelTarget?: Extract<CityTarget, { kind: "venue" }>;
 };
-
 export type World = {
-  /** Human first, then orchestrators, workers, feral bugs; stable order within each group (by name). */
-  bugs: Bug[];
-  edges: Edge[];
-  /** Newest last, at most 50. */
+  characters: CityCharacter[];
+  venues: CityVenue[];
   feed: FeedLine[];
   connection: "connected" | "offline";
 };
-
-/** A message in flight: `ageMs` is time since birth; scene decides how far along the link it is. */
-export type Packet = { seq: number; fromId: string; toId: string; kind: FeedLine["kind"]; ageMs: number };
-
-export type Direction = "left" | "right" | "up" | "down" | "next" | "prev";
-
-export type VizUi = {
-  selectedId: string | null;
-  /** Only bugs of this harness (plus the links they need) are shown; null shows all. The human always stays. */
-  filter: VizHarness | null;
-  /** Dim everything except the selected bug, its links and its link partners. */
-  focus: boolean;
-  /** Show feral (process-detected) bugs. */
-  feral: boolean;
+export type Point = { x: number; y: number };
+export type Rect = Point & { width: number; height: number };
+export type RouteSegment = { from: Point; to: Point; length: number; start: number };
+export type RoutePath = { segments: readonly RouteSegment[]; length: number };
+export type Packet = {
+  seq: number;
+  from: CityTarget;
+  to: CityTarget;
+  kind: Kind;
+  ageMs: number;
+  path: RoutePath;
 };
-
-/** Clickable bug rectangle, zero-based screen cells. */
-export type Hit = { id: string; column: number; row: number; width: number; height: number };
-
-export type SceneResult = { frame: TerminalFrame; hits: Hit[] };
+export type CityRoom = {
+  id: string;
+  venueKey: string;
+  slot: number;
+  floor: number;
+  rect: Rect;
+  anchor: Point;
+  canonical: boolean;
+};
+export type PlacedVenue = {
+  venue: CityVenue;
+  rect: Rect;
+  entrance: Point;
+  floors: number;
+  rooms: CityRoom[];
+};
+export type PlacedCharacter = {
+  character: CityCharacter;
+  rect: Rect;
+  anchor: Point;
+  /** null denotes its retained public street workstation. */
+  home: string | null;
+};
+export type TargetPosition = {
+  target: CityTarget;
+  anchor: Point;
+  rect: Rect;
+  /** Stable allocation order; unaffected by names, filtering or terminal size. */
+  order: number;
+};
+export type CityLayout = {
+  venues: PlacedVenue[];
+  characters: PlacedCharacter[];
+  byVenue: ReadonlyMap<string, PlacedVenue>;
+  byCharacter: ReadonlyMap<string, PlacedCharacter>;
+  targets: TargetPosition[];
+  /** Target key -> orthogonal path from anchor to y=0 street spine. */
+  routes: ReadonlyMap<string, RoutePath>;
+  bounds: Rect;
+  moved: { id: string; from: Point; to: Point }[];
+};
+export type CityPacket = { seq: number; from: CityTarget; to: CityTarget; kind: Kind; path: RoutePath; senderId: string };
+export type CityView = { world: World; layout: CityLayout; appearances: ReadonlyMap<string, Appearance>; notice: string | null };
+export type Viewport = { x: number; y: number; zoom: 1 | 2 | 4 };
+export type VizUi = {
+  selected: CityTarget | null;
+  filter: VizHarness | null;
+  focus: boolean;
+  processes: boolean;
+  viewport: Viewport;
+  search: boolean;
+  query: string;
+  results: CityTarget[];
+  searchCursor: number;
+  inspector: "normal" | "focused";
+  inspectorScroll: number;
+  follow: false | "session" | "traffic";
+  notice: string | null;
+};
+export type Hit = {
+  target: CityTarget;
+  column: number;
+  row: number;
+  width: number;
+  height: number;
+  /** Inspector entries win over scenery. */
+  priority?: number;
+};
+export type CityRenderContext = {
+  appearances: ReadonlyMap<string, Appearance>;
+  animator: CharacterAnimator;
+  clock: number;
+  reducedMotion: boolean;
+  color: boolean;
+  settingsWarning: string | null;
+};
+export type SceneResult = {
+  frame: TerminalFrame;
+  hits: Hit[];
+  /** Screen-space city rectangle used to center selection and preserve zoom anchors. */
+  cityRegion?: Rect;
+  inspectorLength?: number;
+};

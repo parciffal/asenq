@@ -1,32 +1,12 @@
 import { sanitizeTerminalText, terminalTextWidth } from "../tui/terminal.js";
-import type { TerminalSize } from "../tui/terminal.js";
-import { EYE_ROW, SPRITE_ROWS } from "./sprites.js";
-import type { SpriteClass, SpriteMode } from "./sprites.js";
-import type { Bug, Edge } from "./types.js";
+import { venueAppearance } from "./model.js";
+import type { CityLayout, CityRoom, CityTarget, CityVenue, PlacedCharacter, PlacedVenue, Point, Rect, RoutePath, RouteSegment, TargetPosition, VizUi, World } from "./types.js";
 
-export const MIN_COLUMNS = 60;
-export const MIN_ROWS = 20;
-const HEADER_ROWS = 2;
-const CLUSTER_GAP = 2;
-const MAX_HUMAN_W = 30;
-
-/** Rows reserved for the bottom HUD (two panels plus the key line). */
-export function hudHeight(rows: number): number {
-  return rows <= 24 ? 7 : rows <= 32 ? 8 : rows <= 44 ? 9 : 10;
-}
-
-const ASCII_ONLY = /^[\x20-\x7e]*$/;
+export const textWidth = (text: string): number => terminalTextWidth(text);
 const nameCache = new Map<string, { text: string; width: number }>();
-
-/** Display width of untrusted text after sanitizing. */
-export function textWidth(text: string): number {
-  return ASCII_ONLY.test(text) ? text.length : terminalTextWidth(text);
-}
-
-/** Sanitized single-line text with its display width; never empty. */
 export function cleanLabel(raw: string): { text: string; width: number } {
   let hit = nameCache.get(raw);
-  if (hit === undefined) {
+  if (!hit) {
     if (nameCache.size > 1024) nameCache.clear();
     const text = sanitizeTerminalText(raw).trim() || "?";
     hit = { text, width: textWidth(text) };
@@ -34,302 +14,163 @@ export function cleanLabel(raw: string): { text: string; width: number } {
   }
   return hit;
 }
+export const targetKey = (target: CityTarget): string => target.kind === "venue" ? `v:${target.venueKey}`
+  : target.kind === "character" ? `c:${target.id}` : `m:${target.venueKey}:${target.id}`;
 
-/** Level of detail: sprites shrink and finally vanish so every name stays visible on small terminals. */
-export interface Level {
-  id: 0 | 1 | 2 | 3;
-  sprite: SpriteMode;
-  plateRows: 1 | 2;
-  /** Rows between a parent's bottom and its children's top; the last one is the bus row. */
-  gap: number;
-  minWs: number;
-  minOw: number;
-  minHw: number;
+/** A constant-size segment representation, never one allocation per route cell. */
+export function routePoints(points: readonly Point[]): RoutePath {
+  const segments: RouteSegment[] = [];
+  let length = 0;
+  for (let i = 1; i < points.length; i++) {
+    const from = points[i - 1]!;
+    const to = points[i]!;
+    if (from.x !== to.x && from.y !== to.y) throw new Error("city routes must be orthogonal");
+    const distance = Math.abs(to.x - from.x) + Math.abs(to.y - from.y);
+    if (distance === 0) continue;
+    segments.push({ from, to, start: length, length: distance });
+    length += distance;
+  }
+  return { segments, length };
 }
-
-const LEVELS: readonly Level[] = [
-  { id: 3, sprite: "full", plateRows: 2, gap: 2, minWs: 9, minOw: 13, minHw: 15 },
-  { id: 2, sprite: "mini", plateRows: 2, gap: 2, minWs: 9, minOw: 13, minHw: 15 },
-  { id: 1, sprite: "none", plateRows: 2, gap: 1, minWs: 8, minOw: 10, minHw: 12 },
-  { id: 0, sprite: "none", plateRows: 1, gap: 1, minWs: 8, minOw: 10, minHw: 12 },
-];
-const MAX_WS = 26;
-const MAX_OW = 30;
-
-export const classOf = (bug: Bug): SpriteClass =>
-  bug.kind === "human" ? "human" : bug.kind === "orchestrator" ? "orch" : "worker";
-
-const heightOf = (lv: Level, cls: SpriteClass): number => SPRITE_ROWS[lv.sprite][cls].length + lv.plateRows;
-
-/** One bug's slot: sprite + plate cells; `lane` is the gutter column links descend through (-1: unlinked). */
-export interface Placed {
-  bug: Bug;
-  cls: SpriteClass;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  lane: number;
-  /** Row where links enter this slot (its eye row). */
-  eyeY: number;
-  /** Rows between this slot's bottom and its children (0 for leaves). */
-  gapBelow: number;
-}
-
-export interface Route {
-  edge: Edge;
-  /** Flat cell indexes (y * columns + x) from the parent's stem to the child's entry arrow (last cell). */
-  path: number[];
-}
-
-export interface Layout {
-  level: Level;
-  placed: Placed[];
-  byId: Map<string, Placed>;
-  /** Primary uplink of each linked bug: the id packets climb through when no direct edge exists. */
-  parentOf: Map<string, string>;
-  routes: Route[];
-  routeByKey: Map<string, number[]>;
-  /** Label anchor for the feral band. */
-  feralLabel: { x: number; y: number; w: number } | null;
-  dropped: number;
-  sceneTop: number;
-  sceneBottom: number;
-  columns: number;
-}
-
-interface Cluster {
-  orch: Bug | null;
-  kids: Bug[];
-}
-interface Groups {
-  human: Bug | null;
-  clusters: Cluster[];
-  ferals: Bug[];
-}
-interface Built {
-  level: Level;
-  items: Placed[];
-  feralLabel: Layout["feralLabel"];
-  /** Workers placed under an orchestrator; a human link into them would cross its sprite. */
-  orchKids: Set<string>;
-}
-
-function buildGroups(bugs: Bug[], edges: Edge[]): Groups {
-  const human = bugs.find((bug) => bug.kind === "human") ?? null;
-  const orchs = bugs.filter((bug) => bug.kind === "orchestrator");
-  const workers = bugs.filter((bug) => bug.kind === "worker");
-  const workerIds = new Set(workers.map((bug) => bug.id));
-  const primary = new Map<string, string>();
-  for (const orch of orchs) {
-    for (const edge of edges) {
-      if (edge.from === orch.id && workerIds.has(edge.to) && !primary.has(edge.to)) primary.set(edge.to, orch.id);
+export function sampleRoute(path: RoutePath, distance: number): Point {
+  const last = path.segments[path.segments.length - 1];
+  if (!last) return { x: 0, y: 0 };
+  const d = Math.max(0, Math.min(path.length, distance));
+  for (const segment of path.segments) {
+    if (d <= segment.start + segment.length) {
+      const fraction = (d - segment.start) / segment.length;
+      return { x: segment.from.x + (segment.to.x - segment.from.x) * fraction,
+        y: segment.from.y + (segment.to.y - segment.from.y) * fraction };
     }
   }
-  const clusters: Cluster[] = orchs.map((orch) => ({ orch, kids: workers.filter((w) => primary.get(w.id) === orch.id) }));
-  const free = workers.filter((w) => !primary.has(w.id));
-  if (free.length > 0) clusters.push({ orch: null, kids: free });
-  return { human, clusters, ferals: bugs.filter((bug) => bug.kind === "feral") };
+  return last.to;
 }
-
-const clamp = (value: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, value));
-
-function tryLayout(lv: Level, groups: Groups, ws: number, ow: number, hw: number, width: number, height: number, top: number): Built | null {
-  const { human, clusters, ferals } = groups;
-  const pitch = ws + 2;
-  const avail = width - 2;
-  const orchRegion = ow + 2;
-  const wH = heightOf(lv, "worker");
-  const oH = heightOf(lv, "orch");
-  const hH = heightOf(lv, "human");
-  if (human && hw > avail) return null;
-
-  // Cluster widths: one worker column each, then widen where it saves the most rows.
-  const cols = clusters.map((c) => (c.kids.length > 0 ? 1 : 0));
-  const widthOf = (i: number, nc: number): number => Math.max(clusters[i].orch ? orchRegion : 0, nc * pitch);
-  const widths = clusters.map((_, i) => widthOf(i, cols[i]));
-  const n = clusters.length;
-  const used = (): number => widths.reduce((a, b) => a + b, 0) + CLUSTER_GAP * Math.max(0, n - 1);
-  if (used() > avail) return null;
-  for (;;) {
-    const spare = avail - used();
-    let best = -1;
-    let bestRows = 1;
-    for (let i = 0; i < n; i++) {
-      const k = clusters[i].kids.length;
-      if (cols[i] >= k || cols[i] === 0) continue;
-      if (widthOf(i, cols[i] + 1) - widths[i] > spare) continue;
-      const rows = Math.ceil(k / cols[i]);
-      if (rows > bestRows || (rows === bestRows && best >= 0 && k > clusters[best].kids.length)) {
-        best = i;
-        bestRows = rows;
-      }
-    }
-    if (best < 0) break;
-    cols[best]++;
-    widths[best] = widthOf(best, cols[best]);
-  }
-
-  // Vertical budget.
-  const hasOrch = clusters.some((c) => c.orch !== null);
-  const hasOrchKids = clusters.some((c) => c.orch !== null && c.kids.length > 0);
-  let tier = 0;
-  clusters.forEach((c, i) => {
-    const rows = c.kids.length > 0 ? Math.ceil(c.kids.length / cols[i]) : 0;
-    tier = Math.max(tier, c.orch ? oH + (rows > 0 ? lv.gap + rows * wH : 0) : rows * wH);
+export function routeBetween(layout: CityLayout, from: CityTarget, to: CityTarget): RoutePath | null {
+  const a = layout.routes.get(targetKey(from));
+  const b = layout.routes.get(targetKey(to));
+  if (!a || !b) return null;
+  const points: Point[] = [];
+  const start = layout.targets.find((p) => targetKey(p.target) === targetKey(from))?.anchor;
+  const end = layout.targets.find((p) => targetKey(p.target) === targetKey(to))?.anchor;
+  if (!start || !end) return null;
+  points.push(start);
+  for (const segment of a.segments) points.push(segment.to);
+  const spineA = points[points.length - 1]!;
+  const spineB = b.segments[b.segments.length - 1]?.to ?? end;
+  if (spineA.y !== 0) points.push({ x: spineA.x, y: 0 });
+  points.push({ x: spineB.x, y: 0 });
+  for (let i = b.segments.length - 1; i >= 0; i--) points.push(b.segments[i]!.from);
+  points.push(end);
+  return routePoints(points);
+}
+export function matchingTargets(world: World, layout: CityLayout, ui: VizUi): TargetPosition[] {
+  const byId = new Map(world.characters.map((c) => [c.id, c]));
+  return layout.targets.filter(({ target }) => {
+    if (target.kind === "venue") return true;
+    const c = byId.get(target.id);
+    return c !== undefined && (c.source !== "process" || ui.processes) && (c.source === "human" || ui.filter === null || c.harness === ui.filter);
   });
-  const feralCols = Math.max(1, Math.floor(avail / pitch));
-  const feralRows = Math.ceil(ferals.length / feralCols);
-  const band = ferals.length > 0 ? 2 + feralRows * wH : 0;
-  const humanBlock = human ? hH + (n > 0 ? lv.gap : 0) : 0;
-  const total = humanBlock + tier + band;
-  if (total > height) return null;
-  const gapUses = (human && n > 0 ? 1 : 0) + (hasOrchKids ? 1 : 0);
-  const extra = gapUses > 0 ? Math.min(2, Math.floor((height - total) / (gapUses + 1))) : 0;
-  const g1 = lv.gap + extra;
-  const g2 = lv.gap + extra;
-
-  const items: Placed[] = [];
-  const place = (bug: Bug, x: number, y: number, w: number, lane: number, gapBelow: number): void => {
-    const cls = classOf(bug);
-    items.push({ bug, cls, x, y, w, h: heightOf(lv, cls), lane, eyeY: y + EYE_ROW[lv.sprite][cls], gapBelow });
-  };
-  if (human) place(human, Math.floor((width - hw) / 2), top, hw, -1, n > 0 ? g1 : 0);
-  const tierTop = top + humanBlock + (human && n > 0 ? extra : 0);
-
-  const spare = avail - used();
-  const gap = n > 1 ? Math.min(8, CLUSTER_GAP + Math.floor(spare / (n - 1))) : 0;
-  const totalWidth = widths.reduce((a, b) => a + b, 0) + gap * Math.max(0, n - 1);
-  let x0 = 1 + Math.floor((avail - totalWidth) / 2);
-  clusters.forEach((c, i) => {
-    const wi = widths[i];
-    if (c.orch) {
-      const left = x0 + Math.floor((wi - orchRegion) / 2);
-      place(c.orch, left + 2, tierTop, ow, left, c.kids.length > 0 ? g2 : 0);
-    }
-    if (c.kids.length > 0) {
-      const gl = x0 + Math.floor((wi - cols[i] * pitch) / 2);
-      const kidsTop = c.orch ? tierTop + oH + g2 : tierTop;
-      c.kids.forEach((kid, j) => {
-        const lane = gl + (j % cols[i]) * pitch;
-        place(kid, lane + 2, kidsTop + Math.floor(j / cols[i]) * wH, ws, lane, 0);
-      });
-    }
-    x0 += wi + gap;
-  });
-
-  let feralLabel: Built["feralLabel"] = null;
-  if (ferals.length > 0) {
-    const bandTop = top + height - band;
-    const perRow = Math.min(feralCols, ferals.length);
-    const gl = 1 + Math.floor((avail - perRow * pitch) / 2);
-    feralLabel = { x: gl, y: bandTop + 1, w: perRow * pitch };
-    ferals.forEach((bug, j) => place(bug, gl + (j % feralCols) * pitch + 1, bandTop + 2 + Math.floor(j / feralCols) * wH, ws, -1, 0));
-  }
-  const orchKids = new Set(clusters.flatMap((c) => (c.orch ? c.kids.map((kid) => kid.id) : [])));
-  return { level: lv, items, feralLabel, orchKids };
 }
 
-function fit(groups: Groups, width: number, height: number, top: number): Built | null {
-  const kids = [...groups.clusters.flatMap((c) => c.kids), ...groups.ferals];
-  const orchs = groups.clusters.flatMap((c) => (c.orch ? [c.orch] : []));
-  const maxKid = kids.reduce((m, b) => Math.max(m, cleanLabel(b.name).width), 0);
-  const maxOrch = orchs.reduce((m, b) => Math.max(m, cleanLabel(b.name).width), 0);
-  const humanName = groups.human ? cleanLabel(groups.human.name).width : 0;
-  const prefs = LEVELS.map((lv) => ({
-    ws: clamp(maxKid + 4, lv.minWs, MAX_WS),
-    ow: clamp(maxOrch + 4 + (lv.plateRows === 1 ? 2 : 0), lv.minOw, MAX_OW),
-    hw: clamp(humanName + 4, lv.minHw, MAX_HUMAN_W),
-  }));
-  // Prefer showing full names at a coarser level over truncating at a richer one.
-  for (let i = 0; i < LEVELS.length; i++) {
-    const built = tryLayout(LEVELS[i], groups, prefs[i].ws, prefs[i].ow, prefs[i].hw, width, height, top);
-    if (built) return built;
-  }
-  for (let i = 0; i < LEVELS.length; i++) {
-    const lv = LEVELS[i];
-    const { ws: wsPref, ow: owPref, hw } = prefs[i];
-    for (let shrink = 1; ; shrink++) {
-      const ws = Math.max(lv.minWs, wsPref - shrink);
-      const ow = Math.max(lv.minOw, owPref - shrink);
-      const built = tryLayout(lv, groups, ws, ow, hw, width, height, top);
-      if (built) return built;
-      if (ws === lv.minWs && ow === lv.minOw) break;
-    }
-  }
-  return null;
-}
+type VenueReservation = { key: string; name: string; appearance: CityVenue["appearance"]; strip: number; slots: Map<string, number>; floors: number };
+/** All reservations are retained until this map instance is destroyed. */
+export class CityPlacement {
+  private readonly names = new Map<string, VenueReservation>();
+  private readonly streets = new Map<string, number>([["human", 0]]);
+  private readonly homes = new Map<string, string | null>();
+  private readonly orders = new Map<string, number>();
+  private previous = new Map<string, Point>();
+  private nextVenue = 0;
+  private nextOrder = 0;
+  private bounds: Rect = { x: 0, y: -14, width: 40, height: 30 };
 
-const keyOf = (from: string, to: string): string => `${from}>${to}`;
-
-function routeEdges(built: Built, edges: Edge[], columns: number): { routes: Route[]; parentOf: Map<string, string> } {
-  const byId = new Map(built.items.map((item) => [item.bug.id, item]));
-  const routes: Route[] = [];
-  const parentOf = new Map<string, string>();
-  for (const edge of edges) {
-    const parent = byId.get(edge.from);
-    const child = byId.get(edge.to);
-    if (!parent || !child || child.lane < 0 || parent.gapBelow === 0) continue;
-    const busY = parent.y + parent.h - 1 + parent.gapBelow;
-    if (child.y <= busY) continue;
-    // A human link into an orchestrator's worker would cross that orchestrator's sprite; packets climb through it instead.
-    if (parent.cls === "human" && built.orchKids.has(child.bug.id)) continue;
-    const px = parent.x + Math.floor(parent.w / 2);
-    const cells: number[] = [];
-    const push = (x: number, y: number): void => { cells.push(y * columns + x); };
-    for (let y = parent.y + parent.h; y <= busY; y++) push(px, y);
-    const dx = Math.sign(child.lane - px);
-    if (dx !== 0) for (let x = px + dx; x !== child.lane + dx; x += dx) push(x, busY);
-    for (let y = busY + 1; y <= child.eyeY; y++) push(child.lane, y);
-    push(child.lane + 1, child.eyeY);
-    routes.push({ edge, path: cells });
+  renameChannel(oldName: string, name: string): void {
+    const reservation = this.names.get(oldName);
+    if (!reservation || oldName === name) return;
+    this.names.delete(oldName);
+    reservation.name = name;
+    this.names.set(name, reservation);
   }
-  // Primary uplink: the first routed edge into each bug, orchestrators before the human.
-  const ordered = [...routes].sort((a, b) => Number(byId.get(a.edge.from)?.cls === "human") - Number(byId.get(b.edge.from)?.cls === "human"));
-  for (const { edge } of ordered) if (!parentOf.has(edge.to)) parentOf.set(edge.to, edge.from);
-  return { routes, parentOf };
-}
 
-/** Place every bug and route its links. Deterministic in (bugs, edges, size); shared by rendering and navigation. */
-export function layoutScene(bugs: Bug[], edges: Edge[], size: TerminalSize): Layout {
-  const top = HEADER_ROWS;
-  const bottom = size.rows - hudHeight(size.rows);
-  const height = bottom - top;
-  const groups = buildGroups(bugs, edges);
-  const total = bugs.filter((bug) => bug.kind !== "human").length;
-  let built = fit(groups, size.columns, height, top);
-  let dropped = 0;
-  if (!built) {
-    // Even the smallest level overflows: shed bugs from the end (ferals, workers, then orchestrators) and keep a marker row.
-    const trial: Groups = { human: groups.human, clusters: groups.clusters.map((c) => ({ orch: c.orch, kids: [...c.kids] })), ferals: [...groups.ferals] };
-    while (!built) {
-      if (trial.ferals.length > 0) trial.ferals.pop();
-      else {
-        const last = [...trial.clusters].reverse().find((c) => c.kids.length > 0);
-        if (last) last.kids.pop();
-        else if (trial.clusters.length > 0) trial.clusters.pop();
-        else break;
+  update(world: World): CityLayout {
+    for (const v of [...world.venues].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+      if (!this.names.has(v.name)) {
+        const strip = this.nextVenue++;
+        this.names.set(v.name, { key: `venue:${strip}`, name: v.name, appearance: venueAppearance(v.name), strip, slots: new Map(), floors: 1 });
       }
-      trial.clusters = trial.clusters.filter((c) => c.orch !== null || c.kids.length > 0);
-      built = fit(trial, size.columns, height - 1, top);
+      const reservation = this.names.get(v.name)!;
+      v.key = reservation.key;
+      v.appearance = reservation.appearance;
+      for (const id of v.roster.map((c) => c.id).sort()) if (!reservation.slots.has(id)) reservation.slots.set(id, reservation.slots.size);
+      for (const c of v.roster) reservation.floors = Math.max(reservation.floors, Math.floor(reservation.slots.get(c.id)! / 2) + 1);
     }
-    if (!built) built = { level: LEVELS[3], items: groups.human ? [{ bug: groups.human, cls: "human", x: 1, y: top, w: Math.min(MAX_HUMAN_W, size.columns - 2), h: 1, lane: -1, eyeY: top, gapBelow: 0 }] : [], feralLabel: null, orchKids: new Set() };
-    dropped = total - built.items.filter((item) => item.bug.kind !== "human").length;
+    const byName = new Map(world.venues.map((v) => [v.name, v]));
+    for (const c of [...world.characters].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) {
+      const eligible = c.memberships.filter((name) => byName.has(name)).sort();
+      const keys = eligible.map((name) => byName.get(name)!.key);
+      const old = this.homes.get(c.id);
+      const home = old !== undefined && old !== null && keys.includes(old) ? old : keys[0] ?? null;
+      this.homes.set(c.id, home);
+      if (home === null && !this.streets.has(c.id)) this.streets.set(c.id, this.streets.size);
+    }
+    const venues: PlacedVenue[] = [];
+    const characters: PlacedCharacter[] = [];
+    const targets: TargetPosition[] = [];
+    const routes = new Map<string, RoutePath>();
+    const roomsById = new Map<string, CityRoom>();
+    const add = (target: CityTarget, anchor: Point, rect: Rect, points: Point[]): void => {
+      const key = targetKey(target);
+      if (!this.orders.has(key)) this.orders.set(key, this.nextOrder++);
+      targets.push({ target, anchor, rect, order: this.orders.get(key)! });
+      routes.set(key, routePoints(points));
+    };
+    for (const venue of world.venues.sort((a, b) => this.names.get(a.name)!.strip - this.names.get(b.name)!.strip)) {
+      const r = this.names.get(venue.name)!;
+      const x = r.strip * 48;
+      const rect = { x, y: -14 - (r.floors - 1) * 10, width: 40, height: r.floors * 10 };
+      const entrance = { x: x + 20, y: -4 };
+      const rooms: CityRoom[] = [];
+      add({ kind: "venue", venueKey: venue.key }, entrance, rect, [entrance, { x: entrance.x, y: 0 }]);
+      for (const c of venue.roster) {
+        const slot = r.slots.get(c.id)!;
+        const floor = Math.floor(slot / 2);
+        const roomRect = { x: x + 1 + (slot % 2) * 20, y: -13 - floor * 10, width: 18, height: 8 };
+        const anchor = { x: roomRect.x + 5, y: roomRect.y + 1 };
+        const canonical = this.homes.get(c.id) === venue.key;
+        const room = { id: c.id, venueKey: venue.key, slot, floor, rect: roomRect, anchor, canonical };
+        rooms.push(room);
+        if (canonical) roomsById.set(c.id, room);
+        else add({ kind: "membership", id: c.id, venueKey: venue.key }, anchor, roomRect,
+          [anchor, { x: anchor.x, y: roomRect.y + 7 }, { x: entrance.x, y: roomRect.y + 7 }, entrance, { x: entrance.x, y: 0 }]);
+      }
+      venues.push({ venue, rect, entrance, floors: r.floors, rooms });
+    }
+    for (const c of world.characters) {
+      const room = roomsById.get(c.id);
+      const slot = this.streets.get(c.id) ?? 0;
+      const rect = room?.rect ?? { x: (slot % 8) * 18, y: 6 + Math.floor(slot / 8) * 10, width: 16, height: 8 };
+      const anchor = room?.anchor ?? { x: rect.x + 4, y: rect.y + 1 };
+      const placed = { character: c, rect, anchor, home: this.homes.get(c.id) ?? null };
+      characters.push(placed);
+      const entrance = room ? venues.find((v) => v.venue.key === room.venueKey)!.entrance : null;
+      const points = room && entrance ? [anchor, { x: anchor.x, y: rect.y + 7 }, { x: entrance.x, y: rect.y + 7 }, entrance, { x: entrance.x, y: 0 }]
+        : [anchor, { x: rect.x + rect.width, y: anchor.y }, { x: rect.x + rect.width, y: 0 }];
+      add({ kind: "character", id: c.id }, anchor, rect, points);
+    }
+    const moved: CityLayout["moved"] = [];
+    for (const c of characters) {
+      const from = this.previous.get(c.character.id);
+      if (from && (from.x !== c.anchor.x || from.y !== c.anchor.y)) moved.push({ id: c.character.id, from, to: c.anchor });
+    }
+    this.previous = new Map(characters.map((c) => [c.character.id, c.anchor]));
+    for (const rect of [...venues.map((v) => v.rect), ...characters.map((c) => c.rect)]) {
+      const x = Math.min(this.bounds.x, rect.x);
+      const y = Math.min(this.bounds.y, rect.y);
+      this.bounds = { x, y, width: Math.max(this.bounds.x + this.bounds.width, rect.x + rect.width) - x,
+        height: Math.max(this.bounds.y + this.bounds.height, rect.y + rect.height) - y };
+    }
+    targets.sort((a, b) => a.order - b.order);
+    return { venues, characters, targets, routes, bounds: this.bounds, moved,
+      byVenue: new Map(venues.map((v) => [v.venue.key, v])), byCharacter: new Map(characters.map((c) => [c.character.id, c])) };
   }
-  const { routes, parentOf } = routeEdges(built, edges, size.columns);
-  return {
-    level: built.level,
-    placed: built.items,
-    byId: new Map(built.items.map((item) => [item.bug.id, item])),
-    parentOf,
-    routes,
-    routeByKey: new Map(routes.map((route) => [keyOf(route.edge.from, route.edge.to), route.path])),
-    feralLabel: built.feralLabel,
-    dropped,
-    sceneTop: top,
-    sceneBottom: bottom,
-    columns: size.columns,
-  };
 }
-
-export { keyOf as edgeKey };

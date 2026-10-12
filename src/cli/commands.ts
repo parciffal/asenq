@@ -113,7 +113,9 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           if (e.type === "session") {
             out(`${hhmmss(Date.now())} session ${e.name} (${e.harness}) ${e.action}${e.oldName ? ` from ${e.oldName}` : ""}`);
           } else if (e.type === "channel") {
-            out(`${hhmmss(Date.now())} channel #${e.channel.name} ${e.action}${e.oldName ? ` from #${e.oldName}` : ""} (${e.channel.memberIds?.length ?? 0} members)`);
+            const detail = e.action === "deleted" ? ""
+              : `${e.oldName ? ` from #${e.oldName}` : ""} (${e.channel.memberIds?.length ?? 0} members)`;
+            out(`${hhmmss(Date.now())} channel #${e.channel.name} ${e.action}${detail}`);
           } else if (e.type === "ping") {
             out(`${hhmmss(Date.now())} ping ${e.sessionId}: ${e.ping}`);
           } else if (e.type === "message") {

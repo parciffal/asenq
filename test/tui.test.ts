@@ -5,15 +5,19 @@ import { afterEach, test } from "node:test";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { AsenqClient } from "../src/shared/client.js";
 import type { ClientOpts } from "../src/shared/client.js";
-import { GRACE_MS, type PositionedEvent, type SendResult, type SessionIdentity, type StoredMessage } from "../src/shared/protocol.js";
+import { GRACE_MS } from "../src/shared/protocol.js";
+import type { PositionedEvent, SendResult, SessionIdentity, StoredMessage } from "../src/shared/protocol.js";
 import type { ProcInfo } from "../src/viz/scan.js";
-import { ConsoleApp, type ConsoleDeps } from "../src/tui/app.js";
+import type { VizMap } from "../src/viz/map.js";
+import { ConsoleApp } from "../src/tui/app.js";
+import type { ConsoleDeps } from "../src/tui/app.js";
 import { paneWidths } from "../src/tui/layout.js";
 import {
   changedTerminalRows, normalizeTerminalLine, terminalTextWidth, translateKeyboardInput, truncateTerminalText, wrapTerminalText,
-  type TerminalAdapterOptions, type TerminalFrame, type TerminalLine, type TerminalSize,
 } from "../src/tui/terminal.js";
-import { logOf, startEnv, type Adapter, type TestEnv } from "./helpers.js";
+import type { MouseInput, TerminalAdapterOptions, TerminalFrame, TerminalLine, TerminalSize } from "../src/tui/terminal.js";
+import { logOf, startEnv } from "./helpers.js";
+import type { Adapter, TestEnv } from "./helpers.js";
 
 let env: TestEnv | undefined;
 let open: Console | undefined;
@@ -32,6 +36,7 @@ type Console = {
   press(name: string): Promise<void>;
   burst(keys: string[]): Promise<void>;
   click(column: number, row?: number): Promise<void>;
+  mouse(action: MouseInput["action"], column: number, row: number): Promise<void>;
   paste(text: string): Promise<void>;
   resize(columns: number, rows: number): Promise<void>;
   close(): void;
@@ -44,7 +49,7 @@ const lineText = (line: TerminalLine | undefined): string =>
   line === undefined ? "" : typeof line === "string" ? line : line.map((span) => span.text).join("");
 
 /** Runs the real ui against the test daemon with a recording screen instead of a TTY. */
-async function startConsole(columns: number, rows: number, client?: ConsoleDeps["client"], deps: Pick<ConsoleDeps, "scan" | "now" | "schedule"> = {}): Promise<Console> {
+async function startConsole(columns: number, rows: number, client?: ConsoleDeps["client"], deps: Pick<ConsoleDeps, "scan" | "now" | "schedule" | "settings" | "reducedMotion"> = {}): Promise<Console> {
   let handlers: TerminalAdapterOptions = {};
   let frame: TerminalFrame = { lines: [] };
   const size = { columns, rows };
@@ -76,6 +81,10 @@ async function startConsole(columns: number, rows: number, client?: ConsoleDeps[
     },
     async click(column, row = 0) {
       handlers.onMouse?.({ name: "MOUSE_LEFT_BUTTON_PRESSED", column, row, action: "press", button: "left", ctrl: false, alt: false, shift: false });
+      await app.idle();
+    },
+    async mouse(action, column, row) {
+      handlers.onMouse?.({ name: "MOUSE", action, column, row, button: "left", ctrl: false, alt: false, shift: false });
       await app.idle();
     },
     async paste(text) {
@@ -449,7 +458,7 @@ test("compact tabs remain mouse reachable without stealing the connection hit ar
   assert.deepEqual(ui.rows().slice(1), before, "Activity mouse target selects the same view as its key");
 });
 
-test("the Map tab stays mouse reachable at compact widths and shows a too-small notice below the scene minimum", async () => {
+test("the Map tab stays mouse reachable at compact widths and exposes compact inspection", async () => {
   env = await startEnv();
   const ui = await startConsole(100, 24, undefined, { scan: async () => [] });
   for (const columns of [100, 60, 40, 30, 24, 20]) {
@@ -459,7 +468,10 @@ test("the Map tab stays mouse reachable at compact widths and shows a too-small 
     const column = header.includes("Map") ? header.indexOf("Map") : header.indexOf("M");
     assert.ok(column >= 0 && column < header.indexOf("●"), `Map precedes the connection symbol at ${columns}: ${header}`);
     await ui.click(column);
-    assert.ok(ui.rows().some((row) => /NETWATCH|TOO SMALL/.test(row)), `Map opened at ${columns}:\n${ui.rows().join("\n")}`);
+    assert.ok(activeMap(ui), `Map opened at ${columns}:\n${ui.rows().join("\n")}`);
+    await searchMap(ui, "operator");
+    assert.deepEqual(mapOf(ui).selected, { kind: "character", id: "human" });
+    assert.ok(ui.rows().some((row) => row.includes("operator")), "compact inspection reaches the operator");
     assertWithin(ui);
   }
 });
@@ -2676,12 +2688,25 @@ async function mapFleet(e: TestEnv): Promise<MapFleet> {
 
 const hasRow = (ui: Console, text: string): boolean => ui.rows().some((row) => row.includes(text));
 const noDaemon = (options: ClientOpts): AsenqClient => new AsenqClient({ ...options, autoStart: false });
-/** The row under the TARGET header: names the selected bug, or a hint when none is selected. */
-const mapTarget = (ui: Console): string => {
-  const rows = ui.rows();
-  const header = rows.findIndex((row) => row.includes("TARGET"));
-  return header < 0 ? "" : rows[header + 1] ?? "";
+/** Controller exposes counts/selection that cannot be distinguished from cell art in plain text. */
+const mapOf = (ui: Console): VizMap => {
+  const inner = ui.app as unknown as { map: VizMap };
+  return inner.map;
 };
+const activeMap = (ui: Console): boolean => {
+  const header = ui.frame().lines[0];
+  return header !== undefined && typeof header !== "string"
+    && header.some((span) => span.style?.inverse && ["Map", "M"].includes(span.text.trim()));
+};
+const mapShown = (ui: Console): boolean => {
+  const footer = ui.rows().at(-1) ?? "";
+  return activeMap(ui) && (footer.includes("arrows pan") || footer.includes("switch"));
+};
+async function searchMap(ui: Console, query: string): Promise<void> {
+  await ui.press("/");
+  await ui.type(query);
+  await ui.press("ENTER");
+}
 
 async function openMap(columns = 160, rows = 48, deps: Pick<ConsoleDeps, "scan" | "now" | "schedule"> = {}): Promise<Console> {
   const ui = await startConsole(columns, rows, undefined, { scan: async () => [], ...deps });
@@ -2689,7 +2714,7 @@ async function openMap(columns = 160, rows = 48, deps: Pick<ConsoleDeps, "scan" 
   return ui;
 }
 
-test("the tab bar has a Map tab and m opens the bug-map with its panels and the console footer hints", async () => {
+test("m opens the city under the console chrome with host navigation hints", async () => {
   env = await startEnv();
   await mapFleet(env);
   const timer = mapTimer();
@@ -2697,13 +2722,12 @@ test("the tab bar has a Map tab and m opens the bug-map with its panels and the 
   assert.ok(ui.rows()[0].includes("Map"), ui.rows()[0]);
   await ui.press("m");
   await ui.until(() => hasRow(ui, "boss-queen") && hasRow(ui, "wrk-alpha"), "sessions drawn on the map");
-  assert.ok(hasRow(ui, "TARGET") && hasRow(ui, "NETWATCH"), ui.rows().join("\n"));
+  assert.ok(mapShown(ui), ui.rows().join("\n"));
   assert.ok(!hasRow(ui, "SIGNAL LOST"));
   assert.ok(ui.rows()[0].includes("Map"), "the console tab bar stays above the scene");
   assert.equal(ui.rows().length, ui.size.rows, "the scene fills the body and the console footer");
   const footer = ui.rows().at(-1)!;
-  assert.ok(footer.includes("select") && footer.includes("rescan"), `console footer carries the map hints: ${footer}`);
-  assert.ok(!ui.rows().slice(0, -1).some((row) => row.includes("rescan")), "the scene's own key-hint row is dropped");
+  assert.ok(footer.includes("select") && footer.includes("refresh"), `console footer carries the map hints: ${footer}`);
   assertWithin(ui);
 });
 
@@ -2711,16 +2735,16 @@ test("Left/Right switch tabs from the tab bar into and out of the Map tab", asyn
   env = await startEnv();
   await mapFleet(env);
   const ui = await openMap();
-  await ui.until(() => hasRow(ui, "NETWATCH"), "map shown");
+  await ui.until(() => mapShown(ui), "map shown");
   await ui.press("s");
-  assert.ok(!hasRow(ui, "NETWATCH"));
+  assert.ok(!mapShown(ui));
   await ui.press("SHIFT_TAB"); // list → tab bar
   for (let i = 0; i < 4; i++) await ui.press("RIGHT");
-  await ui.until(() => hasRow(ui, "NETWATCH"), "four Right presses reach the Map tab");
+  await ui.until(() => mapShown(ui), "four Right presses reach the Map tab");
   await ui.press("RIGHT");
-  await ui.until(() => !hasRow(ui, "NETWATCH"), "Right from the Map tab wraps to Sessions");
+  await ui.until(() => !mapShown(ui), "Right from Map wraps to Sessions");
   await ui.press("LEFT");
-  await ui.until(() => hasRow(ui, "NETWATCH"), "Left from Sessions wraps back to Map");
+  await ui.until(() => mapShown(ui), "Left from Sessions wraps back to Map");
 });
 
 test("clicking the Map tab opens it and Esc returns to Sessions", async () => {
@@ -2728,48 +2752,55 @@ test("clicking the Map tab opens it and Esc returns to Sessions", async () => {
   await mapFleet(env);
   const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
   await ui.click(ui.rows()[0].indexOf("Map") + 1, 0);
-  await ui.until(() => hasRow(ui, "NETWATCH") && hasRow(ui, "wrk-alpha"), "map opened by mouse");
+  await ui.until(() => mapShown(ui) && hasRow(ui, "wrk-alpha"), "map opened by mouse");
   await ui.press("ESCAPE");
-  assert.ok(!hasRow(ui, "NETWATCH"), "Esc keeps its console meaning: back to Sessions");
+  assert.ok(!mapShown(ui), "Esc returns to Sessions");
 });
 
-test("Tab selects bugs on the map instead of moving console focus, and f filters by harness", async () => {
+test("Tab cycles all city targets without changing host focus; F follow differs from f filter", async () => {
   env = await startEnv();
-  await mapFleet(env);
+  const { boss, alpha } = await mapFleet(env);
   const ui = await openMap();
-  await ui.until(() => hasRow(ui, "wrk-alpha"), "initial world");
-  const names = ["boss-queen", "wrk-alpha"];
-  const selected = (): string[] => names.filter((n) => mapTarget(ui).includes(n));
-  assert.deepEqual(selected(), [], "nothing is selected initially");
+  const scopes = new Set<string>();
+  for (let i = 0; i < 8; i++) {
+    await ui.press("TAB");
+    scopes.add(JSON.stringify(mapOf(ui).conversation()));
+  }
+  for (const scope of [{ scope: "channel", channel: "ops" }, { scope: "session", sessionId: boss.session.id }, { scope: "session", sessionId: alpha.session.id }]) {
+    assert.ok(scopes.has(JSON.stringify(scope)), JSON.stringify(scope));
+  }
+  const first = mapOf(ui).selected;
   await ui.press("TAB");
-  assert.equal(selected().length, 1, `Tab selects one bug: ${mapTarget(ui)}`);
-  const first = mapTarget(ui);
-  await ui.press("TAB");
-  assert.notEqual(mapTarget(ui), first, "a second Tab selects another bug");
+  assert.notDeepEqual(mapOf(ui).selected, first);
   await ui.press("SHIFT_TAB");
-  assert.equal(mapTarget(ui), first, "Shift-Tab goes back");
-  assert.ok(ui.rows().at(-1)!.includes("select"), "console focus did not move to another region");
-  await ui.press("f"); // claude: the orchestrator remains, the omp worker is hidden
-  // the selected orchestrator's TARGET panel still lists its drone, so look for the worker's own plate only
-  assert.ok(hasRow(ui, "boss-queen") && !ui.rows().some((row) => row.includes("wrk-alpha") && !row.includes("DRONES")), ui.rows().join("\n"));
-  await ui.press("f"); // omp: the worker and the orchestrator leading it
-  assert.ok(hasRow(ui, "wrk-alpha") && hasRow(ui, "boss-queen"));
-  assert.ok(hasRow(ui, "NETWATCH"), "f never reached the console's activity filter");
+  assert.deepEqual(mapOf(ui).selected, first);
+  await searchMap(ui, "boss-queen");
+  await ui.press("F");
+  assert.ok(!mapOf(ui).flags.includes("FILTER"));
+  await ui.press("f");
+  assert.ok(mapOf(ui).flags.includes("FILTER:claude"));
+  assert.ok(mapShown(ui));
 });
 
-test("a mouse press on a bug selects it, offset by the tab bar row", async () => {
+test("mouse selection translates the tab-bar offset and supports pan gestures", async () => {
   env = await startEnv();
-  await mapFleet(env);
+  const { alpha } = await mapFleet(env);
   const ui = await openMap();
-  await ui.until(() => hasRow(ui, "wrk-alpha"), "initial world");
+  await searchMap(ui, "wrk-alpha");
   const row = ui.rows().findIndex((r) => r.includes("wrk-alpha"));
-  assert.ok(row > 0, "the bug is drawn below the tab bar");
+  assert.ok(row > 0);
   await ui.click(ui.rows()[row].indexOf("wrk-alpha") + 2, row);
-  assert.ok(mapTarget(ui).includes("wrk-alpha"), `TARGET shows the clicked bug: ${mapTarget(ui)}`);
-  assert.ok(!mapTarget(ui).includes("boss-queen"));
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
+  const before = ui.rows();
+  await ui.mouse("wheel-down", 4, 5);
+  assert.notDeepEqual(ui.rows(), before, "wheel pans city, not a host transcript");
+  await ui.mouse("press", 4, 5);
+  await ui.mouse("drag", 12, 9);
+  await ui.mouse("release", 12, 9);
+  assertWithin(ui);
 });
 
-test("messages produce NETWATCH feed rows, including ones sent before the tab was opened", async () => {
+test("observed feed includes messages received before opening the Map and fresh channel posts", async () => {
   env = await startEnv();
   const { boss, alpha } = await mapFleet(env);
   const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
@@ -2824,20 +2855,24 @@ test("the animation timer and list polling run only while the Map tab is shown",
   assert.equal(timer.state.running, 0, "quitting cancels the timer");
 });
 
-test("the Map tab marks nothing read and opens no composer or conversation", async () => {
+test("selection and focused inspection do not read; explicit Enter opens the existing identity conversation", async () => {
   env = await startEnv();
   const { alpha } = await mapFleet(env);
+  const ui = await openMap();
   await alpha.client.request("send", { to: "human", text: "please read me" });
-  const human = env.human();
-  const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
-  await ui.press("m");
-  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
-  for (const key of ["TAB", "ENTER", "TAB", "ENTER", "r", "DOWN", "RIGHT", "u"]) await ui.press(key);
-  assert.equal((await human.readState({ scope: "session", sessionId: alpha.session.id })).unread, 1, "unread marker untouched");
-  assert.ok(!hasRow(ui, "Enter send") && !hasRow(ui, "please read me"), ui.rows().join("\n"));
-  await alpha.client.request("send", { to: "human", text: "second note" });
-  await ui.until(() => ui.app.idle().then(() => true), "event applied");
-  assert.equal((await human.readState({ scope: "session", sessionId: alpha.session.id })).unread, 2, "new arrivals stay unread");
+  await ui.until(() => hasRow(ui, "please read me"), "map observed incoming message");
+  await searchMap(ui, "wrk-alpha");
+  await ui.press("I");
+  assert.ok(hasRow(ui, "wrk-alpha"));
+  assert.equal(await unread(env.human(), alpha.session.id), 1, "search acceptance and inspector leave unread untouched");
+  const focused = ui.rows();
+  await ui.press("ESCAPE");
+  assert.ok(activeMap(ui), "local inspector Escape does not leave Map");
+  assert.notDeepEqual(ui.rows(), focused, "Escape returns from focused inspection to the city");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
+  await ui.press("ENTER");
+  await ui.until(() => hasRow(ui, "please read me") && !mapShown(ui), "existing transcript opened");
+  assert.equal(await unread(env.human(), alpha.session.id), 0, "normal visible transcript read rules apply after opening");
 });
 
 test("the palette lists Map under Navigate with its shortcut and opens it", async () => {
@@ -2849,14 +2884,14 @@ test("the palette lists Map under Navigate with its shortcut and opens it", asyn
   assert.ok(row, ui.rows().join("\n"));
   await ui.type("Map");
   await ui.press("ENTER");
-  await ui.until(() => hasRow(ui, "NETWATCH"), "palette action opened the map");
+  await ui.until(() => mapShown(ui), "palette action opened the map");
   await ui.press("?");
   assert.ok(hasRow(ui, "type to filter"), "console keys still work on the Map tab");
-  assert.ok(!hasRow(ui, "NETWATCH"), "overlays replace the map");
+  assert.ok(!mapShown(ui), "overlays replace the map");
   await ui.press("f");
   assert.ok(ui.rows().some((row) => row.startsWith("? f")), "keys go to the palette filter while it is open");
   await ui.press("ESCAPE");
-  assert.ok(hasRow(ui, "NETWATCH"), "closing the palette returns to the map");
+  assert.ok(mapShown(ui), "closing the palette returns to the map");
 });
 
 test("an unreachable daemon shows SIGNAL LOST on the map and it recovers when the daemon returns", async () => {
@@ -2869,12 +2904,12 @@ test("an unreachable daemon shows SIGNAL LOST on the map and it recovers when th
   await env.daemon.close();
   timer.tick(20);
   await ui.until(() => hasRow(ui, "SIGNAL LOST"), "SIGNAL LOST after the daemon goes away");
-  assert.ok(hasRow(ui, "netrunner"), "the netrunner survives a lost signal");
+  assert.ok(hasRow(ui, "wrk-alpha"), "last successful occupants survive a lost signal");
   await env.restart();
   await ui.until(async () => {
     timer.tick(20);
     await ui.app.idle();
-    return hasRow(ui, "LINK ESTABLISHED") && !hasRow(ui, "SIGNAL LOST");
+    return hasRow(ui, "wrk-alpha") && !hasRow(ui, "SIGNAL LOST");
   }, "recovery on a later poll");
 });
 
@@ -2890,16 +2925,15 @@ test("the Map tab survives tiny terminals without throwing", async () => {
     await ui.click(0, Math.min(rows - 1, 2));
   }
   await ui.resize(160, 48);
-  await ui.until(() => hasRow(ui, "NETWATCH"), "recovers at full size");
+  await ui.until(() => mapShown(ui), "recovers at full size");
 });
 
 test("only traffic seen while the Map is on screen spawns packets; earlier traffic fills the feed without replaying", async () => {
   env = await startEnv();
   const { boss, alpha } = await mapFleet(env);
   const ui = await startConsole(160, 48, undefined, { scan: async () => [] });
-  // Packets are a few animated glyphs on a link, which a text frame cannot tell apart from the link art reliably,
-  // so the in-flight count (and the console's received events) are read from the controller instead.
-  const inner = ui.app as unknown as { map: { packetCount: number }; activity: PositionedEvent[] };
+  // Controller counts distinguish live motion from static route/sprite art.
+  const inner = ui.app as unknown as { map: VizMap; activity: PositionedEvent[] };
   const received = (text: string): boolean => inner.activity.some((item) => item.event.type === "message" && item.event.msg.text === text);
   await boss.client.request("send", { to: "wrk-alpha", text: "unseen traffic", kind: "task" });
   await alpha.nextDelivery();
@@ -2907,11 +2941,14 @@ test("only traffic seen while the Map is on screen spawns packets; earlier traff
   await ui.press("m");
   await ui.until(() => hasRow(ui, "unseen traffic") && hasRow(ui, "wrk-alpha"), "feed row and sessions on opening");
   assert.equal(inner.map.packetCount, 0, "no packet for a message that arrived while another tab was shown");
+  assert.equal(inner.map.animationCount, 0);
   await boss.client.request("send", { to: "wrk-alpha", text: "live traffic", kind: "task" });
   await ui.until(() => hasRow(ui, "live traffic"), "live feed row");
   assert.equal(inner.map.packetCount, 1, "a message seen while the map is shown spawns one packet");
+  assert.equal(inner.map.animationCount, 1);
   await ui.press("s");
   assert.equal(inner.map.packetCount, 0, "leaving the tab drops in-flight packets");
+  assert.equal(inner.map.animationCount, 0);
   await ui.press("m");
   assert.equal(inner.map.packetCount, 0, "re-entering does not replay old packets");
   assert.ok(hasRow(ui, "live traffic") && hasRow(ui, "unseen traffic"), "the feed keeps both lines");
@@ -2938,13 +2975,13 @@ test("an overlay over the Map stops its timer and polling, and closing it resume
   for (const [open, close] of [["?", "ESCAPE"], ["CTRL_K", "ESCAPE"], ["CTRL_E", "ESCAPE"]]) {
     const [list, scan, cancelled] = [lists, scans, timer.state.cancelled];
     await ui.press(open);
-    assert.ok(!hasRow(ui, "NETWATCH"), `${open} covers the map`);
+    assert.ok(!mapShown(ui), `${open} covers the map`);
     assert.deepEqual([timer.state.running, timer.state.cancelled], [0, cancelled + 1], `${open} stops the animation timer`);
     timer.tick(100); // a stale tick (and a 2s/5s poll worth of them) must stay inert under the overlay
     await ui.app.idle();
     assert.deepEqual([lists, scans], [list, scan], `no polling under ${open}`);
     await ui.press(close);
-    await ui.until(() => hasRow(ui, "NETWATCH") && lists === list + 1 && scans === scan + 1, `${open} closed: map resumes with a refresh`);
+    await ui.until(() => mapShown(ui) && lists === list + 1 && scans === scan + 1, `${open} closed: map resumes with a refresh`);
     assert.equal(timer.state.running, 1, "one timer again");
   }
 });
@@ -2995,7 +3032,7 @@ test("a list that fails after leaving the Map is discarded rather than painting 
   };
   const ui = await startConsole(160, 48, gated, { scan: async () => [], schedule: timer.schedule });
   await ui.press("m");
-  await ui.until(() => hasRow(ui, "wrk-alpha") && hasRow(ui, "LINK ESTABLISHED"), "map loaded");
+  await ui.until(() => hasRow(ui, "wrk-alpha") && !hasRow(ui, "SIGNAL LOST"), "map loaded");
   const first = Promise.withResolvers<void>();
   first.promise.catch(() => {});
   gate.hold = first;
@@ -3011,7 +3048,7 @@ test("a list that fails after leaving the Map is discarded rather than painting 
   assert.ok(hasRow(ui, "wrk-alpha") && !hasRow(ui, "SIGNAL LOST"), `stale failure discarded:\n${ui.rows().join("\n")}`);
   second.resolve();
   await ui.app.idle();
-  assert.ok(hasRow(ui, "LINK ESTABLISHED"));
+  assert.ok(!hasRow(ui, "SIGNAL LOST"));
 });
 
 test("a reconnect while the Map shows SIGNAL LOST refreshes it without waiting for the next poll", async () => {
@@ -3039,59 +3076,373 @@ test("a reconnect while the Map shows SIGNAL LOST refreshes it without waiting f
   await ui.until(() => reconnect !== undefined, "console client noticed the lost connection");
   outage = false;
   reconnect!(); // no timer tick: only hydrate-on-reconnect can refresh the map
-  await ui.until(() => !hasRow(ui, "SIGNAL LOST") && hasRow(ui, "LINK ESTABLISHED"), "map refreshed by the reconnect");
+  await ui.until(() => !hasRow(ui, "SIGNAL LOST") && hasRow(ui, "wrk-alpha"), "map refreshed by reconnect");
 });
 
-test("the Map frames at exactly the body height: 60x20 is too small, 60x21 shows the scene", async () => {
+test("compact city inspection reaches every identity below the former scene minimum", async () => {
   env = await startEnv();
-  await mapFleet(env);
+  const { boss, alpha } = await mapFleet(env);
   const ui = await openMap(60, 20);
-  await ui.until(() => hasRow(ui, "TOO SMALL"), "notice at 60x20");
-  assert.ok(hasRow(ui, "need 60x19") && hasRow(ui, "have 60x18"), `the notice names the map region:\n${ui.rows().join("\n")}`);
-  assertWithin(ui);
-  await ui.resize(60, 21);
-  await ui.until(() => hasRow(ui, "NETWATCH") && hasRow(ui, "wrk-alpha") && hasRow(ui, "boss-queen"), "scene at 60x21");
-  assert.equal(ui.rows().length, 21, "tab bar + 19-row scene + footer");
-  assert.ok(!hasRow(ui, "TOO SMALL"));
-  assertWithin(ui);
-});
-
-test("clicking bugs selects them at small map heights, below the tab bar", async () => {
-  env = await startEnv();
-  await mapFleet(env);
-  const ui = await openMap(100, 40);
-  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
-  for (const [columns, rows] of [[60, 21], [80, 24], [100, 30]]) {
+  for (const [columns, rows] of [[60, 20], [40, 16], [60, 21]]) {
     await ui.resize(columns, rows);
-    for (const name of ["boss-queen", "wrk-alpha", "boss-queen"]) {
-      const row = ui.rows().findIndex((r) => r.includes(name)); // the plate sits above the HUD, which repeats the name
-      assert.ok(row > 0, `${name} drawn at ${columns}x${rows}`);
-      await ui.click(ui.rows()[row].indexOf(name) + 1, row);
-      assert.ok(mapTarget(ui).includes(name), `TARGET names ${name} at ${columns}x${rows}: ${mapTarget(ui)}`);
+    for (const session of [boss.session, alpha.session]) {
+      await searchMap(ui, session.name);
+      assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: session.id });
+      assert.ok(hasRow(ui, session.name));
     }
+    assert.equal(ui.rows().length, rows);
+    assertWithin(ui);
   }
 });
 
-test("the console footer carries the Map's filter, focus and feral flags", async () => {
+test("city name labels remain selectable below the tab bar at compact heights", async () => {
+  env = await startEnv();
+  const { boss, alpha } = await mapFleet(env);
+  const ui = await openMap(100, 40);
+  for (const [columns, rows] of [[60, 21], [80, 24], [100, 30]]) {
+    await ui.resize(columns, rows);
+    for (const session of [boss.session, alpha.session]) {
+      await searchMap(ui, session.name);
+      const row = ui.rows().findIndex((r) => r.includes(session.name));
+      assert.ok(row > 0);
+      await ui.click(ui.rows()[row].indexOf(session.name) + 1, row);
+      assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: session.id });
+    }
+    assertWithin(ui);
+  }
+});
+
+test("Map filter and process visibility change navigation candidates and survive focused inspection", async () => {
+  env = await startEnv();
+  const { boss, alpha } = await mapFleet(env);
+  const ui = await openMap(160, 48, { scan: async () => [{ pid: 4242, harness: "codex", command: "codex", elapsedSec: 7, cpu: 12 }] });
+  const footer = (): string => ui.rows().at(-1)!;
+  await searchMap(ui, "codex-4242");
+  assert.deepEqual(mapOf(ui).selected, { kind: "character", id: "proc:4242" });
+  const showingProcesses = footer();
+  await ui.press("u");
+  assert.notEqual(footer(), showingProcesses, "footer reflects changed process visibility");
+  const candidates = new Set<string>();
+  for (let i = 0; i < 12; i++) {
+    await ui.press("TAB");
+    candidates.add(JSON.stringify(mapOf(ui).selected));
+  }
+  assert.ok(!candidates.has(JSON.stringify({ kind: "character", id: "proc:4242" })), "hidden process is not navigable");
+  await ui.press("u");
+  await searchMap(ui, "codex-4242");
+  assert.deepEqual(mapOf(ui).selected, { kind: "character", id: "proc:4242" });
+  const unfiltered = footer();
+  await ui.press("f");
+  assert.notEqual(footer(), unfiltered, "footer reflects changed harness filtering");
+  candidates.clear();
+  for (let i = 0; i < 12; i++) {
+    await ui.press("TAB");
+    candidates.add(JSON.stringify(mapOf(ui).conversation()));
+  }
+  assert.ok(candidates.has(JSON.stringify({ scope: "session", sessionId: boss.session.id })));
+  assert.ok(!candidates.has(JSON.stringify({ scope: "session", sessionId: alpha.session.id })), "nonmatching identity is not a navigation candidate");
+  await searchMap(ui, "boss-queen");
+  await ui.press("SPACE");
+  const focusedFooter = footer();
+  await ui.press("I");
+  assert.equal(footer(), focusedFooter, "focused inspector retains current map modes");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: boss.session.id });
+  await ui.press("s");
+  assert.ok(!activeMap(ui));
+});
+
+test("embedded snapshots publish list and channels together and retain the previous city on partial failure", async () => {
+  env = await startEnv();
+  await mapFleet(env);
+  let failChannels = false;
+  const partial = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      if (op === "channel_list" && failChannels) throw new Error("channel list failed");
+      return request(op, params);
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, partial, { scan: async () => [] });
+  await ui.press("m");
+  await searchMap(ui, "wrk-alpha");
+  const selected = mapOf(ui).selected;
+  failChannels = true;
+  const late = await env.adapter("omp", "partial-city-late", "partial-late");
+  await ui.until(() => hasRow(ui, "SIGNAL LOST"), "partial bundle failure");
+  assert.deepEqual(mapOf(ui).selected, selected);
+  assert.ok(hasRow(ui, "wrk-alpha"), "last complete occupants remain");
+  await searchMap(ui, "partial-late");
+  assert.deepEqual(mapOf(ui).selected, selected, "unpublished list cannot leak new occupants through search");
+  failChannels = false;
+  await ui.press("r");
+  await searchMap(ui, "partial-late");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: late.session.id });
+  assert.ok(!hasRow(ui, "SIGNAL LOST"));
+});
+
+test("embedded fallback rosters hydrate archived identities so Enter opens their actual history", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  await alpha.client.request("send", { to: "human", text: "unresolved-roster-history" });
+  await alpha.client.request("unregister");
+  const legacy = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const sync = client.sync.bind(client);
+    client.sync = async () => {
+      const snapshot = await sync();
+      return { ...snapshot, sessions: snapshot.sessions.filter((identity) => identity.id !== alpha.session.id) };
+    };
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (op === "channel_list") {
+        const channels = reply.channels as { name: string; memberIds?: string[] }[];
+        reply.channels = channels.map(({ memberIds: _ids, ...channel }) => channel);
+      }
+      return reply;
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, legacy, { scan: async () => [] });
+  await ui.press("m");
+  await searchMap(ui, "wrk-alpha");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
+  await ui.press("ENTER");
+  await ui.until(() => hasRow(ui, "unresolved-roster-history") && !mapShown(ui), "resolved archive transcript opened");
+  assert.equal(await unread(env.human(), alpha.session.id), 0);
+});
+
+test("empty venue Enter opens its real channel, without turning map selection into reading", async () => {
+  env = await startEnv();
+  await env.human().request("channel_create", { channel: "empty-city" });
+  const ui = await openMap();
+  await searchMap(ui, "empty-city");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "channel", channel: "empty-city" });
+  assert.ok(hasRow(ui, "empty-city") && mapShown(ui));
+  await ui.press("ENTER");
+  assert.ok(!mapShown(ui) && hasRow(ui, "#empty-city"));
+  assertWithin(ui);
+});
+
+test("secondary membership Enter opens archived identity, not its venue, and then applies transcript read rules", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  await env.human().request("channel_create", { channel: "secondary" });
+  await env.human().request("channel_add", { channel: "secondary", name: "wrk-alpha" });
+  const ui = await openMap();
+  await alpha.client.request("send", { to: "human", text: "archived-city-incoming" });
+  await alpha.client.request("unregister");
+  await ui.until(async () => (await env!.human().sync()).sessions.some((s) => s.id === alpha.session.id && s.state === "removed"), "identity archived");
+  await ui.press("r");
+  for (let i = 0; i < 12; i++) {
+    await ui.press("TAB");
+    const target = mapOf(ui).selected;
+    if (target?.kind === "membership" && target.id === alpha.session.id) break;
+  }
+  const target = mapOf(ui).selected;
+  assert.ok(target?.kind === "membership" && target.id === alpha.session.id, "secondary marker is reachable");
+  assert.equal(await unread(env.human(), alpha.session.id), 1);
+  const row = ui.rows().findIndex((line) => line.includes("@"));
+  assert.ok(row > 0, "secondary membership has a visible marker anchor");
+  await ui.click(ui.rows()[row].indexOf("@"), row);
+  assert.deepEqual(mapOf(ui).selected, target, "the marker glyph selects the local membership, not its canonical character");
+  assert.equal(await unread(env.human(), alpha.session.id), 1, "marker inspection does not read");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
+  await ui.press("ENTER");
+  await ui.until(() => hasRow(ui, "archived-city-incoming") && !mapShown(ui), "archived session transcript opened");
+  assert.equal(await unread(env.human(), alpha.session.id), 0);
+  assertWithin(ui);
+});
+
+test("map search keeps shortcut text local; Ctrl+K, uppercase inspector and lowercase Inbox keep host precedence", async () => {
+  env = await startEnv();
+  await env.adapter("omp", "city-query", "qimasc");
+  const ui = await openMap();
+  await searchMap(ui, "qimasc");
+  assert.ok(mapShown(ui), "q/i/m/a/s/c typed in search do not run host shortcuts");
+  await ui.press("I");
+  assert.ok(hasRow(ui, "qimasc"));
+  await ui.press("ESCAPE");
+  assert.ok(mapShown(ui), "Escape exits only local inspector");
+  await ui.press("/");
+  await ui.type("q");
+  await ui.press("CTRL_K");
+  assert.ok(hasRow(ui, "Enter open") && !mapShown(ui), "global finder wins over local search");
+  await ui.press("ESCAPE");
+  await ui.press("ESCAPE");
+  await ui.press("i");
+  assert.ok(!mapShown(ui) && ui.rows()[0].includes("Inbox"));
+});
+
+test("process Enter remains in Map inspector and never opens a session or channel", async () => {
+  env = await startEnv();
+  const ui = await openMap(160, 48, { scan: async () => [{ pid: 4242, harness: "codex", command: "codex", elapsedSec: 7, cpu: 12 }] });
+  await searchMap(ui, "codex-4242");
+  assert.equal(mapOf(ui).conversation(), undefined);
+  await ui.press("ENTER");
+  assert.ok(hasRow(ui, "4242") && hasRow(ui, "inferred"));
+  assert.ok(ui.rows()[0].includes("Map"));
+  assertWithin(ui);
+});
+
+test("channel rename received while hidden keeps the selected venue identity and frontage", async () => {
   env = await startEnv();
   await mapFleet(env);
   const ui = await openMap();
-  await ui.until(() => hasRow(ui, "wrk-alpha"), "map loaded");
-  const footer = (): string => ui.rows().at(-1)!;
-  assert.ok(!/FILTER|FOCUS|FERAL OFF/.test(footer()), footer());
-  await ui.press("f");
-  assert.ok(footer().includes("FILTER:claude") && footer().includes("rescan"), footer());
-  await ui.press("u");
-  assert.ok(footer().includes("FERAL OFF"), footer());
-  await ui.press("TAB");
-  await ui.press("ENTER");
-  assert.ok(footer().includes("FOCUS"), footer());
-  await ui.press("c");
-  await ui.press("ENTER");
-  await ui.press("ESCAPE");
-  assert.ok(footer().includes("Message text is empty") && footer().includes("FOCUS") && footer().includes("FERAL OFF"), `flags survive an error notice: ${footer()}`);
+  await searchMap(ui, "ops");
+  const selected = mapOf(ui).selected;
   await ui.press("s");
-  assert.ok(!/FILTER|FOCUS|FERAL OFF/.test(footer()), "other tabs show no map flags");
+  await env.human().request("channel_rename", { channel: "ops", name: "renamed-city" });
+  await ui.until(() => {
+    const scope = mapOf(ui).conversation();
+    return scope?.scope === "channel" && scope.channel === "renamed-city";
+  }, "hidden authoritative rename applied");
+  await ui.press("m");
+  assert.deepEqual(mapOf(ui).selected, selected);
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "channel", channel: "renamed-city" });
+  assert.equal(mapOf(ui).packetCount, 0);
+  assert.equal(mapOf(ui).animationCount, 0);
+});
+
+test("recovery replay forwards channel renames but cannot animate missed traffic even when Map stays shown", async () => {
+  env = await startEnv();
+  const { boss } = await mapFleet(env);
+  let recover: ClientOpts["onReconnect"];
+  let hold = false;
+  const recoveringClient = (options: ClientOpts): AsenqClient => {
+    recover = options.onReconnect;
+    const client = new AsenqClient({ ...options, autoStart: false, onPush: (p) => { if (!hold) options.onPush?.(p); } });
+    const replay = client.replay.bind(client);
+    client.replay = async (position) => replay(position, 1);
+    return client;
+  };
+  const ui = await startConsole(160, 48, recoveringClient, { scan: async () => [] });
+  await ui.press("m");
+  await searchMap(ui, "ops");
+  const selected = mapOf(ui).selected;
+  hold = true;
+  await env.human().request("channel_rename", { channel: "ops", name: "recovered-city" });
+  await boss.client.request("send", { to: "wrk-alpha", text: "recovered-old-traffic" });
+  await recover?.();
+  await ui.app.idle();
+  assert.deepEqual(mapOf(ui).selected, selected);
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "channel", channel: "recovered-city" });
+  assert.ok(hasRow(ui, "recovered-old-traffic"));
+  assert.equal(mapOf(ui).packetCount, 0);
+  assert.equal(mapOf(ui).animationCount, 0);
+  hold = false;
+  await boss.client.request("send", { to: "wrk-alpha", text: "fresh-after-replay" });
+  await ui.until(() => hasRow(ui, "fresh-after-replay"), "fresh push replayed");
+  assert.equal(mapOf(ui).packetCount, 1, "fresh pushed positions may animate through the normal replay path");
+  assert.equal(mapOf(ui).animationCount, 1);
+});
+
+test("embedded viz settings and forced reduced motion are shown; polling does not restart motion", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  await alpha.client.request("session_status", { busy: true });
+  const ui = await startConsole(160, 48, undefined, {
+    scan: async () => [], reducedMotion: true,
+    settings: () => ({ settings: { reducedMotion: false, sessions: { [alpha.session.id]: "qwen" }, harnesses: {} }, warning: "viz.json: appearance.harnesses.bad: invalid harness" }),
+    now: () => env!.clock.now(),
+  });
+  await ui.press("m");
+  await searchMap(ui, "wrk-alpha");
+  await ui.press("I");
+  assert.ok(hasRow(ui, "qwen") && hasRow(ui, "REDUCED MOTION") && hasRow(ui, "viz.json:"));
+  assert.equal(mapOf(ui).animationCount, 0);
+  assertWithin(ui);
+});
+
+test("a slow first Map bundle publishes even when a refresh is coalesced and its retry fails", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  const captured = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let lists = 0;
+  const gated = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (op === "list") {
+        lists++;
+        if (lists === 1) { captured.resolve(); await release.promise; }
+        else throw new Error("coalesced retry failed");
+      }
+      return reply;
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, gated, { scan: async () => [] });
+  const opening = ui.press("m");
+  await captured.promise;
+  const refreshing = ui.press("r");
+  release.resolve();
+  await Promise.all([opening, refreshing]);
+  assert.equal(lists, 2, "refresh requests coalesce into one follow-up");
+  assert.ok(hasRow(ui, "SIGNAL LOST"), "retry failure honestly marks the retained city stale");
+  await searchMap(ui, "wrk-alpha");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id }, "first successful bundle was published and retained");
+  await searchMap(ui, "ops");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "channel", channel: "ops" });
+});
+
+test("embedded in-flight rename and session events rebase the city before publication, despite a failed follow-up", async () => {
+  env = await startEnv();
+  const { alpha } = await mapFleet(env);
+  const capturedList = Promise.withResolvers<void>();
+  const capturedChannels = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let hold = false;
+  let held = false;
+  const gated = (options: ClientOpts): AsenqClient => {
+    const client = new AsenqClient({ ...options, autoStart: false });
+    const request = client.request.bind(client);
+    client.request = async (op, params) => {
+      const reply = await request(op, params);
+      if (hold && op === "channel_list") capturedChannels.resolve();
+      if (hold && op === "list") {
+        if (held) throw new Error("event follow-up failed");
+        held = true;
+        capturedList.resolve();
+        await release.promise;
+      }
+      return reply;
+    };
+    return client;
+  };
+  const ui = await startConsole(160, 48, gated, { scan: async () => [] });
+  await ui.press("m");
+  await searchMap(ui, "ops");
+  const selected = mapOf(ui).selected;
+  hold = true;
+  const refreshing = ui.press("r");
+  await Promise.all([capturedList.promise, capturedChannels.promise]);
+  await env.human().request("channel_rename", { channel: "ops", name: "rebase-ops" });
+  await turns(() => {
+    const scope = mapOf(ui).conversation();
+    return scope?.scope === "channel" && scope.channel === "rebase-ops";
+  }, "rename applied before the old bundle settles");
+  await env.human().request("rename", { from: "wrk-alpha", name: "rebase-alpha" });
+  const observing = ui.app as unknown as { activity: PositionedEvent[] };
+  await turns(() => observing.activity.some((item) => item.event.type === "session" && item.event.session.name === "rebase-alpha"), "newer session event applied during the held fetch");
+  release.resolve();
+  await refreshing;
+  assert.deepEqual(mapOf(ui).selected, selected, "late bundle preserves the already-renamed immutable venue key");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "channel", channel: "rebase-ops" });
+  const venues = new Set<string>();
+  for (let i = 0; i < 12; i++) {
+    await ui.press("TAB");
+    const scope = mapOf(ui).conversation();
+    if (scope?.scope === "channel") venues.add(scope.channel);
+  }
+  assert.ok(venues.has("rebase-ops") && !venues.has("ops"), "old channel summary cannot resurrect its name");
+  await searchMap(ui, "rebase-alpha");
+  assert.deepEqual(mapOf(ui).conversation(), { scope: "session", sessionId: alpha.session.id });
+  assert.ok(hasRow(ui, "rebase-alpha"), "listed details are rebased over the newer identity event");
 });
 
 test("channel rename updates the channel list and header in the TUI", async () => {

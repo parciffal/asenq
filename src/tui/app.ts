@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { AsenqClient, type ClientOpts } from "../shared/client.js";
+import { AsenqClient } from "../shared/client.js";
+import type { ClientOpts } from "../shared/client.js";
 import { KINDS, MENTION_KEYWORDS, hasMentionOpening } from "../shared/protocol.js";
 import { isStaleSession } from "../shared/sessions.js";
 import type {
@@ -10,12 +11,13 @@ import { renderMessageBody } from "../shared/render.js";
 import {
   activitySpans, clipSpans, editorLayout, ellipsize, formatTime, harnessShortName, isImportantEvent, justify, layoutTranscript,
   maxTop, padSpans, paneWidths, stepGrapheme, theme, viewportAt, viewportTop,
-  type ActivityFilter, type TranscriptLayout, type Viewport,
 } from "./layout.js";
+import type { ActivityFilter, TranscriptLayout, Viewport } from "./layout.js";
 import {
   sanitizeTerminalText, TerminalAdapter, TerminalUnavailableError, terminalTextWidth, wrapTerminalText,
-  type KeyInput, type MouseInput, type TerminalAdapterOptions, type TerminalCursor, type TerminalFrame,
-  type TerminalLine, type TerminalSize, type TerminalSpan,
+} from "./terminal.js";
+import type {
+  KeyInput, MouseInput, TerminalAdapterOptions, TerminalCursor, TerminalFrame, TerminalLine, TerminalSize, TerminalSpan,
 } from "./terminal.js";
 import { roundedPanel } from "./panel.js";
 import { hintSpans } from "./chrome.js";
@@ -24,6 +26,9 @@ import { REQUEST_TIMEOUT_MS, TICK_MS, VizMap, within } from "../viz/map.js";
 import type { MapDue } from "../viz/map.js";
 import { scanProcesses } from "../viz/scan.js";
 import type { ProcInfo } from "../viz/scan.js";
+import { readVizSettings } from "../viz/settings.js";
+import type { VizSettings } from "../viz/settings.js";
+import { rebaseCitySnapshot } from "../viz/model.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -42,6 +47,8 @@ export type ConsoleDeps = {
   now?(): number;
   /** Repeating timer driving the Map tab's animation while it is shown; returns its canceller. Defaults to setInterval. */
   schedule?(fn: () => void, ms: number): () => void;
+  settings?(): { settings: VizSettings; warning: string | null };
+  reducedMotion?: boolean;
 };
 
 const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"], ["map", "Map"]] as const;
@@ -71,7 +78,7 @@ const SHORTCUTS: Partial<Record<Action, string>> = {
 const HELP = [
   "asenq TUI",
   "",
-  "Tabs: s Sessions · i Inbox · # Channels · a Activity · m Map. Tab / Shift+Tab move focus between tabs, list, conversation and composer (on Map they select bugs instead, unless the tab bar has focus).",
+  "Tabs: s Sessions · i Inbox · # Channels · a Activity · m Map. Tab / Shift+Tab move focus between tabs, list, conversation and composer (on Map they cycle all matching city targets, unless the tab bar has focus).",
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
   "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
   "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
@@ -80,7 +87,8 @@ const HELP = [
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
-  "Map: the live bug-map of sessions (same view as asenq viz). ←↑↓→ / h j k l / Tab select a bug · Enter focus its links · f harness filter · u feral processes · r rescan. It only polls while shown.",
+  "Map: the live city of real channels and session identities (same view as asenq viz). Arrows pan · hjkl spatial select · Tab cycle · +/- zoom · 0 frame selection · / search · Enter open conversation · Space dim others · f harness filter · u detected processes · r refresh · F follow session · T follow observed traffic · I focused inspector · PgUp/PgDn inspect. Empty channels remain venues; memberships are not delivery links. It only polls while shown.",
+  "Map search consumes ordinary shortcuts; Ctrl+K still opens the global finder. Enter in search selects without opening. I is the inspector, i is Inbox; F follows, f filters. --reduced-motion or viz.json disables motion. Costumes are explicit viz.json mappings, not reported model metadata.",
   "? opens this action palette; type to filter. Esc dismisses errors, closes panels and returns to Sessions. q quits.",
   "CLI commands remain available in another terminal.",
 ];
@@ -214,6 +222,9 @@ export class ConsoleApp {
   private syncing = false;
   private replaying = false;
   private resync = false;
+  private recovering = true;
+  /** Only positions pushed freshly while the uncovered map was shown may animate during replay. */
+  private readonly freshMapPositions = new Set<number>();
   private closed = false;
   private tasks = new Set<Promise<unknown>>();
   /** Stream whose `u` reminder must survive until the user scrolls, presses End or reopens it. */
@@ -227,6 +238,8 @@ export class ConsoleApp {
   private mapAgain = false;
   private mapScanning = false;
   private scanAgain = false;
+  /** Events arriving during the active city fetch; cleared after that pass settles. */
+  private mapEvents: PositionedEvent[] | null = null;
   /** Bumped whenever the Map stops being active; fetches started before are discarded when they settle. */
   private mapGen = 0;
   /** Screen row and height of the map region, for translating clicks; height is 0 while it is not drawn. */
@@ -238,11 +251,17 @@ export class ConsoleApp {
     const clientOptions: ClientOpts = {
       autoStart: true,
       onPush: (p) => {
-        if (p.push !== "event") return;
+        if (p.push !== "event" || p.position <= this.watermark) return;
         this.pushedPosition = Math.max(this.pushedPosition, p.position);
+        if (!this.syncing && !this.recovering && this.mapActive() && this.connection === "connected") this.freshMapPositions.add(p.position);
         if (p.position > this.watermark) this.track(this.replay());
       },
-      onReconnect: async () => { await this.hydrate(); },
+      onReconnect: async () => {
+        this.recovering = true;
+        this.freshMapPositions.clear();
+        this.map.setConnection("offline");
+        await this.hydrate();
+      },
     };
     this.client = deps.client ? deps.client(clientOptions) : new AsenqClient(clientOptions);
     const screenOptions: TerminalAdapterOptions = {
@@ -254,7 +273,8 @@ export class ConsoleApp {
     };
     this.screen = deps.screen ? deps.screen(screenOptions) : new TerminalAdapter(screenOptions);
     this.scan = deps.scan ?? (() => scanProcesses());
-    this.map = new VizMap(deps.now, true);
+    const { settings, warning } = (deps.settings ?? readVizSettings)();
+    this.map = new VizMap({ now: deps.now, embedded: true, settings, settingsWarning: warning, reducedMotion: deps.reducedMotion });
     this.schedule = deps.schedule ?? ((fn, ms) => {
       const timer = setInterval(fn, ms);
       return () => clearInterval(timer);
@@ -394,6 +414,11 @@ export class ConsoleApp {
   private async hydrate(): Promise<void> {
     if (this.closed || this.syncing) return;
     this.syncing = true;
+    this.recovering = true;
+    this.freshMapPositions.clear();
+    this.mapGen++;
+    this.map.suspend();
+    this.map.setConnection("offline");
     try {
       const previous = this.watermark;
       const snapshot = await this.client.sync();
@@ -405,21 +430,18 @@ export class ConsoleApp {
       this.activity = events;
       if (previous) this.watermark = previous; // replay missed events before trusting the new watermark
       this.connection = "connected";
-      if (this.mapActive()) {
-        this.map.refresh();
-        this.fetchMap(this.map.take());
-      }
       if (this.notice?.kind === "error" && this.notice.text.startsWith("Disconnected")) this.notice = undefined;
       this.ensureSelection();
       const scope = this.scope();
       if (scope) await this.load(scope);
     } catch (e) {
       this.connection = "offline";
+      this.map.setConnection("offline");
       this.say(`Disconnected: ${stringify(e)} · ? → Doctor / Daemon start / Reconnect`, "error");
     } finally {
       this.syncing = false;
       this.render();
-      if (this.connection === "connected") void this.replay();
+      if (this.connection === "connected") this.track(this.replay());
     }
   }
 
@@ -442,12 +464,16 @@ export class ConsoleApp {
         const r = await this.client.replay(this.watermark);
         if (r.gap) {
           this.say("History gap: retained events were pruned; reloading the snapshot. Older missing changes cannot be recovered.");
+          this.map.setNotice("HISTORY GAP · missing channel renames cannot be recovered");
+          this.freshMapPositions.clear();
           this.resync = true;
           break;
         }
         for (const event of r.events) {
-          this.watermark = Math.max(this.watermark, event.position);
-          this.applyEvent(event);
+          if (event.position <= this.watermark) continue;
+          this.watermark = event.position;
+          const animate = this.freshMapPositions.delete(event.position);
+          this.applyEvent(event, animate);
         }
         if (!r.hasMore) break;
       }
@@ -462,6 +488,7 @@ export class ConsoleApp {
       }
     } catch (e) {
       this.connection = "offline";
+      this.map.setConnection("offline");
       this.say(`Disconnected: ${stringify(e)} · reconnecting`, "error");
     } finally {
       this.replaying = false;
@@ -479,19 +506,33 @@ export class ConsoleApp {
         this.watermark = 0;
         await this.hydrate();
       } else if (this.connection === "connected" && this.pushedPosition > this.watermark) await this.replay();
+      if (this.connection === "connected" && this.recovering && !this.resync && !this.replaying && !this.syncing) {
+        this.recovering = false;
+        this.freshMapPositions.clear();
+        if (this.mapActive()) {
+          this.map.refresh();
+          this.fetchMap(this.map.take());
+        }
+      }
       this.ensureSelection();
       this.render();
     }
   }
 
-  private applyEvent(item: PositionedEvent): void {
+  private applyEvent(item: PositionedEvent, animate = false): void {
     if (!this.activity.length || item.position > this.activity.at(-1)!.position) {
       this.activity.push(item);
       if (this.activity.length > 200) this.activity.shift();
     }
     const e = item.event;
+    if (this.mapEvents) {
+      this.mapEvents.push({
+        position: item.position,
+        event: e.type === "channel" ? { ...e, channel: { ...e.channel } } : e,
+      });
+    }
     if (e.type === "message") {
-      this.map.onMessage(e.msg, this.mapActive());
+      this.map.onMessage(e.msg, animate && this.mapActive());
       if (e.failedCount !== undefined) this.failedCount = e.failedCount;
       if (e.status === "held" || this.heldMessages.has(e.msg.id)) this.heldDirty = true;
       const m: StoredMessage = { ...e.msg, status: e.status, ...(e.reason ? { reason: e.reason } : {}) };
@@ -555,7 +596,19 @@ export class ConsoleApp {
     } else if (e.type === "read") {
       this.readStates.set(keyOf(e.state.scope), e.state);
     } else if (e.type === "channel") {
-      if (e.action === "renamed" && e.oldName) {
+      if (e.action === "deleted") {
+        const key = `c:${e.channel.name}`;
+        this.channels = this.channels.filter((channel) => channel.name !== e.channel.name);
+        this.streams.delete(key);
+        this.readStates.delete(key);
+        this.drafts.delete(`channel:${e.channel.name}`);
+        if (this.readHold === key) this.readHold = undefined;
+        if (this.selectedChannel() === e.channel.name) {
+          this.selection.channels = undefined;
+          if (this.tab === "channels") this.focus = "list";
+        }
+      } else if (e.action === "renamed" && e.oldName) {
+        this.map.renameChannel(e.oldName, e.channel.name);
         const oldKey = `c:${e.oldName}`;
         const newKey = `c:${e.channel.name}`;
         const oldIndex = this.channels.findIndex((c) => c.name === e.oldName);
@@ -583,10 +636,12 @@ export class ConsoleApp {
           }
         }
       }
-      const index = this.channels.findIndex((c) => c.name === e.channel.name);
-      if (index >= 0) this.channels[index] = e.channel;
-      else this.channels.push(e.channel);
-      this.channels.sort((a, b) => b.lastOrder - a.lastOrder || a.name.localeCompare(b.name));
+      if (e.action !== "deleted") {
+        const index = this.channels.findIndex((c) => c.name === e.channel.name);
+        if (index >= 0) this.channels[index] = e.channel;
+        else this.channels.push(e.channel);
+        this.channels.sort((a, b) => b.lastOrder - a.lastOrder || a.name.localeCompare(b.name));
+      }
     } else if (e.type === "session") {
       const index = this.sessions.findIndex((s) => s.id === e.session.id);
       if (e.session.closedAt !== undefined && this.sessions[index]?.closedAt === undefined) this.sessionOrdersDirty = true;
@@ -862,6 +917,10 @@ export class ConsoleApp {
     const e = item.event;
     let sessionId: string | undefined;
     if (e.type === "channel") {
+      if (!this.channels.some((channel) => channel.name === e.channel.name)) {
+        this.say("That channel has been deleted.");
+        return this.render();
+      }
       this.selection.channels = `c:${e.channel.name}`;
       await this.setTab("channels");
       this.focus = "transcript";
@@ -1201,7 +1260,8 @@ export class ConsoleApp {
       this.stopMapTicks?.();
       this.stopMapTicks = undefined;
       this.mapGen++;
-      this.map.clearPackets();
+      this.freshMapPositions.clear();
+      this.map.suspend();
       return;
     }
     this.stopMapTicks = this.schedule(() => this.stepMap(), TICK_MS);
@@ -1220,9 +1280,9 @@ export class ConsoleApp {
     if (due.scan) this.track(this.rescanMap());
   }
 
-  /** Lists sessions for the map; a request during a refresh schedules exactly one more pass. Failure shows SIGNAL LOST until the next poll. */
+  /** Fetch one authoritative bundle; a failed or stale generation never replaces the last city. */
   private async refreshMap(): Promise<void> {
-    if (this.closed || !this.mapActive()) return;
+    if (this.closed || !this.mapActive() || this.recovering) return;
     if (this.mapLoading) {
       this.mapAgain = true;
       return;
@@ -1232,18 +1292,40 @@ export class ConsoleApp {
       do {
         this.mapAgain = false;
         const gen = this.mapGen;
-        let sessions: ListedSession[] = [];
-        let connection: "connected" | "offline" = "offline";
+        const events: PositionedEvent[] = [];
+        this.mapEvents = events;
         try {
-          sessions = (await within(this.client.request("list"), REQUEST_TIMEOUT_MS)).sessions as ListedSession[];
-          connection = "connected";
+          const bundle = await within((async () => {
+            const [list, channelList] = await Promise.all([this.client.request("list"), this.client.request("channel_list")]);
+            const sessions = list.sessions as ListedSession[];
+            const channels = (channelList.channels as ChannelSummary[]).map((channel) => ({ ...channel }));
+            const identities = [...this.sessions];
+            const known = new Set([...sessions, ...identities].map((session) => session.id));
+            await Promise.all(channels.map(async (channel) => {
+              if (channel.memberIds !== undefined && channel.memberIds.every((id) => known.has(id))) return;
+              const reply = await this.client.request("channel_members", { channel: channel.name });
+              const members = reply.members as SessionIdentity[];
+              if (channel.memberIds === undefined) channel.memberIds = members.map((member) => member.id);
+              for (const member of members) if (!identities.some((identity) => identity.id === member.id)) identities.push(member);
+            }));
+            return { sessions, channels, identities };
+          })(), REQUEST_TIMEOUT_MS);
+          if (this.closed) return;
+          if (gen === this.mapGen) {
+            rebaseCitySnapshot(bundle, events);
+            for (const identity of bundle.identities) if (!this.session(identity.id)) this.sessions.push(identity);
+            this.map.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
+            this.map.setConnection("connected");
+            this.render();
+          }
         } catch {
-          // the map shows SIGNAL LOST until a later poll succeeds
-        }
-        if (this.closed) return;
-        if (gen === this.mapGen) {
-          this.map.setSessions(sessions, connection);
-          this.render();
+          if (this.closed) return;
+          if (gen === this.mapGen) {
+            this.map.setConnection("offline");
+            this.render();
+          }
+        } finally {
+          if (this.mapEvents === events) this.mapEvents = null;
         }
       } while (this.mapAgain && this.mapActive());
     } finally {
@@ -1386,7 +1468,9 @@ export class ConsoleApp {
         ? this.session(this.selection.sessions.slice(2))?.state === "removed"
           ? "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? purge"
           : "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? menu"
-      : this.tab === "map" ? "←↑↓→/Tab select · Enter focus · f filter · u feral · r rescan · s sessions · ? menu"
+      : this.tab === "map" ? this.map.searching
+        ? "type to search · ↑↓ choose · Enter select · Esc cancel · Ctrl+K jump"
+        : "arrows pan · hjkl/Tab select · Enter open · +/- zoom · / search · I inspect · f filter · r refresh · ? menu"
       : "↑↓ move · Enter open · Tab focus · Ctrl+K jump · ? menu";
     if (this.shownHeldId && !this.confirmation && !this.finder && !this.palette && !this.form && !this.searching && this.focus !== "composer") {
       hints += " · r release · x drop";
@@ -2106,6 +2190,7 @@ export class ConsoleApp {
 
   private async key(k: KeyInput): Promise<void> {
     if (this.closed) return;
+    if (k.name === "CTRL_C") return this.quit();
     if (this.confirmation) return this.confirmationKey(k);
     if (k.name === "CTRL_K") return this.openFinder();
     if (this.finder) return this.finderKey(k);
@@ -2113,9 +2198,28 @@ export class ConsoleApp {
     if (this.form) return this.formKey(k);
     if (this.searching) return this.searchKey(k);
     if (this.focus === "composer") return this.composerKey(k);
-    if (this.mapActive() && !(this.focus === "tabs" && MAP_TAB_KEYS[k.name]) && this.map.key(k)) {
-      this.fetchMap(this.map.take());
-      return this.render();
+    if (this.mapActive() && (this.map.searching || !(this.focus === "tabs" && MAP_TAB_KEYS[k.name]))) {
+      if (!this.map.searching && (k.name === "ENTER" || k.name === "KP_ENTER")) {
+        const scope = this.map.conversation();
+        if (scope?.scope === "channel") {
+          this.selection.channels = `c:${scope.channel}`;
+          await this.setTab("channels");
+          return this.openEntry();
+        }
+        if (scope?.scope === "session") {
+          const session = this.session(scope.sessionId);
+          if (session?.state === "removed") this.archiveOpen = true;
+          this.query = "";
+          this.selection.sessions = `s:${scope.sessionId}`;
+          await this.setTab("sessions");
+          return this.openEntry();
+        }
+      }
+      const hostShortcut = !k.ctrl && !k.alt && ["s", "i", "#", "a", "m", "c", "q", "?"].includes(k.text ?? k.name);
+      if ((this.map.searching || !hostShortcut) && this.map.key(k)) {
+        this.fetchMap(this.map.take());
+        return this.render();
+      }
     }
     if (this.shownHeldId && (k.text === "r" || k.text === "x")) {
       return this.heldAction(k.text === "r" ? "release" : "drop");
@@ -2312,6 +2416,14 @@ export class ConsoleApp {
       }
       return;
     }
+    if (this.mapActive() && (!hit || m.action === "drag" || m.action === "release")) {
+      const row = m.row - this.mapTop;
+      if ((row >= 0 && row < this.mapHeight) || m.action === "drag" || m.action === "release") {
+        const from = m.from ? { ...m.from, row: m.from.row - this.mapTop } : undefined;
+        if (this.map.mouse({ ...m, row, ...(from ? { from } : {}) })) this.render();
+        return;
+      }
+    }
     if (m.action === "wheel-up" || m.action === "wheel-down") {
       const delta = m.action === "wheel-up" ? -3 : 3;
       if (this.palette) this.palette.selected = Math.max(0, this.palette.selected + Math.sign(delta));
@@ -2322,11 +2434,6 @@ export class ConsoleApp {
         this.scrollTranscript(delta);
       }
       return this.render();
-    }
-    if (m.action === "press" && m.button === "left" && !hit && this.mapActive()) {
-      const row = m.row - this.mapTop;
-      if (row >= 0 && row < this.mapHeight && this.map.click(m.column, row)) this.render();
-      return;
     }
     if (m.action !== "press" || m.button !== "left" || !hit) return;
     const target = hit.target;
@@ -2705,6 +2812,10 @@ export class ConsoleApp {
   }
 }
 
-export async function runTui(): Promise<number> {
-  return new ConsoleApp().run();
+export async function runTui(args: string[]): Promise<number> {
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--reduced-motion")) {
+    process.stderr.write("usage: asenq tui [--reduced-motion]\n");
+    return 1;
+  }
+  return new ConsoleApp({ reducedMotion: args.length === 1 }).run();
 }

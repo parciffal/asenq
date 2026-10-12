@@ -13,4 +13,5 @@ export const dbPath = () => join(asenqHome(), "asenq.db");
 export const lockPath = () => join(asenqHome(), "daemon.lock");
 export const logPath = () => join(asenqHome(), "daemon.log");
 export const configPath = () => join(asenqHome(), "config.json");
+export const vizSettingsPath = () => join(asenqHome(), "viz.json");
 export const replyDir = () => join(asenqHome(), "r");

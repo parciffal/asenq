@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#100609">
+  <title>Asenq // City Map</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/vendor/phaser-3.90.0.min.js" defer></script>
+  <script type="module" src="/app/main.js"></script>
+</head>
+<body>
+  <div id="app">
+    <header id="topbar" class="panel panel-top"></header>
+    <main id="city-area" class="panel panel-city">
+      <div id="city"></div>
+      <div id="search-layer" hidden></div>
+      <button id="drawer-toggle" type="button" aria-label="Toggle sidebar" aria-controls="side-panel" aria-expanded="false" hidden>SIDEBAR [I]</button>
+    </main>
+    <aside id="side-panel" class="panel panel-side"></aside>
+    <section id="feed-panel" class="panel panel-feed"></section>
+    <footer id="footer" class="panel panel-foot"></footer>
+    <div id="toast" role="status" aria-live="polite" hidden></div>
+  </div>
+</body>
+</html>
