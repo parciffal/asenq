@@ -12,6 +12,9 @@ export class CityStore extends EventTarget {
     this.targetsByKey = new Map();
     this.routesByKey = new Map();
     this.connectionState = "connecting";
+    this.conversations = [];
+    this.unreadByKey = new Map();
+    this.held = [];
     this.ui = {
       selected: null,
       filter: null,
@@ -21,11 +24,12 @@ export class CityStore extends EventTarget {
       tab: "map",
       search: "",
       searchOpen: false,
-      transcript: null,
+      chat: null,
+      sidebarTab: "inspect",
       inspectorOpen: false,
       sort: { sessions: ["name", 1], channels: ["name", 1], messages: ["at", -1] },
     };
-    this.transcript = { scope: null, messages: [], hasMore: false, loading: false, error: null };
+    this.chat = { scope: null, messages: [], hasMore: false, loading: false, error: null };
     this.animations = new Map();
   }
 
@@ -49,7 +53,10 @@ export class CityStore extends EventTarget {
       routesByKey: this.routesByKey,
       connectionState: this.connectionState,
       ui: this.ui,
-      transcript: this.transcript,
+      chat: this.chat,
+      conversations: this.conversations,
+      unreadByKey: this.unreadByKey,
+      held: this.held,
       animations: this.animations,
     };
   }
@@ -65,8 +72,9 @@ export class CityStore extends EventTarget {
     this.routesByKey = new Map(Object.entries(wire.layout.routes));
     if (this.ui.selected && !this.targetsByKey.has(targetKey(this.ui.selected))) {
       this.ui.selected = null;
-      this.ui.inspectorOpen = false;
+      if (this.ui.sidebarTab === "inspect") this.ui.inspectorOpen = false;
     }
+    this.updateUnread();
     this.emit();
   }
 
@@ -103,44 +111,54 @@ export class CityStore extends EventTarget {
   closeSearch() { this.ui.searchOpen = false; this.ui.search = ""; this.emit(); }
   setInspectorOpen(open) { this.ui.inspectorOpen = open; this.emit(); }
 
-  openTranscript(scope) {
-    this.ui.transcript = scope;
-    this.transcript = { scope, messages: [], hasMore: false, loading: true, error: null };
+  openChat(scope) {
+    this.ui.chat = scope;
+    this.ui.sidebarTab = "chats";
+    this.ui.inspectorOpen = true;
+    this.chat = { scope, messages: [], hasMore: false, loading: Boolean(scope), error: null };
     this.emit();
   }
 
-  closeTranscript() {
-    this.ui.transcript = null;
-    this.transcript = { scope: null, messages: [], hasMore: false, loading: false, error: null };
+  closeChat() {
+    this.ui.chat = null;
+    this.chat = { scope: null, messages: [], hasMore: false, loading: false, error: null };
     this.emit();
   }
 
-  setTranscriptPage(scope, page, { prepend = false } = {}) {
-    if (!this.ui.transcript || !sameScope(this.ui.transcript, scope)) return;
+  setChatPage(scope, page, { prepend = false } = {}) {
+    if (!this.ui.chat || !sameScope(this.ui.chat, scope)) return;
     const merged = new Map();
-    const all = prepend ? [...page.messages, ...this.transcript.messages] : [...this.transcript.messages, ...page.messages];
-    for (const message of all) merged.set(message.id, message);
-    this.transcript = {
+    for (const message of [...this.chat.messages, ...page.messages]) merged.set(message.id, message);
+    this.chat = {
       scope,
       messages: [...merged.values()].sort((a, b) => a.order - b.order),
-      hasMore: page.hasMore,
+      hasMore: prepend || !this.chat.messages.length ? page.hasMore : this.chat.hasMore,
       loading: false,
       error: null,
     };
     this.emit();
   }
 
-  setTranscriptLoading(loading, error = null) {
-    this.transcript = { ...this.transcript, loading, error };
+  setChatLoading(loading, error = null) {
+    this.chat = { ...this.chat, loading, error };
     this.emit();
   }
 
-  upsertTranscriptMessage(message) {
-    if (!this.ui.transcript) return;
-    const messages = new Map(this.transcript.messages.map((item) => [item.id, item]));
-    messages.set(message.id, message);
-    this.transcript = { ...this.transcript, messages: [...messages.values()].sort((a, b) => a.order - b.order) };
-    this.emit();
+  setConversations(list) { this.conversations = list; this.updateUnread(); this.emit(); }
+  setHeld(list) { this.held = list; this.emit(); }
+  setSidebarTab(tab) { this.ui.sidebarTab = tab; this.ui.inspectorOpen = true; this.emit(); }
+
+  updateUnread() {
+    this.unreadByKey = new Map();
+    let total = 0;
+    for (const item of this.conversations) {
+      total += item.unread;
+      const scope = item.scope;
+      const venue = scope.scope === "channel" ? [...this.venuesByKey.values()].find((v) => v.name === scope.channel) : null;
+      const key = scope.scope === "session" ? `c:${scope.sessionId}` : venue ? `v:${venue.key}` : null;
+      if (key) this.unreadByKey.set(key, item.unread);
+    }
+    if (typeof document !== "undefined") document.title = `${total ? `(${total}) ` : ""}ASENQ // CITY MAP`;
   }
 
   toggleSort(table, field) {

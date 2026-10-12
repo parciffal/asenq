@@ -133,7 +133,7 @@ export function scopeOf(target, state) {
 export function messageTouches(msg, scope) {
   if (!scope) return false;
   if (scope.scope === "channel") return msg.channel === scope.channel;
-  if (scope.scope === "session") return msg.fromSessionId === scope.sessionId || msg.toSessionId === scope.sessionId;
+  if (scope.scope === "session") return !msg.channel && (msg.fromSessionId === scope.sessionId || msg.toSessionId === scope.sessionId);
   return false;
 }
 

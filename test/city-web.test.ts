@@ -4,6 +4,8 @@ import { test } from "node:test";
 // The browser stays uncompiled, so this runtime URL reaches the shipped web/ tree from dist/test.
 const city = await import(new URL("../../web/city/app/logic.js", import.meta.url).href);
 const { CityStore } = await import(new URL("../../web/city/app/store.js", import.meta.url).href);
+// Static imports would resolve from dist/; these URLs intentionally load the uncompiled browser modules.
+const chat = await import(new URL("../../web/city/app/chat.js", import.meta.url).href);
 
 type Character = {
   id: string; name: string; previousNames: string[]; source: "registered" | "process" | "human";
@@ -123,7 +125,7 @@ test("hiding processes clears a selected process and its follow state", () => {
   assert.equal(store.ui.follow, false);
 });
 
-test("transcript scopes use channel names and registered identities only", () => {
+test("chat scopes use channel names and registered identities only", () => {
   const worker = character({ id: "registered" });
   const process = character({ id: "proc:8", source: "process" });
   const state = {
@@ -152,4 +154,51 @@ test("walk paths return to the street spine and sample route segments in cell un
   ]);
   const route = { length: 10, segments: [{ from: { x: 0, y: 0 }, to: { x: 10, y: 0 }, length: 10, start: 0 }] };
   assert.deepEqual(city.sample(route, 4), { x: 4, y: 0 });
+});
+
+test("conversation sorting uses recency then title and filtering includes previews", () => {
+  const entries = [
+    { title: "Beta", lastActivity: 20, preview: { text: "deploy ready" } },
+    { title: "Alpha", lastActivity: 20, preview: null },
+    { title: "Newest", lastActivity: 30, preview: null },
+  ];
+  assert.deepEqual(chat.sortConversations(entries).map((item: { title: string }) => item.title), ["Newest", "Alpha", "Beta"]);
+  assert.deepEqual(chat.filterConversations(entries, "DEPLOY").map((item: { title: string }) => item.title), ["Beta"]);
+  assert.deepEqual(chat.filterConversations(entries, "alpha").map((item: { title: string }) => item.title), ["Alpha"]);
+  assert.equal(entries[0].title, "Beta");
+});
+
+test("reply waiting follows the newest DM involving the selected identity", () => {
+  const outgoing = { toSessionId: "session", from: "human", order: 1 };
+  const incoming = { fromSessionId: "session", to: "human", order: 2 };
+  assert.equal(chat.awaitingReply([], "session"), false);
+  assert.equal(chat.awaitingReply([outgoing], "session"), true);
+  assert.equal(chat.awaitingReply([outgoing, incoming], "session"), false);
+  assert.equal(chat.awaitingReply([incoming, outgoing], "session"), true);
+  assert.equal(chat.awaitingReply([{ ...outgoing, toSessionId: "other" }], "session"), false);
+  assert.equal(chat.awaitingReply([outgoing, { ...incoming, channel: "ops" }], "session"), true);
+});
+
+test("message status marks distinguish every delivery outcome", () => {
+  assert.deepEqual(["queued", "delivered", "replied", "held", "rejected", "failed", "expired", "posted", "dropped"].map(chat.statusMark),
+    ["⌛", "✓", "✓✓", "HELD", "✗", "✗", "✗", "•", "✗"]);
+});
+
+test("mention suggestions match member prefixes and always offer all", () => {
+  const members = [{ name: "ops-11" }, { name: "design" }];
+  assert.deepEqual(chat.mentionSuggestions(members, "@ops"), ["ops-11", "all"]);
+  assert.deepEqual(chat.mentionSuggestions(members, "wor"), ["worker", "all"]);
+  assert.deepEqual(chat.mentionSuggestions(members, "orch"), ["orchestrator", "all"]);
+  assert.deepEqual(chat.mentionSuggestions(members, "missing"), ["all"]);
+});
+
+test("message day groups split at local midnight", () => {
+  const messages = [
+    { id: "late", createdAt: new Date(2026, 9, 11, 23, 59, 59).getTime() },
+    { id: "early", createdAt: new Date(2026, 9, 12, 0, 0, 0).getTime() },
+    { id: "later", createdAt: new Date(2026, 9, 12, 12, 0, 0).getTime() },
+  ];
+  assert.deepEqual(chat.groupByDay(messages).map((group: { messages: { id: string }[] }) => group.messages.map((message) => message.id)),
+    [["late"], ["early", "later"]]);
+  assert.deepEqual(chat.groupByDay([]), []);
 });
