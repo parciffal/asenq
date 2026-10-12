@@ -14,8 +14,9 @@ export function targetKey(target) {
 }
 
 const UNSAFE_LABEL = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+function stripUnsafeText(text) { return String(text ?? "").replace(UNSAFE_LABEL, ""); }
 export function sanitizeLabel(text) {
-  const clean = String(text ?? "").replace(UNSAFE_LABEL, "");
+  const clean = stripUnsafeText(text);
   const points = Array.from(clean);
   return points.length > 16 ? `${points.slice(0, 16).join("")}…` : clean;
 }
@@ -96,7 +97,7 @@ export function cycle(targets, selectedKey, dir) {
 }
 
 export function search(state, query) {
-  const needle = sanitizeLabel(query).toLocaleLowerCase();
+  const needle = stripUnsafeText(query).toLocaleLowerCase();
   if (!needle) return [];
   const characters = characterIndex(state);
   const matches = [];
@@ -111,7 +112,7 @@ export function search(state, query) {
       const character = characters.get(target.id);
       if (character) labels = [character.name, ...(character.previousNames ?? [])];
     }
-    if (labels.some((label) => sanitizeLabel(label).toLocaleLowerCase().includes(needle))) matches.push(target);
+    if (labels.some((label) => stripUnsafeText(label).toLocaleLowerCase().includes(needle))) matches.push(target);
   }
   return matches;
 }

@@ -479,7 +479,7 @@ export class CityScene extends Phaser.Scene {
 
   handlePacket(packet) {
     const state = this.store.snapshot();
-    if (!this.characterReady || !state.wire || state.ui.tab !== "map" || document.visibilityState !== "visible" || state.wire.connection !== "connected") return;
+    if (!this.packetGraphics || !state.wire || state.ui.tab !== "map" || document.visibilityState !== "visible" || state.wire.connection !== "connected") return;
     const now = performance.now();
     const lengthPx = packet.path.length * 8;
     const duration = clamp(lengthPx / 480 * 1000, 800, 3000);
@@ -516,8 +516,10 @@ export class CityScene extends Phaser.Scene {
   updateFollow(delta) {
     const state = this.state;
     if (!state.ui.follow || !state.ui.selected) return;
-    const target = state.targetsByKey.get(targetKey(state.ui.selected));
-    if (!target) return;
+    const selected = state.ui.selected;
+    const followTarget = state.ui.follow === "session" && selected.kind === "membership"
+      ? { kind: "character", id: selected.id } : selected;
+    const target = state.targetsByKey.get(targetKey(followTarget));
     if (state.ui.follow === "traffic") {
       const selected = state.ui.selected;
       let recent = null;
