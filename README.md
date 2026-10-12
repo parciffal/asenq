@@ -259,6 +259,8 @@ asenq doctor
 asenq --version
 ```
 
+The human-only daemon operation `channel_delete {channel}` removes a channel, its posts, memberships, shared read markers and rename records. Mention copies remain ordinary direct messages, including held or queued ones. A tail event reports `channel #name deleted`; members receive no deletion note. Explicit `channel_create` recreates the name empty, and posting to the deleted name still implicitly recreates it with only the new post.
+
 ### `--json` output schemas
 
 `asenq ls --json` emits the full `ListedSession` array: `id`, `name`, `previousNames`, `harness`, `cwd`, `state` (`live`/`gone`/`stale`), `stale`, `ping`, `inbound`, `role`, `channels`, `lastSeen`, `busy`, `harnessSessionId`, `resumeCommand`, `you`. `harnessSessionId` is `null` until the session's hooks report it.
@@ -361,7 +363,7 @@ Select a channel or registered session and press Enter to open its transcript. T
 
 The listener binds only to `127.0.0.1`. Open the full printed URL, including its `#token=...` fragment, and keep it private: the token authorizes viewing and sending as you. Host and Origin checks protect the local HTTP endpoints, but this is a tool for a trusted same-user environment, not a public server or a sandbox against hostile local processes. Do not expose it through a proxy or share the token URL.
 
-The package includes `web/city/` with the browser modules, vendored Phaser and assets. The command serves those files locally without a separate web build or CDN. Its daemon client must use the same protocol revision as the running daemon (currently **18**); a mixed-version deployment will not connect. The browser command does not bypass the protocol handshake or restart the daemon to resolve a mismatch.
+The package includes `web/city/` with the browser modules, vendored Phaser and assets. The command serves those files locally without a separate web build or CDN. Its daemon client must use the same protocol revision as the running daemon (currently **19**); a mixed-version deployment will not connect. The browser command does not bypass the protocol handshake or restart the daemon to resolve a mismatch.
 
 ## Upgrading
 
@@ -375,7 +377,7 @@ asenq setup        # only if wiring or skills changed; doctor tells you
 asenq daemon stop  # the next asenq command starts the new daemon
 ```
 
-`npm link` points at the checkout, so rebuilding is the reinstall. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **18**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
+`npm link` points at the checkout, so rebuilding is the reinstall. Restart/resume sessions whose MCP server, plugin or extension loaded the old version; for omp use `omp -r`. Protocol revision is **19**. A protocol mismatch during switchover is expected until old clients restart; do not work around it with mixed versions. Message history and recognised session identities remain in the database.
 
 ## Limitations
 

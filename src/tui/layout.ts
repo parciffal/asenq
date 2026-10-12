@@ -363,6 +363,9 @@ export function activitySpans(item: PositionedEvent, names: (id: string) => stri
     return [position, { text: "session  ", style: theme.accent }, { text: `${event.action} `, style }, { text: detail, style: theme.bold }, { text: `  ${event.harness}`, style: theme.dim }];
   }
   if (event.type === "channel") {
+    if (event.action === "deleted") {
+      return [position, { text: "channel  ", style: theme.accent }, { text: `#${event.channel.name} deleted`, style: theme.dim }];
+    }
     return [position, { text: "channel  ", style: theme.accent }, { text: `${event.action} #${event.channel.name}`, style: theme.bold }, { text: `  ${event.channel.memberIds?.length ?? 0} members`, style: theme.dim }];
   }
   if (event.type === "ping") {

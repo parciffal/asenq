@@ -596,7 +596,18 @@ export class ConsoleApp {
     } else if (e.type === "read") {
       this.readStates.set(keyOf(e.state.scope), e.state);
     } else if (e.type === "channel") {
-      if (e.action === "renamed" && e.oldName) {
+      if (e.action === "deleted") {
+        const key = `c:${e.channel.name}`;
+        this.channels = this.channels.filter((channel) => channel.name !== e.channel.name);
+        this.streams.delete(key);
+        this.readStates.delete(key);
+        this.drafts.delete(`channel:${e.channel.name}`);
+        if (this.readHold === key) this.readHold = undefined;
+        if (this.selectedChannel() === e.channel.name) {
+          this.selection.channels = undefined;
+          if (this.tab === "channels") this.focus = "list";
+        }
+      } else if (e.action === "renamed" && e.oldName) {
         this.map.renameChannel(e.oldName, e.channel.name);
         const oldKey = `c:${e.oldName}`;
         const newKey = `c:${e.channel.name}`;
@@ -625,10 +636,12 @@ export class ConsoleApp {
           }
         }
       }
-      const index = this.channels.findIndex((c) => c.name === e.channel.name);
-      if (index >= 0) this.channels[index] = e.channel;
-      else this.channels.push(e.channel);
-      this.channels.sort((a, b) => b.lastOrder - a.lastOrder || a.name.localeCompare(b.name));
+      if (e.action !== "deleted") {
+        const index = this.channels.findIndex((c) => c.name === e.channel.name);
+        if (index >= 0) this.channels[index] = e.channel;
+        else this.channels.push(e.channel);
+        this.channels.sort((a, b) => b.lastOrder - a.lastOrder || a.name.localeCompare(b.name));
+      }
     } else if (e.type === "session") {
       const index = this.sessions.findIndex((s) => s.id === e.session.id);
       if (e.session.closedAt !== undefined && this.sessions[index]?.closedAt === undefined) this.sessionOrdersDirty = true;
@@ -904,6 +917,10 @@ export class ConsoleApp {
     const e = item.event;
     let sessionId: string | undefined;
     if (e.type === "channel") {
+      if (!this.channels.some((channel) => channel.name === e.channel.name)) {
+        this.say("That channel has been deleted.");
+        return this.render();
+      }
       this.selection.channels = `c:${e.channel.name}`;
       await this.setTab("channels");
       this.focus = "transcript";

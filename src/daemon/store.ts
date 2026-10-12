@@ -949,6 +949,15 @@ export class Store {
     );
   }
 
+  /** Deletes posts and roster state, keeping mention DMs. Caller must wrap in a transaction. */
+  deleteChannel(name: string): void {
+    this.db.run("DELETE FROM messages WHERE channel=?", name);
+    this.db.run("DELETE FROM channel_members WHERE channel=?", name);
+    this.db.run("DELETE FROM channels WHERE name=?", name);
+    this.db.run("DELETE FROM human_read_positions WHERE scope='channel' AND stream_key=?", name);
+    this.db.run("DELETE FROM channel_renames WHERE old_name=? OR new_name=?", name, name);
+  }
+
   /** Returns the current name if `name` was renamed away, following the full chain. */
   channelRenamedTo(name: string): string | undefined {
     const row = this.db.get<{ new_name: string }>(

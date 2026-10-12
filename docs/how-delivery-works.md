@@ -1,6 +1,6 @@
 # How delivery works
 
-User workflows and command reference: [README](../README.md). This document preserves the detailed behavior behind naming, delivery, reading and human actions for protocol revision **18**.
+User workflows and command reference: [README](../README.md). This document preserves the detailed behavior behind naming, delivery, reading and human actions for protocol revision **19**.
 
 ## Harness wiring and delivery
 
@@ -73,6 +73,8 @@ Posting to an unknown channel still creates it, with an empty roster and no auto
 For a sending session, `"*"` produces a direct message to each **live** session sharing any of its channels, once even if several channels overlap, and never to the sender. A channel member with no live co-members reaches nobody; it does not fall back to machine-wide delivery. A sender belonging to no channel reaches every other live session on the machine. Human broadcasts remain machine-wide, and the human is never a broadcast target. Named direct messages remain unrestricted by membership; broadcasts use the same inbound policy, rate limits and delivery handling as other direct messages.
 
 The Channels tab lists each roster under its channel with role and lifecycle state. Selecting a member keeps the channel conversation and composer in channel scope, not a direct message. Purging retained posts keeps the channel; deleting an identity through retention removes its memberships.
+
+The human-only daemon operation `channel_delete {channel}` deletes a channel's retained posts, memberships, human read markers and rename records atomically, then publishes a `deleted` channel event. It sends no system note to members. Mention copies have no channel-history scope and remain direct messages, including held and queued copies; their source-channel label remains historical context. Re-creating the name starts empty, and a later plain post may implicitly re-create it as usual.
 
 ### Channel mentions
 

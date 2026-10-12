@@ -14,8 +14,8 @@ afterEach(async () => {
   env = undefined;
 });
 
-test("protocol constant is 18", () => {
-  assert.equal(PROTOCOL, 18);
+test("protocol constant is 19", () => {
+  assert.equal(PROTOCOL, 19);
 });
 
 test("channel rename succeeds and updates all stored references", async () => {

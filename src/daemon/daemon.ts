@@ -530,6 +530,8 @@ export class Daemon {
       }
       case "channel_rename":
         return this.opChannelRename(this.sender(c, p), p);
+      case "channel_delete":
+        return this.opChannelDelete(this.sender(c, p), p);
       case "channel_add":
       case "channel_remove":
         return this.opChannelMember(this.sender(c, p), p, p.op === "channel_add");
@@ -2006,6 +2008,19 @@ export class Daemon {
       };
       void Promise.resolve(this.routeOne({ kind: "asenq" }, target, note)).catch((e) => this.log(`channel rename note failed: ${String(e)}`));
     }
+    return { channel };
+  }
+
+  private opChannelDelete(actor: Sender, p: Params): Result {
+    this.requireHuman(actor, "delete channels");
+    const name = this.channelName({ channel: str(p, "channel", true) });
+    if (!this.store.hasChannel(name)) throw new AsenqError("unknown_channel", `unknown channel "${name}"`);
+    const channel = { name, count: 0, lastAt: 0, lastOrder: 0, memberIds: [] };
+    const event = this.store.transaction(() => {
+      this.store.deleteChannel(name);
+      return this.store.appendEvent({ type: "channel", action: "deleted", channel }, this.now());
+    });
+    this.publish(event);
     return { channel };
   }
 
