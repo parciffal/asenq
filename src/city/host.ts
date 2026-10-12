@@ -64,7 +64,14 @@ export class CityHost {
   constructor(deps: CityDeps = {}) {
     const { settings, warning } = (deps.settings ?? readVizSettings)();
     this.scan = deps.scan ?? scanProcesses;
-    this.kill = deps.kill ?? ((pid, signal) => { process.kill(pid, signal); });
+    this.kill = deps.kill ?? ((pid, signal) => {
+      try { process.kill(pid, signal); } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ESRCH") throw new AsenqError("unknown_target", "process not found");
+        if (code === "EPERM") throw new AsenqError("not_permitted", "not permitted to signal that process");
+        throw error;
+      }
+    });
     this.warning = warning;
     this.reducedMotion = (deps.reducedMotion ?? false) || settings.reducedMotion;
     this.map = new VizMap({
@@ -207,7 +214,12 @@ export class CityHost {
           if (through > 0 || !page.hasMore || page.messages.length === 0) break;
           before = page.messages[0].order;
         }
-        return { state: (await client.markRead(operation.scope, through, state.version)).state };
+        // A concurrent read change (TUI, MARK UNREAD) bumps the version; retry against the fresh version instead of reporting success.
+        let result = await client.markRead(operation.scope, through, state.version);
+        for (let attempt = 0; !result.applied && attempt < 2; attempt++) {
+          result = await client.markRead(operation.scope, through, (await client.readState(operation.scope)).version);
+        }
+        return { state: result.state, applied: result.applied };
       }
     }
   }

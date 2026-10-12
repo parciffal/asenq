@@ -949,8 +949,15 @@ export class Store {
     );
   }
 
-  /** Deletes posts and roster state, keeping mention DMs. Caller must wrap in a transaction. */
+  /** Deletes posts, their retained protocol events and roster state, keeping mention DMs. Caller must wrap in a transaction. */
   deleteChannel(name: string): void {
+    for (const row of this.db.all<{ position: number; event_json: string }>("SELECT position,event_json FROM protocol_events")) {
+      const event = JSON.parse(row.event_json) as TailEvent;
+      const belongs = event.type === "message" ? event.msg.channel === name
+        : event.type === "read" ? event.state.scope.scope === "channel" && event.state.scope.channel === name
+        : false;
+      if (belongs) this.db.run("DELETE FROM protocol_events WHERE position=?", row.position);
+    }
     this.db.run("DELETE FROM messages WHERE channel=?", name);
     this.db.run("DELETE FROM channel_members WHERE channel=?", name);
     this.db.run("DELETE FROM channels WHERE name=?", name);

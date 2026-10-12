@@ -140,3 +140,17 @@ test("channel deletion preserves held and queued mention copies as actionable di
   const delivered = (await human.historyPage({ scope: "session", sessionId: queued.id })).messages;
   assert.deepEqual(delivered.map((message) => [message.id, message.status]), [[queuedId, "delivered"]]);
 });
+
+test("channel deletion also removes the deleted posts from retained protocol events", async () => {
+  env = await startEnv();
+  const human = env.human();
+  const poster = await env.adapter("omp", "delete-scrub", "scrub");
+  await human.request("channel_create", { channel: "secret" });
+  await human.request("channel_add", { channel: "secret", name: "scrub" });
+  await poster.client.request("channel_send", { channel: "secret", text: "classified-text-9431" });
+  assert.match(JSON.stringify((await human.replay(0)).events), /classified-text-9431/);
+  await human.request("channel_delete", { channel: "secret" });
+  const events = (await human.replay(0)).events;
+  assert.doesNotMatch(JSON.stringify(events), /classified-text-9431/);
+  assert.ok(events.some((positioned) => positioned.event.type === "channel" && positioned.event.action === "deleted"));
+});

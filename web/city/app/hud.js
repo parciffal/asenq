@@ -175,6 +175,7 @@ export class CityHud {
     this.side.append(header);
     this.sideBody = element("div", `side-body${state.ui.sidebarTab === "chats" && state.ui.chat ? " thread-body" : ""}`);
     this.side.append(this.sideBody);
+    if (state.ui.sidebarTab !== "manage") this.deleteConfirmVenue = undefined;
     if (state.ui.sidebarTab === "chats") this.renderChats(state, previous);
     else if (state.ui.sidebarTab === "manage") this.renderManage(state);
     else this.renderInspector(state);
@@ -488,9 +489,12 @@ export class CityHud {
   scopeFor(target) { return scopeOf(target, this.store.snapshot()); }
 
   openChat(scope) {
+    const sameThread = sameHistoryScope(this.store.ui.chat, scope);
     this.chatGeneration++;
-    this.composerDraft = "";
-    this.composerOptions = { kind: "chat", action: "pause", thread: "", done: false, replyTo: null };
+    if (!sameThread) {
+      this.composerDraft = "";
+      this.composerOptions = { kind: "chat", action: "pause", thread: "", done: false, replyTo: null };
+    }
     this.composerStatus = { text: "", error: false };
     this.pendingMessage = null;
     this.readSuppressed = null;
@@ -791,9 +795,10 @@ export class CityHud {
         event.stopPropagation();
         this.submitMessage(scope);
       } else if (event.key === "Escape") {
+        // Leave the composer (draft kept); a second Escape from the map closes the thread.
         event.preventDefault();
         event.stopPropagation();
-        this.closeChat();
+        this.composer.blur();
       }
     });
     const actions = element("div", "composer-actions");
@@ -886,9 +891,13 @@ export class CityHud {
       if (!this.canRead(scope) || this.readSuppressed === this.chatScopeKey) return;
       try {
         const result = await this.api.manage("read.mark", { scope, state: "read" });
-        this.readThrough = signature;
+        if (result.applied !== false) this.readThrough = signature;
         this.handleRead(result);
-      } catch (error) { this.showToast(error.message, true); }
+      } catch (error) {
+        // Do not re-arm for the same newest message on every render; a new message or scope change retries.
+        this.readThrough = signature;
+        this.showToast(error.message, true);
+      }
     }, 400);
   }
 
@@ -946,6 +955,7 @@ export class CityHud {
       this.showToast(error.message, true);
     } finally {
       this.manageBusy = false;
+      this.clearDeleteConfirmations();
       if (!this.destroyed) this.renderSide(this.store.snapshot());
     }
   }
@@ -990,11 +1000,19 @@ export class CityHud {
     section.append(group);
   }
 
+  clearDeleteConfirmations() {
+    for (const key of [...this.formValues.keys()]) if (key.startsWith("delete-channel:")) this.formValues.delete(key);
+  }
+
   renderManage(state) {
     this.sideBody.append(element("div", "composer-result manage-result", this.manageStatus));
     const target = state.ui.selected;
     const character = target && target.kind !== "venue" ? state.charactersById.get(target.id) : null;
     const venue = target?.kind === "venue" ? state.venuesByKey.get(target.venueKey) : null;
+    if (this.deleteConfirmVenue !== (venue?.key ?? null)) {
+      this.clearDeleteConfirmations();
+      this.deleteConfirmVenue = venue?.key ?? null;
+    }
     const live = [...state.charactersById.values()].filter((c) => c.source === "registered" && c.state !== "removed");
     if (character?.source === "registered") this.renderSessionManage(state, character, live);
     else if (character?.source === "process") {
