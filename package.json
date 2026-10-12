@@ -29,7 +29,8 @@
   },
   "files": [
     "dist/src",
-    "skills"
+    "skills",
+    "web"
   ],
   "scripts": {
     "build": "tsc -p .",

@@ -11,7 +11,7 @@ import { mapRegion, renderScene } from "./scene.js";
 import { DEFAULT_VIZ_SETTINGS } from "./settings.js";
 import type { VizSettings } from "./settings.js";
 import { VIZ_HARNESSES } from "./types.js";
-import type { CityCharacter, CityLayout, CityTarget, FeedLine, Hit, Packet, Point, Rect, TargetPosition, VizUi, World } from "./types.js";
+import type { CityCharacter, CityLayout, CityPacket, CityTarget, CityView, FeedLine, Hit, Packet, Point, Rect, TargetPosition, VizUi, World } from "./types.js";
 
 export const TICK_MS = 100;
 export const REQUEST_TIMEOUT_MS = 4000;
@@ -29,6 +29,7 @@ export type VizMapOptions = {
   reducedMotion?: boolean;
   color?: boolean;
   settingsWarning?: string | null;
+  onPacket?: (packet: CityPacket) => void;
 };
 type LivePacket = Omit<Packet, "ageMs"> & { born: number };
 
@@ -78,6 +79,7 @@ export class VizMap {
   private readonly reducedMotion: boolean;
   private readonly color: boolean;
   private readonly settingsWarning: string | null;
+  private readonly onPacket?: (packet: CityPacket) => void;
 
   constructor(options: VizMapOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -86,6 +88,7 @@ export class VizMap {
     this.reducedMotion = (options.reducedMotion ?? false) || this.settings.reducedMotion;
     this.color = options.color ?? terminalSupportsColor();
     this.settingsWarning = options.settingsWarning ?? null;
+    this.onPacket = options.onPacket;
     this.world = this.build();
     this.layout = this.placement.update(this.world);
     this.cacheAppearance();
@@ -99,6 +102,7 @@ export class VizMap {
       this.ui.follow ? `FOLLOW:${this.ui.follow}` : "", this.reducedMotion ? "REDUCED MOTION" : ""].filter(Boolean).join(" ");
   }
   setNotice(notice: string | null): void { this.ui.notice = notice === null ? null : sanitizeTerminalText(notice); }
+  view(): CityView { return { world: this.world, layout: this.layout, appearances: this.appearances, notice: this.ui.notice }; }
 
   /** Publish a complete successful bundle; failed fetches must call setConnection only. */
   setSnapshot(sessions: ListedSession[], channels: ChannelSummary[], identities: SessionIdentity[]): void {
@@ -181,6 +185,7 @@ export class VizMap {
       const path = routeBetween(this.layout, source, destination);
       if (path) {
         this.packets.push({ seq: line.seq, from: source, to: destination, kind: line.kind, born: this.clock, path });
+        this.onPacket?.({ seq: line.seq, from: source, to: destination, kind: line.kind, path, senderId: from.id });
         if (this.packets.length > PACKET_MAX) this.packets.shift();
         this.animator.send(from.id, this.clock);
       }
