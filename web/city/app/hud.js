@@ -495,11 +495,6 @@ export class CityHud {
     if (state.transcript.error) messages.append(element("div", "composer-result error", state.transcript.error));
     this.transcript.append(messages);
     const composer = element("form", "transcript-composer");
-    if (previousMessages) {
-      if (prepended) messages.scrollTop = previousTop + Math.max(0, messages.scrollHeight - previousHeight);
-      else if (wasAtBottom) messages.scrollTop = messages.scrollHeight;
-      else messages.scrollTop = Math.min(previousTop, messages.scrollHeight);
-    } else if (history.length) messages.scrollTop = messages.scrollHeight;
     this.transcriptScopeKey = currentScopeKey;
     this.transcriptFirstOrder = firstOrder;
     this.transcriptCount = history.length;
@@ -526,6 +521,14 @@ export class CityHud {
     composer.addEventListener("submit", (event) => { event.preventDefault(); this.submitMessage(scope); });
     this.transcript.append(composer);
     this.transcript.append(element("div", "transcript-note", "Viewing here does not mark messages read."));
+    requestAnimationFrame(() => {
+      if (!messages.isConnected) return;
+      if (previousMessages) {
+        if (prepended) messages.scrollTop = previousTop + Math.max(0, messages.scrollHeight - previousHeight);
+        else if (wasAtBottom) messages.scrollTop = messages.scrollHeight;
+        else messages.scrollTop = Math.min(previousTop, messages.scrollHeight);
+      } else if (history.length) messages.scrollTop = messages.scrollHeight;
+    });
     if (activeComposer) {
       this.composer.focus();
       this.composer.setSelectionRange(...selection);
