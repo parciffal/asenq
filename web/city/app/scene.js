@@ -13,6 +13,7 @@ const HARNESS_FILTERS = [null, "claude", "omp", "opencode", "codex"];
 const PACKET_COLORS = { chat: COLORS.cream, task: COLORS.cyan, result: COLORS.yellow, status: 0xbdb1a4, control: COLORS.alert };
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const keyOf = (target) => target ? targetKey(target) : null;
+const isTextEntry = (target) => target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
 
 export class CityScene extends Phaser.Scene {
   constructor(store, hud) {
@@ -29,6 +30,7 @@ export class CityScene extends Phaser.Scene {
     this.cameraZooms = [1, 2, 3, 4];
     this.clock = performance.now();
     this.lastViewportRefresh = 0;
+    this.keyListener = (event) => this.onKeyDown(event);
   }
 
   create() {
@@ -78,7 +80,7 @@ export class CityScene extends Phaser.Scene {
     this.loadBackdrop("skyline-mid", "/assets/skyline-mid.png");
     this.seedRain();
 
-    this.input.keyboard.on("keydown", this.onKeyDown, this);
+    window.addEventListener("keydown", this.keyListener);
     this.input.on("pointerdown", this.onPointerDown, this);
     this.input.on("pointermove", this.onPointerMove, this);
     this.input.on("pointerup", this.onPointerUp, this);
@@ -97,7 +99,7 @@ export class CityScene extends Phaser.Scene {
 
   shutdown() {
     this.unsubscribe?.();
-    this.input.keyboard.off("keydown", this.onKeyDown, this);
+    window.removeEventListener("keydown", this.keyListener);
   }
 
   onStoreChange(state) {
@@ -728,8 +730,7 @@ export class CityScene extends Phaser.Scene {
   }
 
   onKeyDown(event) {
-    const active = document.activeElement;
-    if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) return;
+    if (event.defaultPrevented || isTextEntry(event.target) || isTextEntry(document.activeElement)) return;
     const key = event.key;
     let handled = true;
     const selected = this.state.ui.selected;
