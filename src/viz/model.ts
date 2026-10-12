@@ -35,6 +35,11 @@ export function rebaseCitySnapshot(bundle: CitySnapshot, events: readonly Positi
         };
       }
     } else if (event.type === "channel") {
+      const action: string = event.action;
+      if (action === "deleted") {
+        bundle.channels = bundle.channels.filter((channel) => channel.name !== event.channel.name);
+        continue;
+      }
       const previous = bundle.channels.find((channel) => channel.name === event.channel.name
         || (event.action === "renamed" && channel.name === event.oldName));
       const channel = { ...event.channel };
@@ -118,12 +123,17 @@ export function buildWorld(input: WorldInput): World {
     const identity = historical.get(id);
     const member = memberships.has(id);
     if (!member && s?.state === "gone" && (s.lastSeen === null || now - s.lastSeen > GONE_VISIBLE_MS)) continue;
+    const inbound = s?.inbound ?? identity?.inbound;
+    const owners = s?.harnessSessionId && s.harnessSessionId.length >= MIN_SESSION_ID_MATCH
+      ? procs.filter((proc) => proc.command.includes(s.harnessSessionId!)) : [];
     registered.push({
       id, name: s?.name ?? identity?.name ?? id, previousNames: [...new Set([...(s?.previousNames ?? []), ...(identity?.previousNames ?? [])])],
       source: "registered", harness: s?.harness ?? (identity?.harness === "unknown" ? null : identity?.harness ?? null),
       role: s ? s.role : identity?.role ?? null, state: identity?.state === "removed" ? "removed" : s?.state ?? identity?.state ?? null,
       stale: s?.stale ?? null, ping: s?.ping ?? null, busy: s?.busy ?? null, cpu: null,
       cwd: s ? s.cwd : identity?.cwd ?? null, memberships: (memberships.get(id) ?? []).sort(), lastSeen: s?.lastSeen ?? null,
+      ...(inbound === undefined ? {} : { inbound }),
+      ...(owners.length === 1 ? { ownerPid: owners[0].pid } : {}),
     });
   }
   const byId = new Map(registered.map((c) => [c.id, c]));

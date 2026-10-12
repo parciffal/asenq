@@ -12,13 +12,15 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { runCity } from "../src/city/command.js";
 import { CityHost } from "../src/city/host.js";
-import type { CityEvent } from "../src/city/host.js";
+import type { CityDeps, CityEvent, ConversationSummary } from "../src/city/host.js";
 import { startCityServer } from "../src/city/server.js";
 import { AsenqClient } from "../src/shared/client.js";
-import type { ChannelSendResult, HistoryPage, SendResult } from "../src/shared/protocol.js";
+import type { ChannelSendResult, HistoryPage, ListedSession, SendResult, StoredMessage } from "../src/shared/protocol.js";
 import { DEFAULT_VIZ_SETTINGS } from "../src/viz/settings.js";
+import type { ProcInfo } from "../src/viz/scan.js";
 import { startEnv } from "./helpers.js";
 
+type CityHttp = { base: string; headers: Record<string, string> };
 type HttpReply = { status: number; headers: IncomingHttpHeaders; body: string };
 function http(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; path?: string } = {}): Promise<HttpReply> {
   const { promise, resolve, reject } = Promise.withResolvers<HttpReply>();
@@ -70,7 +72,7 @@ async function stream(url: string) {
   };
 }
 
-async function city(t: TestContext) {
+async function city(t: TestContext, deps: Pick<CityDeps, "scan" | "kill"> = {}) {
   const env = await startEnv();
   const root = mkdtempSync(join(tmpdir(), "asenq-city-static-"));
   writeFileSync(join(root, "index.html"), "<!doctype html><title>city transport test</title>");
@@ -80,6 +82,7 @@ async function city(t: TestContext) {
     client: (options) => new AsenqClient({ ...options, autoStart: false }),
     scan: async () => [], schedule: () => () => {},
     settings: () => ({ settings: DEFAULT_VIZ_SETTINGS, warning: null }),
+    ...deps,
   });
   const token = randomBytes(24).toString("base64url");
   const server = await startCityServer(host, { port: 0, token, root });
@@ -88,6 +91,17 @@ async function city(t: TestContext) {
   host.start();
   await host.idle();
   return { env, root, host, server, token, base, headers: { "X-Asenq-Token": token, "Content-Type": "application/json", Origin: base } };
+}
+
+async function manage(c: CityHttp, body: Record<string, unknown>): Promise<HttpReply> {
+  return http(c.base + "/api/manage", { method: "POST", headers: c.headers, body: JSON.stringify(body) });
+}
+
+async function conversations(c: CityHttp): Promise<ConversationSummary[]> {
+  const reply = await http(c.base + "/api/conversations", { headers: c.headers });
+  assert.equal(reply.status, 200);
+  const result: { conversations: ConversationSummary[] } = JSON.parse(reply.body);
+  return result.conversations;
 }
 
 test("localhost guard, static confinement, CSP and token checks", { timeout: 10_000 }, async (t) => {
@@ -287,6 +301,283 @@ test("history pagination leaves both channel and session human unread positions 
   for (const query of ["scope=inbox", "scope=channel", "scope=session&sessionId=x&before=1.5", "scope=channel&channel=history&before=NaN", "scope=channel&channel=history&extra=x"]) {
     assert.equal((await http(c.base + `/api/history?${query}`, { headers: c.headers })).status, 400);
   }
+});
+
+test("manage shares send guards and rejects unknown or mistyped operations", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const body = JSON.stringify({ op: "channel.create", name: "guarded" });
+  const { Origin, ...withoutOrigin } = c.headers;
+  assert.equal((await http(c.base + "/api/manage", { method: "POST", headers: withoutOrigin, body })).status, 403);
+  assert.equal((await http(c.base + "/api/manage", { method: "POST", headers: { ...c.headers, Origin: "https://evil.example" }, body })).status, 403);
+  assert.equal((await http(c.base + "/api/manage", { method: "POST", headers: { ...c.headers, "Content-Type": "text/plain" }, body })).status, 415);
+  assert.equal((await http(c.base + "/api/manage", { method: "POST", body })).status, 401);
+  assert.equal((await http(c.base + "/api/manage", { method: "POST", headers: c.headers, body: "x".repeat(1024 * 1024 + 1) })).status, 413);
+  for (const operation of [
+    { op: "unknown" }, { op: "channel.create" }, { op: "channel.rename", name: "guarded", to: 7 },
+    { op: "session.close", id: "missing", terminate: "yes" }, { op: "session.role", id: "missing", role: "manager" },
+    { op: "session.inbound", id: "missing", mode: "allow" }, { op: "session.replace", fromId: "missing" },
+    { op: "session.purge", id: "missing", all: true }, { op: "held.release", msgId: 1 },
+    { op: "process.kill", pid: -1 }, { op: "process.kill", pid: 1.5 },
+    { op: "read.mark", scope: { scope: "inbox" }, state: "read" },
+    { op: "read.mark", scope: { scope: "channel", channel: "guarded" }, state: "other" },
+    { op: "session.close", id: "missing", terminate: true, pid: 42 },
+  ]) {
+    const reply = await manage(c, operation);
+    assert.equal(reply.status, 400);
+    assert.equal(JSON.parse(reply.body).error, "bad_request");
+  }
+  assert.equal((await manage(c, { op: "session.close", id: "missing", terminate: false })).status, 404);
+  assert.equal((await manage(c, { op: "session.rename", id: "missing", name: "next" })).status, 404);
+  assert.equal((await manage(c, { op: "channel.delete", name: "missing" })).status, 404);
+});
+
+test("channel management creates, renames and deletes venues without moving the remaining city", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const s = await stream(c.base + `/api/events?token=${c.token}`);
+  t.after(() => s.close());
+  assert.equal((await manage(c, { op: "channel.create", name: "stable" })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.venues.some((venue) => venue.name === "stable")));
+  const stable = c.host.current().layout.venues.find((venue) => c.host.current().venues.find((item) => item.key === venue.key)?.name === "stable")!;
+  assert.equal((await manage(c, { op: "channel.create", name: "lab" })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.venues.some((venue) => venue.name === "lab")));
+  const labKey = c.host.current().venues.find((venue) => venue.name === "lab")!.key;
+  assert.equal((await manage(c, { op: "channel.rename", name: "lab", to: "lab2" })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.venues.some((venue) => venue.name === "lab2" && venue.key === labKey)));
+  const collision = await manage(c, { op: "channel.rename", name: "lab2", to: "stable" });
+  assert.equal(collision.status, 409);
+  assert.equal(JSON.parse(collision.body).error, "name_taken");
+  const start = s.events.length;
+  const deleted = await manage(c, { op: "channel.delete", name: "lab2" });
+  assert.equal(deleted.status, 200);
+  assert.equal(JSON.parse(deleted.body).ok, true);
+  await s.until((events) => events.slice(start).some((event) => event.event === "state" && !event.data.venues.some((venue) => venue.key === labKey)));
+  await c.host.idle();
+  assert.deepEqual(c.host.current().layout.venues.find((venue) => venue.key === stable.key)!.rect, stable.rect);
+  assert.ok(!(await conversations(c)).some((conversation) => conversation.title === "lab2"));
+});
+
+test("session management publishes role, inbound and exact current name and returns ping replies", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const a = await c.env.adapter("omp", "manage-session-a", "manage-a");
+  const b = await c.env.adapter("omp", "manage-session-b", "manage-b");
+  const s = await stream(c.base + `/api/events?token=${c.token}`);
+  t.after(() => s.close());
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.characters.some((ch) => ch.id === a.session.id)));
+  assert.equal((await manage(c, { op: "session.role", id: a.session.id, role: "worker" })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.characters.some((ch) => ch.id === a.session.id && ch.role === "worker")));
+  assert.equal((await manage(c, { op: "session.inbound", id: a.session.id, mode: "hold" })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.characters.some((ch) => ch.id === a.session.id && ch.inbound === "hold")));
+  assert.equal((await manage(c, { op: "session.rename", id: a.session.id, name: "renamed-a" })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.characters.some((ch) => ch.id === a.session.id && ch.name === "renamed-a")));
+  assert.equal((await manage(c, { op: "session.rename", id: a.session.id, name: b.session.name })).status, 409);
+  const ping = await manage(c, { op: "session.ping", id: a.session.id });
+  assert.equal(ping.status, 200);
+  assert.equal(JSON.parse(ping.body).results[0].ping, "responding");
+  assert.equal((await manage(c, { op: "session.role", id: a.session.id, role: null })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.characters.some((ch) => ch.id === a.session.id && ch.name === "renamed-a" && ch.role === null)));
+});
+
+test("close always archives first and SIGTERMs only one freshly identified safe owner", { timeout: 10_000 }, async (t) => {
+  let procs: ProcInfo[] = [];
+  const killed: { pid: number; signal: string }[] = [];
+  const c = await city(t, { scan: async () => procs, kill: (pid, signal) => { killed.push({ pid, signal }); } });
+  for (const [label, pids, reason] of [
+    ["unique", [700_001], undefined], ["missing", [], "process not identified"],
+    ["ambiguous", [700_002, 700_003], "ambiguous"], ["self", [process.pid], "refused"],
+    ["parent", [process.ppid], "refused"],
+  ] as const) {
+    const key = `resume-close-${label}`;
+    const a = await c.env.adapter("omp", key, `close-${label}`);
+    procs = pids.map((pid) => ({ pid, harness: "omp", command: `omp --resume ${key}`, elapsedSec: 1, cpu: 0 }));
+    const reply = await manage(c, { op: "session.close", id: a.session.id, terminate: true });
+    assert.equal(reply.status, 200);
+    const result = JSON.parse(reply.body);
+    assert.equal(result.closed, true);
+    assert.equal(result.session.state, "removed");
+    assert.equal(result.terminated, label === "unique" ? 700_001 : null);
+    if (reason) assert.equal(result.reason, reason);
+    else assert.equal(result.inferred, true);
+    const identities = (await c.env.human().sync()).sessions;
+    assert.equal(identities.find((session) => session.id === a.session.id)!.state, "removed");
+  }
+  assert.deepEqual(killed, [{ pid: 700_001, signal: "SIGTERM" }]);
+  const short = await c.env.adapter("omp", "short", "close-short");
+  procs = [{ pid: 700_004, harness: "omp", command: "omp --resume short", elapsedSec: 1, cpu: 0 }];
+  assert.equal(JSON.parse((await manage(c, { op: "session.close", id: short.session.id, terminate: true })).body).terminated, null);
+  assert.equal(killed.length, 1);
+});
+
+test("city state exposes owner pid only for unique long resume-id matches", { timeout: 10_000 }, async (t) => {
+  const procs: ProcInfo[] = [
+    { pid: 710_001, harness: "omp", command: "omp --resume owner-unique-city", elapsedSec: 1, cpu: 0 },
+    { pid: 710_002, harness: "omp", command: "omp --resume owner-ambiguous-city", elapsedSec: 1, cpu: 0 },
+    { pid: 710_003, harness: "omp", command: "omp --resume owner-ambiguous-city", elapsedSec: 1, cpu: 0 },
+    { pid: 710_004, harness: "omp", command: "omp --resume tiny", elapsedSec: 1, cpu: 0 },
+  ];
+  const c = await city(t, { scan: async () => procs, kill: () => assert.fail("projection must never terminate processes") });
+  const a = await c.env.adapter("omp", "owner-unique-city", "owner-unique");
+  const b = await c.env.adapter("omp", "owner-ambiguous-city", "owner-ambiguous");
+  const short = await c.env.adapter("omp", "tiny", "owner-short");
+  const missing = await c.env.adapter("omp", "owner-missing-city", "owner-missing");
+  const s = await stream(c.base + `/api/events?token=${c.token}`);
+  t.after(() => s.close());
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.characters.some((ch) => ch.id === missing.session.id)));
+  const characters = c.host.current().characters;
+  assert.equal(characters.find((ch) => ch.id === a.session.id)!.ownerPid, 710_001);
+  for (const id of [b.session.id, short.session.id, missing.session.id]) assert.equal(characters.find((ch) => ch.id === id)!.ownerPid, undefined);
+  assert.ok(characters.filter((ch) => ch.source !== "registered").every((ch) => ch.inbound === undefined && ch.ownerPid === undefined));
+});
+
+test("a termination failure reports successful closure and process kill rechecks fresh scan ownership", { timeout: 10_000 }, async (t) => {
+  let procs: ProcInfo[] = [];
+  let fail = true;
+  const killed: number[] = [];
+  const c = await city(t, {
+    scan: async () => procs,
+    kill: (pid) => { if (fail) throw new Error("SIGTERM unavailable"); killed.push(pid); },
+  });
+  const a = await c.env.adapter("omp", "resume-terminate-failure", "terminate-failure");
+  procs = [{ pid: 700_005, harness: "omp", command: "omp --resume resume-terminate-failure", elapsedSec: 1, cpu: 0 }];
+  const closed = await manage(c, { op: "session.close", id: a.session.id, terminate: true });
+  assert.equal(closed.status, 200);
+  const result = JSON.parse(closed.body);
+  assert.equal(result.closed, true);
+  assert.equal(result.session.state, "removed");
+  assert.equal(result.terminated, null);
+  fail = false;
+  procs = [];
+  assert.equal((await manage(c, { op: "process.kill", pid: 700_005 })).status, 404);
+  for (const pid of [process.pid, process.ppid]) {
+    procs = [{ pid, harness: "omp", command: "omp", elapsedSec: 1, cpu: 0 }];
+    assert.equal((await manage(c, { op: "process.kill", pid })).status, 404);
+  }
+  procs = [{ pid: 700_006, harness: "omp", command: "omp", elapsedSec: 1, cpu: 0 }];
+  const killedReply = await manage(c, { op: "process.kill", pid: 700_006 });
+  assert.equal(killedReply.status, 200);
+  assert.equal(JSON.parse(killedReply.body).terminated, 700_006);
+  assert.deepEqual(killed, [700_006]);
+});
+
+test("conversations expose live and archived activity and read management broadcasts reminders", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const a = await c.env.adapter("omp", "conversation-a", "conversation-a");
+  const empty = await c.env.adapter("omp", "conversation-empty", "conversation-empty");
+  const s = await stream(c.base + `/api/events?token=${c.token}`);
+  t.after(() => s.close());
+  const scope = { scope: "session", sessionId: a.session.id };
+  await a.client.request("send", { to: "human", text: "incoming preview" });
+  let list = await conversations(c);
+  let conversation = list.find((entry) => entry.key === `s:${a.session.id}`)!;
+  assert.equal(conversation.unread, 1);
+  assert.equal(conversation.archived, false);
+  assert.equal(conversation.preview!.text, "incoming preview");
+  assert.equal(conversation.preview!.from, a.session.name);
+  assert.ok(conversation.lastActivity > 0 && conversation.lastOrder > 0);
+  assert.equal((await manage(c, { op: "read.mark", scope, state: "read" })).status, 200);
+  assert.equal((await conversations(c)).find((entry) => entry.key === conversation.key)!.unread, 0);
+  const unread = await manage(c, { op: "read.mark", scope, state: "unread" });
+  assert.equal(unread.status, 200);
+  assert.equal(JSON.parse(unread.body).state.unread, 1);
+  await s.until((events) => events.some((event) => event.event === "read" && event.data.state.scope.scope === "session"
+    && event.data.state.scope.sessionId === a.session.id && event.data.state.reminder !== null));
+  conversation = (await conversations(c)).find((entry) => entry.key === conversation.key)!;
+  assert.equal(conversation.reminder, true);
+  assert.equal((await manage(c, { op: "read.mark", scope, state: "read" })).status, 200);
+  conversation = (await conversations(c)).find((entry) => entry.key === conversation.key)!;
+  assert.equal(conversation.unread, 0);
+  assert.equal(conversation.reminder, false);
+  assert.equal((await manage(c, { op: "channel.create", name: "conversation-channel" })).status, 200);
+  await c.env.human().request("channel_add", { channel: "conversation-channel", name: a.session.name });
+  await a.client.request("channel_send", { channel: "conversation-channel", text: "channel activity" });
+  list = await conversations(c);
+  assert.equal(list.find((entry) => entry.key === "ch:conversation-channel")!.unread, 1);
+  assert.equal((await manage(c, { op: "read.mark", scope: { scope: "channel", channel: "conversation-channel" }, state: "read" })).status, 200);
+  assert.equal((await conversations(c)).find((entry) => entry.key === "ch:conversation-channel")!.unread, 0);
+  assert.equal((await manage(c, { op: "session.close", id: a.session.id, terminate: false })).status, 200);
+  assert.equal((await manage(c, { op: "session.close", id: empty.session.id, terminate: false })).status, 200);
+  list = await conversations(c);
+  assert.equal(list.find((entry) => entry.key === conversation.key)!.archived, true);
+  assert.ok(!list.some((entry) => entry.key === `s:${empty.session.id}`));
+});
+
+test("session send options deliver actual control messages and invalid channel or option payloads fail", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const a = await c.env.adapter("omp", "control-options", "control-options");
+  const target = { kind: "session", id: a.session.id };
+  const options = { kind: "control", action: "pause", thread: "city-control", done: true };
+  const reply = await http(c.base + "/api/send", { method: "POST", headers: c.headers, body: JSON.stringify({ target, text: "pause now", options }) });
+  assert.equal(reply.status, 200);
+  const delivery = await a.nextDelivery();
+  assert.equal(delivery.msg.kind, "control");
+  assert.equal(delivery.msg.action, "pause");
+  assert.equal(delivery.msg.thread, "city-control");
+  assert.equal(delivery.msg.done, true);
+  for (const invalid of [
+    null, [], { kind: "unknown" }, { action: "pause" }, { kind: "chat", action: "pause" },
+    { kind: "control", action: "stop" }, { thread: "x".repeat(201) }, { replyTo: 1 }, { done: "yes" }, { reset: "compact" },
+  ]) {
+    assert.equal((await http(c.base + "/api/send", { method: "POST", headers: c.headers, body: JSON.stringify({ target, text: "invalid", options: invalid }) })).status, 400);
+  }
+  assert.equal((await http(c.base + "/api/send", {
+    method: "POST", headers: c.headers, body: JSON.stringify({ target: { kind: "channel", name: "options" }, text: "invalid", options: {} }),
+  })).status, 400);
+  assert.equal(a.deliveries.length, 1);
+});
+
+test("held management releases and drops real agent messages", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const a = await c.env.adapter("omp", "held-target-city", "held-target");
+  const sender = await c.env.adapter("omp", "held-sender-city", "held-sender");
+  await c.env.human().request("set_inbound", { name: a.session.name, mode: "hold" });
+  const releaseId = ((await sender.client.request("send", { to: a.session.name, text: "release me" })).results as SendResult[])[0].msgId!;
+  const dropId = ((await sender.client.request("send", { to: a.session.name, text: "drop me" })).results as SendResult[])[0].msgId!;
+  const held = await http(c.base + "/api/held", { headers: c.headers });
+  assert.equal(held.status, 200);
+  const result: { messages: StoredMessage[] } = JSON.parse(held.body);
+  const messages = result.messages;
+  assert.deepEqual(messages.map((message) => [message.id, message.status]), [[releaseId, "held"], [dropId, "held"]]);
+  assert.equal((await manage(c, { op: "held.release", msgId: releaseId })).status, 200);
+  assert.equal((await a.nextDelivery()).msg.id, releaseId);
+  assert.equal((await manage(c, { op: "held.drop", msgId: dropId })).status, 200);
+  assert.deepEqual(JSON.parse((await http(c.base + "/api/held", { headers: c.headers })).body).messages, []);
+  const history = await c.env.human().historyPage({ scope: "session", sessionId: a.session.id });
+  assert.equal(history.messages.find((message) => message.id === releaseId)!.status, "delivered");
+  assert.equal(history.messages.find((message) => message.id === dropId)!.status, "dropped");
+});
+
+test("membership, replacement, stale closure and purging use stable session identities", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const a = await c.env.adapter("omp", "membership-city-a", "membership-a");
+  const b = await c.env.adapter("omp", "membership-city-b", "membership-b");
+  const s = await stream(c.base + `/api/events?token=${c.token}`);
+  t.after(() => s.close());
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.characters.some((ch) => ch.id === b.session.id)));
+  assert.equal((await manage(c, { op: "channel.create", name: "members" })).status, 200);
+  assert.equal((await manage(c, { op: "channel.add", name: "members", id: a.session.id })).status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.venues.some((venue) => venue.name === "members" && venue.rosterIds.includes(a.session.id))));
+  assert.equal((await manage(c, { op: "channel.remove", name: "members", id: a.session.id })).status, 200);
+  assert.deepEqual((await c.env.human().request("channel_members", { channel: "members" })).members, []);
+  assert.equal((await manage(c, { op: "channel.add", name: "members", id: a.session.id })).status, 200);
+  assert.equal((await manage(c, { op: "session.role", id: a.session.id, role: "worker" })).status, 200);
+  assert.equal((await manage(c, { op: "session.replace", fromId: a.session.id, toId: b.session.id })).status, 200);
+  const listed = (await c.env.human().request("list")).sessions as ListedSession[];
+  assert.ok(!listed.some((session) => session.id === a.session.id));
+  assert.equal(listed.find((session) => session.id === b.session.id)!.role, "worker");
+  assert.deepEqual(listed.find((session) => session.id === b.session.id)!.channels, ["members"]);
+  assert.equal((await manage(c, { op: "session.purge", id: a.session.id })).status, 200);
+  b.client.close();
+  for (let turn = 0; turn < 2000; turn++) {
+    const sessions = (await c.env.human().request("list")).sessions as ListedSession[];
+    if (sessions.some((session) => session.id === b.session.id && session.stale)) break;
+    await nextTurn();
+  }
+  const stale = (await c.env.human().request("list")).sessions as ListedSession[];
+  assert.equal(stale.find((session) => session.id === b.session.id)!.stale, true);
+  const closed = await manage(c, { op: "session.closeStale" });
+  assert.equal(closed.status, 200);
+  assert.equal(JSON.parse(closed.body).closed, 1);
+  assert.equal((await manage(c, { op: "session.purge", all: true })).status, 200);
+  assert.deepEqual((await c.env.human().sync()).sessions, []);
 });
 
 test("server close terminates open SSE streams", { timeout: 10_000 }, async (t) => {
