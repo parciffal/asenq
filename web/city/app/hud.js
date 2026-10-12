@@ -634,7 +634,8 @@ export class CityHud {
         const character = item.scope.scope === "session" ? state.charactersById.get(item.scope.sessionId) : null;
         if (item.archived) head.append(element("span", "kind-tag", "ARCHIVED"));
         else if (character) head.append(element("span", "roster-meta", `${shortHarness(character.harness)} · ${this.stateLabel(character)}`));
-        row.append(head, element("div", "conversation-preview", item.preview?.text ?? "No preview"));
+        row.append(head);
+        if (item.preview?.text) row.append(element("div", "conversation-preview", item.preview.text));
         this.sideBody.append(row);
       }
       if (!entries.length) this.sideBody.append(element("p", "detail-value", "No conversations match."));
@@ -1008,9 +1009,8 @@ export class CityHud {
     global.append(element("div", "manage-hint", "CREATE CHANNEL · lowercase letters, digits, - and _"), name,
       button("CREATE CHANNEL", "", () => this.runManage("channel.create", { name: name.value })));
     const stale = [...state.charactersById.values()].filter((c) => c.source === "registered" && c.stale === true).length;
-    const archived = state.conversations.filter((item) => item.archived && item.key.startsWith("s:")).length;
     global.append(this.confirmButton("close-stale", `CLOSE ALL STALE (${stale})`, "CONFIRM CLOSE STALE", () => this.runManage("session.closeStale", {})),
-      this.confirmButton("purge-all", `PURGE ALL ARCHIVED (${archived})`, "CONFIRM PURGE ALL", () => this.runManage("session.purge", { all: true })));
+      this.confirmButton("purge-all", "PURGE ALL ARCHIVED", "CONFIRM PURGE ALL", () => this.runManage("session.purge", { all: true })));
     this.sideBody.append(global);
   }
 

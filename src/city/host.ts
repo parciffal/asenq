@@ -195,8 +195,18 @@ export class CityHost {
       case "read.mark": {
         if (operation.state === "unread") return { state: (await client.markUnread(operation.scope)).state };
         const state = await client.readState(operation.scope);
-        const page = await client.historyPage({ ...operation.scope, limit: 1 });
-        const through = page.messages.reduce((order, message) => Math.max(order, message.order), 0);
+        let through = 0;
+        let before: number | undefined;
+        // The daemon accepts only messages sent to the human as read markers: DMs addressed to it, or posts by others in a channel.
+        const incoming = operation.scope.scope === "session"
+          ? (message: { from: string; to: string }) => message.to === "human"
+          : (message: { from: string; to: string }) => message.from !== "human";
+        for (;;) {
+          const page = await client.historyPage({ ...operation.scope, limit: 200, ...(before === undefined ? {} : { before }) });
+          through = page.messages.reduce((order, message) => incoming(message) ? Math.max(order, message.order) : order, 0);
+          if (through > 0 || !page.hasMore || page.messages.length === 0) break;
+          before = page.messages[0].order;
+        }
         return { state: (await client.markRead(operation.scope, through, state.version)).state };
       }
     }

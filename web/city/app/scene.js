@@ -504,9 +504,10 @@ export class CityScene extends Phaser.Scene {
     const signature = `${label}:${border}:${count}:${subtitle}:${zoom}`;
     if (signature === plate.signature) return;
     plate.signature = signature;
-    plate.text.setResolution(zoom).setText(label);
-    plate.subtitle.setResolution(zoom).setText(subtitle).setVisible(Boolean(subtitle));
-    plate.unread.setResolution(zoom).setText(count > 0 ? String(count) : "").setVisible(count > 0);
+    const inverse = 1 / zoom;
+    plate.text.setResolution(zoom).setText(label).setScale(inverse);
+    plate.subtitle.setResolution(zoom).setText(subtitle).setVisible(Boolean(subtitle)).setScale(inverse);
+    plate.unread.setResolution(zoom).setText(count > 0 ? String(count) : "").setVisible(count > 0).setScale(inverse);
     const width = Math.ceil(Math.max(plate.text.width, plate.subtitle.width)) + 8;
     const height = Math.ceil(plate.text.height + (subtitle ? plate.subtitle.height : 0)) + 4;
     const left = plate.decorative ? 0 : -Math.floor(width / 2);

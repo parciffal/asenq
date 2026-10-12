@@ -131,7 +131,7 @@ button:disabled { opacity: .45; cursor: default; }
 .chat-heading { flex: 1; min-width: 0; overflow-wrap: anywhere; font-family: "Share Tech Mono", monospace; font-size: 16px; margin: 0; }
 .thread-state { color: #a99591; font-size: 11px; overflow-wrap: anywhere; flex: none; }
 .chat-messages { flex: 1 1 0; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 3px 2px; overscroll-behavior: contain; }
-.chat-message { flex: none; max-width: 94%; padding: 7px; border-left: 2px solid var(--red); background: rgba(40, 16, 24, .55); overflow-wrap: anywhere; }
+.chat-message { flex: none; min-width: 62%; max-width: 94%; padding: 7px; border-left: 2px solid var(--red); background: rgba(40, 16, 24, .55); overflow-wrap: anywhere; }
 .chat-message.incoming { align-self: flex-start; }
 .chat-message.outgoing { align-self: flex-end; border-left: 0; border-right: 2px solid var(--cyan); background: rgba(85, 206, 209, .08); }
 .chat-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; color: #ae8889; font-size: 11px; }

@@ -493,6 +493,11 @@ test("conversations expose live and archived activity and read management broadc
   assert.equal(list.find((entry) => entry.key === "ch:conversation-channel")!.unread, 1);
   assert.equal((await manage(c, { op: "read.mark", scope: { scope: "channel", channel: "conversation-channel" }, state: "read" })).status, 200);
   assert.equal((await conversations(c)).find((entry) => entry.key === "ch:conversation-channel")!.unread, 0);
+  // A thread whose newest message is the human's own must still mark read.
+  await c.env.human().request("channel_send", { channel: "conversation-channel", text: "operator follow-up" });
+  await c.env.human().request("send", { toSessionId: a.session.id, text: "operator dm" });
+  assert.equal((await manage(c, { op: "read.mark", scope: { scope: "channel", channel: "conversation-channel" }, state: "read" })).status, 200);
+  assert.equal((await manage(c, { op: "read.mark", scope, state: "read" })).status, 200);
   assert.equal((await manage(c, { op: "session.close", id: a.session.id, terminate: false })).status, 200);
   assert.equal((await manage(c, { op: "session.close", id: empty.session.id, terminate: false })).status, 200);
   list = await conversations(c);
