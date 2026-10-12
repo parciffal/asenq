@@ -252,6 +252,7 @@ asenq channel members <ch>
 asenq channel read <ch> [--limit n] | asenq channel send <ch> <text…>
 asenq tui [--reduced-motion]
 asenq viz [--reduced-motion]
+asenq city [--port n] [--no-open] [--reduced-motion]
 asenq daemon run|start|stop|status
 asenq setup [--remove]
 asenq doctor
@@ -343,6 +344,24 @@ Use `$ASENQ_HOME/viz.json` (by default `~/.asenq/viz.json`), separate from daemo
 Outfits: `claude`, `codex`, `gemini`, `qwen`, `llama`, `mistral`, `neutral`. Session mappings override harness mappings; detected processes use only harness mappings. A `claude` harness mapping is a chosen costume, not evidence of a model. Settings are read once at startup; invalid values are skipped with a visible warning. `asenq tui --reduced-motion` and `asenq viz --reduced-motion` force reduced motion regardless of the file: no walking or blinking, static busy/send poses.
 
 **Limits.** Placement reservations live only for this map instance, not across application restarts. Channels have name-only wire identity: an observed rename retains frontage/appearance, but a pruned reconnect replay shows **HISTORY GAP** and cannot reconstruct missed rename identity; new names receive new frontages without guessing. Codex has no asenq registration adapter and appears only as an unregistered detected process. Process scanning is a macOS/Linux controlling-TTY heuristic: it matches harness session IDs in command lines and shows newest surplus processes over registered sessions; helpers can be misclassified, and CPU is not reported agent state. Process/human targets have no session conversation. This is cell art, not photographic raster rendering; terminal graphics protocols would be a separate optional approach.
+
+### `asenq city`: browser pixel map
+
+`asenq city` opens a pixel-art city in your browser, with furnished buildings for real channels, characters for sessions, and packets for observed messages. The inspector shows session state, memberships and outfit mappings; search and the Sessions/Channels tables help you find targets. The terminal `asenq viz` command and the TUI **Map** tab remain available.
+
+```sh
+asenq city                         # choose a free port and open the browser
+asenq city --no-open --port 8787    # print the URL without opening it
+asenq city --reduced-motion        # static character poses; no walking or rain
+```
+
+`--port` accepts an integer from 0 to 65535; 0 is the default and asks the OS for a free port. `--no-open` leaves browser launch to you. Reduced motion also follows `$ASENQ_HOME/viz.json`, along with the same explicit outfit mappings used by the terminal city. Press Ctrl+C in the command's terminal to close the listener and its event streams.
+
+Select a channel or registered session and press Enter to open its transcript. The composer sends channel posts or session DMs **as the human**; Enter sends and Shift+Enter adds a newline. A human post can create a channel implicitly. Viewing transcripts here never calls `mark_read` or advances the TUI's shared human read markers. Detected processes and the operator have no session transcript or send target.
+
+The listener binds only to `127.0.0.1`. Open the full printed URL, including its `#token=...` fragment, and keep it private: the token authorizes viewing and sending as you. Host and Origin checks protect the local HTTP endpoints, but this is a tool for a trusted same-user environment, not a public server or a sandbox against hostile local processes. Do not expose it through a proxy or share the token URL.
+
+The package includes `web/city/` with the browser modules, vendored Phaser and assets. The command serves those files locally without a separate web build or CDN. Its daemon client must use the same protocol revision as the running daemon (currently **18**); a mixed-version deployment will not connect. The browser command does not bypass the protocol handshake or restart the daemon to resolve a mismatch.
 
 ## Upgrading
 
