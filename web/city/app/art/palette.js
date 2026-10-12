@@ -1,0 +1,23 @@
+// Shared with the terminal city: warm black, red architecture, cyan infrastructure.
+export const PAL = Object.freeze({
+  void: "#100609",
+  grid: "#281018",
+  border: "#a52b3a",
+  white: "#e8dec8",
+  cyan: "#55ced1",
+  yellow: "#f4e45a",
+  alert: "#ff4355",
+  ghost: "#70636a",
+  orange: "#dba566",
+  green: "#86bd9d",
+  magenta: "#a98bb7",
+  wall: "#1b1018",
+  panel: "#3b1d28",
+  steel: "#384049",
+  steelLight: "#63636a",
+  glass: "#16383e",
+  cyanDark: "#28595e",
+  redDark: "#642532",
+  road: "#18151d",
+  sidewalk: "#302b33",
+});
