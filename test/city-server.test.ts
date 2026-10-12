@@ -178,9 +178,19 @@ test("send validates Origin, JSON, targets and body limit and preserves daemon e
     assert.equal((await http(c.base + "/api/send", { method: "POST", headers: c.headers, body: invalid })).status, 400);
   }
   assert.equal((await http(c.base + "/api/send", { method: "POST", headers: c.headers, body: "x".repeat(1024 * 1024 + 1) })).status, 413);
-  const missingChannel = await http(c.base + "/api/send", { method: "POST", headers: c.headers, body });
-  assert.equal(missingChannel.status, 404);
-  assert.equal(JSON.parse(missingChannel.body).error, "unknown_channel");
+  assert.ok(!c.host.current().venues.some((venue) => venue.name === "missing"));
+  const createdChannel = await http(c.base + "/api/send", { method: "POST", headers: c.headers, body });
+  assert.equal(createdChannel.status, 200, "the human can implicitly create a channel by posting");
+  const createdReply = JSON.parse(createdChannel.body) as ChannelSendResult;
+  assert.ok(createdReply.msgId);
+  const createdHistory = await http(c.base + "/api/history?scope=channel&channel=missing", { headers: c.headers });
+  assert.equal(createdHistory.status, 200);
+  const createdPost = (JSON.parse(createdHistory.body) as HistoryPage).messages.find((message) => message.id === createdReply.msgId);
+  assert.ok(createdPost);
+  assert.equal(createdPost.text, "hi");
+  assert.equal(createdPost.from, "human");
+  assert.equal(createdPost.channel, "missing");
+  assert.equal(createdPost.status, "posted");
   const missingSession = await http(c.base + "/api/send", { method: "POST", headers: c.headers, body: JSON.stringify({ target: { kind: "session", id: "missing" }, text: "hi" }) });
   assert.equal(missingSession.status, 404);
   assert.equal(JSON.parse(missingSession.body).error, "unknown_target");
