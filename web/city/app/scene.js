@@ -14,7 +14,7 @@ const HARNESS_FILTERS = [null, "claude", "omp", "opencode", "codex"];
 const PACKET_COLORS = { chat: COLORS.cream, task: COLORS.cyan, result: COLORS.yellow, status: 0xbdb1a4, control: COLORS.alert };
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const keyOf = (target) => target ? targetKey(target) : null;
-const isTextEntry = (target) => target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
+const isTextEntry = (target) => target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT" || target?.isContentEditable;
 
 export class CityScene extends Phaser.Scene {
   constructor(store, hud) {
