@@ -1,4 +1,4 @@
-import type { Harness, Kind, PingStatus, Role } from "../shared/protocol.js";
+import type { Harness, Inbound, Kind, PingStatus, Role } from "../shared/protocol.js";
 import type { TerminalFrame } from "../tui/terminal.js";
 import type { Appearance } from "./appearance.js";
 import type { CharacterAnimator } from "./animate.js";
@@ -24,6 +24,8 @@ export type CityCharacter = {
   memberships: string[];
   lastSeen: number | null;
   pid?: number;
+  inbound?: Inbound;
+  ownerPid?: number;
 };
 export type VenueAppearance = "office" | "bar" | "garage" | "arcade" | "communications";
 export type CityVenue = {
