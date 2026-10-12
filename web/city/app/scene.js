@@ -109,8 +109,10 @@ export class CityScene extends Phaser.Scene {
     }
     if (!this.characterReady || !state.wire) return;
     this.drawScene(state);
-    if (state.ui.tab === "map") this.scene.resume();
-    else this.scene.pause();
+    const paused = this.scene.isPaused();
+    if (state.ui.tab === "map") {
+      if (paused) this.scene.resume();
+    } else if (this.scene.isActive() && !paused) this.scene.pause();
   }
 
   applyWire(state) {
@@ -133,9 +135,29 @@ export class CityScene extends Phaser.Scene {
       }
     }
     this.applyOfflineEffect(offline);
-    if (initial) this.mainCamera.centerOn((wire.layout.bounds.x + wire.layout.bounds.width / 2) * 8,
-      (wire.layout.bounds.y + wire.layout.bounds.height / 2) * 8);
+    if (initial) this.centerInitialView(state);
   }
+  centerInitialView(state) {
+    let first = null;
+    let second = null;
+    for (const venue of state.wire.layout.venues) {
+      if (!first || venue.rect.x < first.rect.x) {
+        second = first;
+        first = venue;
+      } else if (!second || venue.rect.x < second.rect.x) second = venue;
+    }
+    if (first) {
+      const last = second ?? first;
+      const left = first.rect.x * 8;
+      const right = (last.rect.x + last.rect.width) * 8;
+      this.mainCamera.centerOn((left + right) / 2, 0);
+      return;
+    }
+    const operator = state.wire.layout.characters.find((item) => state.charactersById.get(item.id)?.source === "human");
+    if (operator) this.mainCamera.centerOn((operator.rect.x + operator.rect.width / 2) * 8,
+      (operator.rect.y + operator.rect.height / 2) * 8);
+  }
+
 
   startWalks(moves, previousWire, nextWire) {
     const now = performance.now();
@@ -457,7 +479,7 @@ export class CityScene extends Phaser.Scene {
 
   handlePacket(packet) {
     const state = this.store.snapshot();
-    if (!this.characterReady || !state.wire || state.ui.tab !== "map" || document.visibilityState !== "visible" || state.wire.connection !== "connected") return;
+    if (!this.packetGraphics || !state.wire || state.ui.tab !== "map" || document.visibilityState !== "visible" || state.wire.connection !== "connected") return;
     const now = performance.now();
     const lengthPx = packet.path.length * 8;
     const duration = clamp(lengthPx / 480 * 1000, 800, 3000);
@@ -494,8 +516,10 @@ export class CityScene extends Phaser.Scene {
   updateFollow(delta) {
     const state = this.state;
     if (!state.ui.follow || !state.ui.selected) return;
-    const target = state.targetsByKey.get(targetKey(state.ui.selected));
-    if (!target) return;
+    const selected = state.ui.selected;
+    const followTarget = state.ui.follow === "session" && selected.kind === "membership"
+      ? { kind: "character", id: selected.id } : selected;
+    const target = state.targetsByKey.get(targetKey(followTarget));
     if (state.ui.follow === "traffic") {
       const selected = state.ui.selected;
       let recent = null;

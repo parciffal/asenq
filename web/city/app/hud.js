@@ -31,6 +31,7 @@ export class CityHud {
     this.scene = null;
     this.searchIndex = 0;
     this.composerDraft = "";
+    this.composerStatus = { text: "", error: false };
     this.historyRequest = 0;
     this.transcriptGeneration = 0;
     this.transcriptScopeKey = null;
@@ -467,6 +468,7 @@ export class CityHud {
     }
     const currentScopeKey = scope.scope === "channel" ? `channel:${scope.channel}` : `session:${scope.sessionId}`;
     const sameScope = this.transcriptScopeKey === currentScopeKey;
+    if (!sameScope) this.composerStatus = { text: "", error: false };
     const previousMessages = sameScope ? this.transcript.querySelector(".transcript-messages") : null;
     const previousTop = previousMessages?.scrollTop ?? 0;
     const previousHeight = previousMessages?.scrollHeight ?? 0;
@@ -495,11 +497,6 @@ export class CityHud {
     if (state.transcript.error) messages.append(element("div", "composer-result error", state.transcript.error));
     this.transcript.append(messages);
     const composer = element("form", "transcript-composer");
-    if (previousMessages) {
-      if (prepended) messages.scrollTop = previousTop + Math.max(0, messages.scrollHeight - previousHeight);
-      else if (wasAtBottom) messages.scrollTop = messages.scrollHeight;
-      else messages.scrollTop = Math.min(previousTop, messages.scrollHeight);
-    } else if (history.length) messages.scrollTop = messages.scrollHeight;
     this.transcriptScopeKey = currentScopeKey;
     this.transcriptFirstOrder = firstOrder;
     this.transcriptCount = history.length;
@@ -519,13 +516,21 @@ export class CityHud {
       }
     });
     const actions = element("div", "composer-actions");
-    this.composerResult = element("span", "composer-result");
+    this.composerResult = element("span", this.composerStatus.error ? "composer-result error" : "composer-result", this.composerStatus.text);
     const submit = button("SEND", "", () => this.submitMessage(scope));
     actions.append(this.composerResult, submit);
     composer.append(this.composer, actions);
     composer.addEventListener("submit", (event) => { event.preventDefault(); this.submitMessage(scope); });
     this.transcript.append(composer);
     this.transcript.append(element("div", "transcript-note", "Viewing here does not mark messages read."));
+    requestAnimationFrame(() => {
+      if (!messages.isConnected) return;
+      if (previousMessages) {
+        if (prepended) messages.scrollTop = previousTop + Math.max(0, messages.scrollHeight - previousHeight);
+        else if (wasAtBottom) messages.scrollTop = messages.scrollHeight;
+        else messages.scrollTop = Math.min(previousTop, messages.scrollHeight);
+      } else if (history.length) messages.scrollTop = messages.scrollHeight;
+    });
     if (activeComposer) {
       this.composer.focus();
       this.composer.setSelectionRange(...selection);
@@ -550,7 +555,7 @@ export class CityHud {
     if (!text.trim()) return;
     const generation = this.transcriptGeneration;
     const target = scope.scope === "channel" ? { kind: "channel", name: scope.channel } : { kind: "session", id: scope.sessionId };
-    if (this.composerResult) { this.composerResult.className = "composer-result"; this.composerResult.textContent = "SENDING…"; }
+    this.setComposerStatus("SENDING…");
     try {
       const reply = await this.api.send(target, text);
       const result = sendResult(reply);
@@ -560,17 +565,21 @@ export class CityHud {
       }
       this.composerDraft = "";
       if (this.composer) this.composer.value = "";
-      if (this.composerResult) this.composerResult.textContent = result;
+      this.setComposerStatus(result);
       this.showToast(result, false);
       await this.loadHistory(scope, undefined, false);
     } catch (error) {
-      if (generation === this.transcriptGeneration && this.composerResult) {
-        this.composerResult.className = "composer-result error";
-        this.composerResult.textContent = error.message;
-      }
+      if (generation === this.transcriptGeneration) this.setComposerStatus(error.message, true);
       this.showToast(error.message, true);
     }
   }
+  setComposerStatus(text, error = false) {
+    this.composerStatus = { text, error };
+    if (!this.composerResult) return;
+    this.composerResult.className = error ? "composer-result error" : "composer-result";
+    this.composerResult.textContent = text;
+  }
+
 
   showToast(message, isError) {
     this.toast.textContent = message;

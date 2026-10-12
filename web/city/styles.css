@@ -135,17 +135,30 @@ button:disabled { opacity: .45; cursor: default; }
 .fatal-error { position: absolute; z-index: 40; inset: 15% 10%; padding: 24px; border: 1px solid var(--alert); background: rgba(16, 6, 9, .96); color: var(--alert); }
 
 @media (max-width: 1100px) {
-  #app { grid-template-columns: minmax(0, 1fr); grid-template-rows: 48px minmax(0, 1fr) 128px 32px; grid-template-areas: "top" "city" "feed" "foot"; }
-  #side-panel { position: absolute; z-index: 25; top: 58px; right: 6px; bottom: 43px; width: min(360px, calc(100vw - 24px)); display: none; background: rgba(16, 6, 9, .98); }
+  #app { grid-template-columns: minmax(0, 1fr); grid-template-rows: 64px minmax(0, 1fr) 128px 32px; grid-template-areas: "top" "city" "feed" "foot"; }
+  #topbar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 30px 20px;
+    grid-template-areas: "brand nav" "status status";
+    align-content: center;
+    column-gap: 14px;
+    row-gap: 2px;
+    padding: 3px 12px;
+  }
+  .brand { grid-area: brand; }
+  .nav-tabs { grid-area: nav; justify-content: flex-start; }
+  .top-status { grid-area: status; justify-content: flex-start; gap: 12px; margin-left: 0; }
+  #side-panel { position: absolute; z-index: 25; top: 74px; right: 6px; bottom: 43px; width: min(360px, calc(100vw - 24px)); display: none; background: rgba(16, 6, 9, .98); }
   #app.drawer-open #side-panel { display: flex; }
   #drawer-toggle { display: block; }
   #drawer-toggle[hidden] { display: none; }
-  #transcript { top: 58px; right: 6px; bottom: 43px; width: min(440px, calc(100vw - 24px)); }
+  #transcript { top: 74px; right: 6px; bottom: 43px; width: min(440px, calc(100vw - 24px)); }
   .city-overview { display: none; }
 }
 @media (max-width: 640px) {
   #app { padding: 4px; gap: 4px; grid-template-rows: 46px minmax(0, 1fr) 48px 38px; }
-  #topbar { gap: 5px; padding: 0 7px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; scrollbar-color: var(--red) var(--burgundy); }
+  #topbar { display: flex; gap: 5px; padding: 0 7px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; scrollbar-color: var(--red) var(--burgundy); }
   .brand { font-size: 12px; }
   .brand small { display: none; }
   .nav-tabs { flex: 0 0 auto; gap: 0; }

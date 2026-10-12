@@ -83,7 +83,18 @@ export class CityStore extends EventTarget {
   }
 
   setFilter(filter) { this.ui.filter = filter; this.emit(); }
-  setShowProcesses(show) { this.ui.showProcesses = show; this.emit(); }
+  setShowProcesses(show) {
+    this.ui.showProcesses = show;
+    if (!show && this.ui.selected) {
+      const character = this.ui.selected.kind === "venue" ? null : this.charactersById.get(this.ui.selected.id);
+      if (character?.source === "process") {
+        this.ui.selected = null;
+        this.ui.inspectorOpen = false;
+        this.ui.follow = false;
+      }
+    }
+    this.emit();
+  }
   setFocus(focus) { this.ui.focus = focus; this.emit(); }
   setFollow(follow) { if (this.ui.follow === follow) return; this.ui.follow = follow; this.emit(); }
   setTab(tab) { this.ui.tab = tab; this.emit(); }

@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 // The browser stays uncompiled, so this runtime URL reaches the shipped web/ tree from dist/test.
 const city = await import(new URL("../../web/city/app/logic.js", import.meta.url).href);
+const { CityStore } = await import(new URL("../../web/city/app/store.js", import.meta.url).href);
 
 type Character = {
   id: string; name: string; previousNames: string[]; source: "registered" | "process" | "human";
@@ -91,6 +92,35 @@ test("search matches sanitized current and former names plus channel names", () 
   };
   assert.deepEqual(city.search(state, "old-name"), [target]);
   assert.deepEqual(city.search(state, "design"), [venueTarget]);
+});
+
+test("search distinguishes long names that share their truncated display prefix", () => {
+  const first = character({ id: "first", name: "1234567890123456A-worker" });
+  const second = character({ id: "second", name: "1234567890123456B-worker" });
+  const firstTarget = { kind: "character", id: first.id };
+  const secondTarget = { kind: "character", id: second.id };
+  const state = {
+    characters: [first, second],
+    layout: { targets: [{ target: firstTarget, order: 0 }, { target: secondTarget, order: 1 }] },
+  };
+  assert.deepEqual(city.search(state, first.name), [firstTarget]);
+  assert.deepEqual(city.search(state, "1234567890123456A"), [firstTarget]);
+});
+
+test("hiding processes clears a selected process and its follow state", () => {
+  const store = new CityStore();
+  const process = character({ id: "process:42", source: "process" });
+  const target = { kind: "character", id: process.id };
+  store.setState({
+    connection: "connected", characters: [process], venues: [], feed: [],
+    layout: { targets: [{ target, order: 0 }], routes: {} },
+  });
+  store.setSelected(target);
+  store.setFollow("traffic");
+  store.setShowProcesses(false);
+  assert.equal(store.ui.selected, null);
+  assert.equal(store.ui.inspectorOpen, false);
+  assert.equal(store.ui.follow, false);
 });
 
 test("transcript scopes use channel names and registered identities only", () => {
