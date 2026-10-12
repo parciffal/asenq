@@ -110,6 +110,8 @@ export type CityLayout = {
   bounds: Rect;
   moved: { id: string; from: Point; to: Point }[];
 };
+export type CityPacket = { seq: number; from: CityTarget; to: CityTarget; kind: Kind; path: RoutePath; senderId: string };
+export type CityView = { world: World; layout: CityLayout; appearances: ReadonlyMap<string, Appearance>; notice: string | null };
 export type Viewport = { x: number; y: number; zoom: 1 | 2 | 4 };
 export type VizUi = {
   selected: CityTarget | null;

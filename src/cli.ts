@@ -35,6 +35,7 @@ const USAGE = `usage: asenq <command>
   setup [--remove]
   tui [--reduced-motion]                interactive human messaging console
   viz [--reduced-motion]                live cyberpunk city map of channels and sessions
+  city [--port n] [--no-open] [--reduced-motion]  pixel city map in the browser (localhost)
   doctor`;
 
 async function main(argv: string[]): Promise<number> {
@@ -74,6 +75,11 @@ async function main(argv: string[]): Promise<number> {
     // Lazy for the same reason as `tui`: no terminal renderer may load on hook/MCP paths.
     const { runViz } = await import("./viz/app.js");
     return runViz(argv.slice(1));
+  }
+  if (cmd === "city") {
+    // Keep the browser host and terminal map dependencies off hook/MCP paths.
+    const { runCity } = await import("./city/command.js");
+    return runCity(argv.slice(1));
   }
   const { runCommand } = await import("./cli/commands.js");
   return runCommand(cmd, argv.slice(1), USAGE);
