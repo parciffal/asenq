@@ -391,7 +391,7 @@ export class CityHud {
   openSearch() {
     this.searchIndex = 0;
     this.store.openSearch();
-    queueMicrotask(() => this.searchInput.focus());
+    this.searchInput.focus();
   }
 
   closeSearch() { this.searchInput.blur(); this.store.closeSearch(); }
