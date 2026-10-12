@@ -47,7 +47,13 @@ async function main() {
     packet: (packet) => scene.handlePacket(packet),
     message: (data) => hud.handleMessage(data),
     read: (data) => hud.handleRead(data),
-    connection: (open) => store.setConnectionState(open ? "open" : "reconnecting"),
+    connection: (open) => {
+      store.setConnectionState(open ? "open" : "reconnecting");
+      if (open) {
+        hud.refreshConversations();
+        if (store.ui.chat) hud.loadHistory(store.ui.chat);
+      }
+    },
   });
   hud.refreshConversations();
   const close = () => {
