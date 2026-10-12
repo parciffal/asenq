@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -175,9 +175,54 @@ function hsv([r, g, b]) {
   return { hue, sat: max === 0 ? 0 : delta / max, val: max / 255 };
 }
 
-function deriveVariant(sheet, frames, outfit, variant) {
+function headBounds(grid, profile) {
+  if (!profile.followHead) return { top: 0, bottom: profile.headRows };
+  // Fitted web figures can begin below row 18. Follow their central silhouette,
+  // ignoring outstretched hands, and scale the head span with the figure height.
+  let top = grid.findIndex((row) => row.slice(Math.floor(profile.width / 4), Math.ceil(profile.width * 3 / 4)).some((pixel) => pixel !== "."));
+  if (top < 0) top = 0;
+  return { top, bottom: Math.min(profile.height, top + Math.min(profile.headRows, Math.ceil((profile.height - top) / 4))) };
+}
+
+function neutralWeb(variant, recolored) {
+  const frames = Object.fromEntries(poses.map((pose) => [pose, variant.frames[pose].split("\n").map((row) => [...row])]));
+  const keep = new Set();
+  for (const grid of Object.values(frames)) {
+    const { top, bottom } = headBounds(grid, config.web);
+    for (let y = top; y < bottom; y++) for (const pixel of grid[y]) if (pixel !== ".") keep.add(variant.palette[parseInt(pixel, 12)]);
+  }
+  // Preserve source head/skin colors and reserve at least one neutral garment
+  // shade. Quantize rare overflow colors within the 12-color browser contract.
+  variant.palette.forEach((color, i) => { if (color === recolored[i]) keep.add(color); });
+  const shades = new Map();
+  for (const grid of Object.values(frames)) for (const row of grid) for (const pixel of row) if (pixel !== ".") {
+    const color = recolored[parseInt(pixel, 12)];
+    if (!keep.has(color)) shades.set(color, (shades.get(color) ?? 0) + 1);
+  }
+  const neutral = [...shades].sort(([a, n], [b, m]) => m - n || (a < b ? -1 : a > b ? 1 : 0)).map(([color]) => color);
+  const palette = [...[...keep].slice(0, config.paletteSize - (neutral.length ? 1 : 0)), ...neutral].slice(0, config.paletteSize);
+  const rgb = (hex) => [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16));
+  const colors = palette.map(rgb);
+  const indexOf = (hex) => {
+    const exact = palette.indexOf(hex);
+    if (exact >= 0) return exact.toString(12);
+    const source = rgb(hex);
+    let best = 0, distance = Infinity;
+    for (const [i, color] of colors.entries()) {
+      const d = color.reduce((sum, channel, j) => sum + (channel - source[j]) ** 2, 0);
+      if (d < distance) { best = i; distance = d; }
+    }
+    return best.toString(12);
+  };
+  return { palette, frames: Object.fromEntries(poses.map((pose) => {
+    const grid = frames[pose], { top, bottom } = headBounds(grid, config.web);
+    return [pose, grid.map((row, y) => row.map((pixel) => pixel === "." ? "." : indexOf((y >= top && y < bottom ? variant.palette : recolored)[parseInt(pixel, 12)])).join("")).join("\n")];
+  })) };
+}
+
+function deriveVariant(sheet, frames, outfit, variant, profile) {
   const boxes = frames.map((f) => bbox(f, sheet.width));
-  const initialScale = config.baseline / boxes[0].height;
+  const initialScale = profile.baseline / boxes[0].height;
   const torsoCenters = frames.map((frame, frameIndex) => {
     const box = boxes[frameIndex];
     let torsoX = 0, torsoCount = 0;
@@ -192,9 +237,9 @@ function deriveVariant(sheet, frames, outfit, variant) {
     let lost = 0;
     const box = boxes[frameIndex], torso = torsoCenters[frameIndex];
     for (const p of frame) {
-      const x0 = config.anchorX + (p % sheet.width - torso) * scale;
-      const y0 = config.baseline + 1 + (Math.floor(p / sheet.width) - box.bottom - 1) * scale;
-      const inside = Math.max(0, Math.min(config.width, x0 + scale) - Math.max(0, x0)) * Math.max(0, Math.min(config.height, y0 + scale) - Math.max(0, y0));
+      const x0 = profile.anchorX + (p % sheet.width - torso) * scale;
+      const y0 = profile.baseline + 1 + (Math.floor(p / sheet.width) - box.bottom - 1) * scale;
+      const inside = Math.max(0, Math.min(profile.width, x0 + scale) - Math.max(0, x0)) * Math.max(0, Math.min(profile.height, y0 + scale) - Math.max(0, y0));
       lost += 1 - inside / (scale * scale);
     }
     return lost / frame.length <= config.clipLimit;
@@ -232,24 +277,24 @@ function deriveVariant(sheet, frames, outfit, variant) {
   const grids = frames.map((frame, frameIndex) => {
     const box = boxes[frameIndex];
     const torso = torsoCenters[frameIndex];
-    const area = new Float64Array(config.width * config.height);
+    const area = new Float64Array(profile.width * profile.height);
     const votes = Array.from({ length: area.length }, () => new Float64Array(palette.length));
     let lost = 0;
     for (const p of frame) {
-      const x0 = config.anchorX + (p % sheet.width - torso) * scale, x1 = x0 + scale;
-      const y0 = config.baseline + 1 + (Math.floor(p / sheet.width) - box.bottom - 1) * scale, y1 = y0 + scale;
-      const inside = Math.max(0, Math.min(config.width, x1) - Math.max(0, x0)) * Math.max(0, Math.min(config.height, y1) - Math.max(0, y0));
+      const x0 = profile.anchorX + (p % sheet.width - torso) * scale, x1 = x0 + scale;
+      const y0 = profile.baseline + 1 + (Math.floor(p / sheet.width) - box.bottom - 1) * scale, y1 = y0 + scale;
+      const inside = Math.max(0, Math.min(profile.width, x1) - Math.max(0, x0)) * Math.max(0, Math.min(profile.height, y1) - Math.max(0, y0));
       lost += 1 - inside / (scale * scale);
       const index = indexOf(p);
-      for (let y = Math.max(0, Math.floor(y0)); y < Math.min(config.height, Math.ceil(y1)); y++) for (let x = Math.max(0, Math.floor(x0)); x < Math.min(config.width, Math.ceil(x1)); x++) {
+      for (let y = Math.max(0, Math.floor(y0)); y < Math.min(profile.height, Math.ceil(y1)); y++) for (let x = Math.max(0, Math.floor(x0)); x < Math.min(profile.width, Math.ceil(x1)); x++) {
         const coverage = Math.max(0, Math.min(x + 1, x1) - Math.max(x, x0)) * Math.max(0, Math.min(y + 1, y1) - Math.max(y, y0));
-        area[y * config.width + x] += coverage;
-        votes[y * config.width + x][index] += coverage;
+        area[y * profile.width + x] += coverage;
+        votes[y * profile.width + x][index] += coverage;
       }
     }
     if (lost / frame.length > config.clipLimit) clippingIssues.push(`${outfit} row ${variant + 1} ${poses[frameIndex]}: clipped ${(lost / frame.length * 100).toFixed(3)}% of opaque pixels (>2%)`);
-    return Array.from({ length: config.height }, (_, y) => Array.from({ length: config.width }, (_, x) => {
-      const p = y * config.width + x;
+    return Array.from({ length: profile.height }, (_, y) => Array.from({ length: profile.width }, (_, x) => {
+      const p = y * profile.width + x;
       if (area[p] < config.coverage) return ".";
       let best = 0, feature = -1, whiteFeature = -1;
       for (let i = 0; i < palette.length; i++) {
@@ -262,37 +307,43 @@ function deriveVariant(sheet, frames, outfit, variant) {
   });
   const headCentroid = (grid) => {
     let x = 0, y = 0, count = 0;
-    for (let row = 0; row <= 8; row++) for (let col = 0; col < config.width; col++) if (grid[row][col] !== ".") { x += col; y += row; count++; }
-    return count ? { x: x / count, y: y / count } : { x: config.anchorX, y: 4 };
+    const { top, bottom } = headBounds(grid, profile);
+    for (let row = top; row < bottom; row++) for (let col = 0; col < profile.width; col++) if (grid[row][col] !== ".") { x += col; y += row; count++; }
+    return count ? { x: x / count, y: y / count } : { x: profile.anchorX, y: profile.headRows / 2 };
   };
-  for (const pose of config.headFix[outfit]?.[String(variant + 1)] ?? []) {
+  for (const pose of profile.headFix[outfit]?.[String(variant + 1)] ?? []) {
     const i = poses.indexOf(pose);
     if (i < 0) fail(`${outfit}: unknown headFix pose ${pose}`);
     const base = headCentroid(grids[0]), target = headCentroid(grids[i]);
     const dx = Math.round(target.x - base.x), dy = Math.round(target.y - base.y);
-    for (let y = 0; y <= 8; y++) for (let x = 0; x < config.width; x++) {
+    const baseBounds = headBounds(grids[0], profile), targetBounds = headBounds(grids[i], profile);
+    for (let y = targetBounds.top; y < targetBounds.bottom; y++) for (let x = 0; x < profile.width; x++) {
       const sourceY = y - dy;
-      grids[i][y][x] = sourceY >= 0 && sourceY <= 8 ? grids[0][sourceY]?.[x - dx] ?? "." : ".";
+      grids[i][y][x] = sourceY >= baseBounds.top && sourceY < baseBounds.bottom ? grids[0][sourceY]?.[x - dx] ?? "." : ".";
     }
   }
   return { palette: palette.map((rgb) => `#${rgb.map((v) => v.toString(16).padStart(2, "0")).join("")}`), frames: Object.fromEntries(poses.map((pose, i) => [pose, grids[i].map((row) => row.join("")).join("\n")])) };
 }
 
 function generate() {
-  const detailed = {};
+  const detailedProfile = { width: config.width, height: config.height, baseline: config.baseline, anchorX: config.anchorX, headRows: 9, headFix: config.headFix };
+  const detailed = {}, web = {};
   for (const outfit of outfits) {
     const sheet = load(outfit), frames = framesOf(sheet, outfit);
-    detailed[outfit] = Array.from({ length: outfit === "operator" ? 1 : 6 }, (_, variant) => deriveVariant(sheet, frames.slice(variant * 8, variant * 8 + 8), outfit, variant));
+    const variants = Array.from({ length: outfit === "operator" ? 1 : 6 }, (_, variant) => frames.slice(variant * 8, variant * 8 + 8));
+    detailed[outfit] = variants.map((frames, variant) => deriveVariant(sheet, frames, outfit, variant, detailedProfile));
+    web[outfit] = variants.map((frames, variant) => deriveVariant(sheet, frames, outfit, variant, config.web));
   }
   if (clippingIssues.length) fail(clippingIssues.join("\n"));
-  detailed.neutral = detailed.mistral.map((variant, row) => ({ ...variant, palette: variant.palette.map((hex, index) => {
+  for (const profile of [detailed, web]) profile.neutral = profile.mistral.map((variant, row) => ({ ...variant, palette: variant.palette.map((hex, index) => {
     const rgb = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16));
     const { hue, sat, val } = hsv(rgb), n = config.neutral;
     if ((config.neutralKeep[String(row + 1)] ?? []).includes(index) || hue < n.hueMin || hue > n.hueMax || sat < n.saturationMin || val < n.valueMin) return hex;
     const g = Math.round(255 * (0.18 + 0.5 * val));
     return `#${[g, g, Math.min(255, g + 8)].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
   }) }));
-  return detailed;
+  web.neutral = web.mistral.map((variant, row) => neutralWeb(variant, web.neutral[row].palette));
+  return { detailed, web };
 }
 
 function preview(detailed, outfit) {
@@ -324,21 +375,55 @@ function preview(detailed, outfit) {
   }
 }
 
+function png(web, outfit, path) {
+  if (!Object.hasOwn(web, outfit)) fail(`unknown outfit ${outfit}`);
+  const scale = 4, gap = 4;
+  const width = poses.length * (config.web.width * scale + gap) + gap;
+  const height = web[outfit].length * (config.web.height * scale + gap) + gap;
+  const rgba = Buffer.alloc(width * height * 4);
+  for (let p = 0; p < rgba.length; p += 4) { rgba[p] = 0x10; rgba[p + 1] = 0x06; rgba[p + 2] = 0x09; rgba[p + 3] = 255; }
+  for (const [row, variant] of web[outfit].entries()) for (const [col, pose] of poses.entries()) {
+    const frame = variant.frames[pose].split("\n");
+    const palette = variant.palette.map((hex) => [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16)));
+    for (let y = 0; y < config.web.height; y++) for (let x = 0; x < config.web.width; x++) {
+      if (frame[y][x] === ".") continue;
+      const rgb = palette[parseInt(frame[y][x], 12)];
+      for (let dy = 0; dy < scale; dy++) for (let dx = 0; dx < scale; dx++) {
+        const p = ((gap + row * (config.web.height * scale + gap) + y * scale + dy) * width + gap + col * (config.web.width * scale + gap) + x * scale + dx) * 4;
+        rgba[p] = rgb[0]; rgba[p + 1] = rgb[1]; rgba[p + 2] = rgb[2];
+      }
+    }
+  }
+  const result = spawnSync("ffmpeg", ["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", `${width}x${height}`, "-i", "-", "-frames:v", "1", path], { input: rgba, maxBuffer: 64 * 1024 * 1024 });
+  if (result.error?.code === "ENOENT") fail("derive-sprites needs ffmpeg and ffprobe on PATH");
+  if (result.error || result.status !== 0) fail(`ffmpeg: ${result.error?.message ?? result.stderr.toString().trim()}`);
+  console.log(`generated ${path}`);
+}
+
 try {
   const args = process.argv.slice(2);
-  if (!(args.length === 0 || (args.length === 1 && args[0] === "--check") || (args.length === 2 && args[0] === "--preview"))) fail("usage: node scripts/derive-sprites.mjs [--check | --preview <outfit|operator>]");
-  const detailed = generate();
+  if (!(args.length === 0 || (args.length === 1 && args[0] === "--check") || (args.length === 2 && args[0] === "--preview") || (args.length === 3 && args[0] === "--png"))) fail("usage: node scripts/derive-sprites.mjs [--check | --preview <outfit|operator|neutral> | --png <outfit|operator|neutral> <path>]");
+  const { detailed, web } = generate();
   const output = "// Generated by scripts/derive-sprites.mjs from assets/characters/source; do not edit.\n" +
     'import type { Outfit } from "./appearance.js";\nimport type { DetailedVariant } from "./cast.js";\n\n' +
     `export const DETAILED: Record<Outfit | "operator", readonly DetailedVariant[]> = ${JSON.stringify(detailed, null, 2)};\n`;
   const path = join(root, "src/viz/cast-detailed.ts");
+  const webPath = join(root, "web/city/assets/characters.json");
+  const webOutput = JSON.stringify({ width: config.web.width, height: config.web.height, poses, outfits: web }) + "\n";
   if (args[0] === "--preview") preview(detailed, args[1]);
+  else if (args[0] === "--png") png(web, args[1], args[2]);
   else if (args[0] === "--check") {
-    let existing;
-    try { existing = readFileSync(path, "utf8"); } catch { fail("cast-detailed.ts is missing; run node scripts/derive-sprites.mjs"); }
-    if (existing !== output) fail("cast-detailed.ts differs; run node scripts/derive-sprites.mjs");
-    console.log("cast-detailed.ts matches deterministic derivation");
-  } else { writeFileSync(path, output); console.log("generated src/viz/cast-detailed.ts (43 variants, 344 frames including neutral)"); }
+    for (const [file, expected] of [[path, output], [webPath, webOutput]]) {
+      let existing;
+      try { existing = readFileSync(file, "utf8"); } catch { fail(`${file} is missing; run node scripts/derive-sprites.mjs`); }
+      if (existing !== expected) fail(`${file} differs; run node scripts/derive-sprites.mjs`);
+    }
+    console.log("cast-detailed.ts and characters.json match deterministic derivation");
+  } else {
+    mkdirSync(dirname(webPath), { recursive: true });
+    writeFileSync(path, output); writeFileSync(webPath, webOutput);
+    console.log("generated src/viz/cast-detailed.ts and web/city/assets/characters.json");
+  }
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;
