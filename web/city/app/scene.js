@@ -1,4 +1,5 @@
-import { sample, orderedTargets, cycle, targetKey, walkPath, poseFor, sanitizeLabel, px, fnv1a } from "./logic.js";
+import { sample, orderedTargets, cycle, targetKey, walkPath, poseFor, px, fnv1a } from "./logic.js";
+import { clampView, plateText } from "./mapkit.js";
 import { paintVenue } from "./art/buildings.js";
 import { paintStreetTile, paintWorkstation } from "./art/street.js";
 import { textureFor, loadCharacterTextures } from "./art/characters.js";
@@ -13,7 +14,7 @@ const HARNESS_FILTERS = [null, "claude", "omp", "opencode", "codex"];
 const PACKET_COLORS = { chat: COLORS.cream, task: COLORS.cyan, result: COLORS.yellow, status: 0xbdb1a4, control: COLORS.alert };
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const keyOf = (target) => target ? targetKey(target) : null;
-const isTextEntry = (target) => target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
+const isTextEntry = (target) => target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT" || target?.isContentEditable;
 
 export class CityScene extends Phaser.Scene {
   constructor(store, hud) {
@@ -28,6 +29,7 @@ export class CityScene extends Phaser.Scene {
     this.lastClickAt = 0;
     this.characterReady = false;
     this.cameraZooms = [1, 2, 3, 4];
+    this.wheelZoomDelta = 0;
     this.clock = performance.now();
     this.lastViewportRefresh = 0;
     this.keyListener = (event) => this.onKeyDown(event);
@@ -41,7 +43,7 @@ export class CityScene extends Phaser.Scene {
     this.bgCamera = this.cameras.add(0, 0, width, height);
     this.mainCamera = this.cameras.add(0, 0, width, height, true);
     this.fxCamera = this.cameras.add(0, 0, width, height);
-    this.mainCamera.setZoom(2);
+    this.mainCamera.setOrigin(0, 0);
 
     this.bgLayer = this.add.layer();
     this.streetLayer = this.add.layer();
@@ -73,6 +75,8 @@ export class CityScene extends Phaser.Scene {
     this.stationTextures = new Set();
     this.characterSprites = new Map();
     this.characterLabels = new Map();
+    this.signs = new Map();
+    this.holograms = new Map();
     this.proceduralSkyline("skyline-far", false);
     this.proceduralSkyline("skyline-mid", true);
     this.createBackdropTiles(width, height);
@@ -84,6 +88,7 @@ export class CityScene extends Phaser.Scene {
     this.input.on("pointerdown", this.onPointerDown, this);
     this.input.on("pointermove", this.onPointerMove, this);
     this.input.on("pointerup", this.onPointerUp, this);
+    this.input.on("pointerupoutside", this.endDrag, this);
     this.input.on("wheel", this.onWheel, this);
     this.scale.on("resize", (size) => this.resize(size.width, size.height));
     this.unsubscribe = this.store.subscribe((state) => this.onStoreChange(state));
@@ -94,6 +99,7 @@ export class CityScene extends Phaser.Scene {
     }).catch((error) => {
       this.hud?.setFatal?.(error.message);
     });
+    this.setView(0, 0, 2);
     this.onStoreChange(this.store.snapshot());
   }
 
@@ -123,6 +129,7 @@ export class CityScene extends Phaser.Scene {
     const wasOffline = this.lastWire?.connection === "offline";
     const offline = wire.connection === "offline";
     this.lastWire = wire;
+    this.vacantX = Math.max(this.vacantX ?? 0, this.nextVacantX(wire));
     if (offline) {
       this.packets.length = 0;
       this.walks.clear();
@@ -152,11 +159,11 @@ export class CityScene extends Phaser.Scene {
       const last = second ?? first;
       const left = first.rect.x * 8;
       const right = (last.rect.x + last.rect.width) * 8;
-      this.mainCamera.centerOn((left + right) / 2, 0);
+      this.centerAt((left + right) / 2, 0);
       return;
     }
     const operator = state.wire.layout.characters.find((item) => state.charactersById.get(item.id)?.source === "human");
-    if (operator) this.mainCamera.centerOn((operator.rect.x + operator.rect.width / 2) * 8,
+    if (operator) this.centerAt((operator.rect.x + operator.rect.width / 2) * 8,
       (operator.rect.y + operator.rect.height / 2) * 8);
   }
 
@@ -236,20 +243,21 @@ export class CityScene extends Phaser.Scene {
       this.streetSignature = signature;
     }
     this.streetSprite?.setPosition(x, -32);
-    const strip = Math.floor((Math.max(...wire.layout.venues.map((venue) => venue.rect.x / 48), -1) + 1) * 48);
-    this.drawVacant(strip * 8);
+    this.drawVacant(this.vacantX);
   }
 
   drawVacant(x) {
-    this.vacantGraphics?.destroy();
-    this.vacantGraphics = this.add.graphics();
+    if (this.vacantPosition === x) return;
+    this.vacantPosition = x;
+    this.vacantGraphics ??= this.add.graphics();
+    this.vacantGraphics.clear();
     this.vacantGraphics.fillStyle(COLORS.burgundy, 0.75);
     this.vacantGraphics.fillRect(x, -32, 320, 80);
     this.vacantGraphics.lineStyle(1, COLORS.border, 0.9);
     dashedRect(this.vacantGraphics, x, -32, 320, 80, 7, 5);
     this.streetLayer.add(this.vacantGraphics);
-    this.vacantText?.destroy();
-    this.vacantText = this.add.text(x + 16, 0, "VACANT LOT", { fontFamily: "Silkscreen", fontSize: "8px", color: "#a52b3a" });
+    this.vacantText ??= this.add.text(0, 0, "VACANT LOT", { fontFamily: "Silkscreen", fontSize: "8px", color: "#a52b3a" });
+    this.vacantText.setPosition(x + 16, 0);
     this.vacantText.setOrigin(0, 0.5);
     this.streetLayer.add(this.vacantText);
   }
@@ -289,19 +297,32 @@ export class CityScene extends Phaser.Scene {
   }
 
   drawSigns(state) {
-    this.signLayer.removeAll(true);
+    const live = new Set();
     for (const venue of state.wire.layout.venues) {
       const data = state.venuesByKey.get(venue.key);
       if (!data) continue;
-      const text = this.add.text(venue.rect.x * 8 + 8, venue.rect.y * 8 - 54, `#${sanitizeLabel(data.name)}`, {
-        fontFamily: "Silkscreen", fontSize: "16px", color: "#55ced1", stroke: "#100609", strokeThickness: 2,
-      }).setOrigin(0, 1);
-      text.preFX?.addGlow?.(COLORS.cyan, 1, 0, false, 8, 1);
-      this.signLayer.add(text);
+      live.add(venue.key);
+      let plate = this.signs.get(venue.key);
+      if (!plate) {
+        plate = this.createPlate(this.signLayer, true);
+        plate.text.preFX?.addGlow?.(COLORS.cyan, 1, 0, false, 8, 1);
+        this.signs.set(venue.key, plate);
+      }
+      this.updatePlate(plate, `#${plateText(data.name)}`, `#${data.name}`, COLORS.cyan,
+        state.unreadByKey?.get(`v:${venue.key}`) ?? 0);
+      plate.container.setPosition(venue.rect.x * 8 + 8, venue.rect.y * 8 - 54);
+    }
+    for (const [key, plate] of this.signs) {
+      if (live.has(key)) continue;
+      plate.container.destroy();
+      this.signs.delete(key);
     }
   }
 
   drawConduits(routes) {
+    const signature = JSON.stringify([...routes]);
+    if (signature === this.conduitSignature) return;
+    this.conduitSignature = signature;
     this.conduits.clear();
     this.conduits.lineStyle(1, COLORS.cyan, 0.6);
     for (const path of routes.values()) {
@@ -345,27 +366,35 @@ export class CityScene extends Phaser.Scene {
   }
 
   drawCharacters(state) {
-    this.characterLayer.removeAll(true);
-    this.labelLayer.removeAll(true);
-    this.characterSprites.clear();
-    this.characterLabels.clear();
-    const wire = state.wire;
-    for (const placed of wire.layout.characters) {
+    const live = new Set();
+    for (const placed of state.wire.layout.characters) {
       const character = state.charactersById.get(placed.id);
       if (!character || (character.source === "process" && !state.ui.showProcesses)) continue;
-      const appearance = character.appearance;
-      const key = textureFor(appearance, "idle_a");
+      const key = textureFor(character.appearance, "idle_a");
       if (!this.textures.exists(key)) continue;
-      const sprite = this.add.image(0, 0, key).setOrigin(0.5, 1);
-      this.characterLayer.add(sprite);
-      this.characterSprites.set(character.id, { sprite, placed, character });
-      const name = this.add.text(0, 0, sanitizeLabel(character.name), {
-        fontFamily: "Silkscreen", fontSize: "8px", color: "#e8dec8", stroke: "#100609", strokeThickness: 2,
-      }).setOrigin(0.5, 1);
-      this.labelLayer.add(name);
-      const badges = this.add.text(0, 0, "", { fontFamily: "Silkscreen", fontSize: "8px", color: "#55ced1", stroke: "#100609", strokeThickness: 1, lineSpacing: -1 }).setOrigin(0, 0);
-      this.labelLayer.add(badges);
-      this.characterLabels.set(character.id, { name, badges });
+      live.add(character.id);
+      let entry = this.characterSprites.get(character.id);
+      if (!entry) {
+        const sprite = this.add.image(0, 0, key).setOrigin(0.5, 1);
+        this.characterLayer.add(sprite);
+        entry = { sprite, placed, character };
+        this.characterSprites.set(character.id, entry);
+        const plate = this.createPlate(this.labelLayer);
+        const badges = this.add.text(0, 0, "", { fontFamily: "Silkscreen", fontSize: "8px", color: "#55ced1", stroke: "#100609", strokeThickness: 1, lineSpacing: -1 }).setOrigin(0, 0);
+        this.labelLayer.add(badges);
+        this.characterLabels.set(character.id, { plate, badges });
+      }
+      entry.placed = placed;
+      entry.character = character;
+    }
+    for (const [id, entry] of this.characterSprites) {
+      if (live.has(id)) continue;
+      entry.sprite.destroy();
+      const labels = this.characterLabels.get(id);
+      labels.plate.container.destroy();
+      labels.badges.destroy();
+      this.characterSprites.delete(id);
+      this.characterLabels.delete(id);
     }
     this.drawCharactersFrame(state, performance.now());
   }
@@ -397,36 +426,100 @@ export class CityScene extends Phaser.Scene {
       if (activity.tone === "offline") sprite.setTint(0x8c8c8c); else sprite.clearTint();
       const labels = this.characterLabels.get(id);
       if (!labels) continue;
-      labels.name.setText(sanitizeLabel(character.name));
-      labels.name.setPosition(x, y - 54);
+      this.updatePlate(labels.plate, plateText(character.name), character.name, this.plateBorder(character, activity),
+        state.unreadByKey?.get(`c:${id}`) ?? 0, character.source === "process" ? "UNREGISTERED" : "");
+      labels.plate.container.setPosition(x, y - 54);
       const harness = character.harness === "claude" ? "CC" : character.harness === "codex" ? "CX" : character.harness === "omp" ? "OMP" : character.harness === "opencode" ? "OC" : "—";
       const role = character.source === "human" ? "[H]" : character.role === "orchestrator" ? "[O]" : character.role === "worker" ? "[W]" : "[-]";
       labels.badges.setText(`${harness}\n${role}\n${activity.label}${activity.badge ? ` ${activity.badge}` : ""}`);
       labels.badges.setPosition(x + 20, y - 48);
       labels.badges.setColor(activity.tone === "offline" || activity.tone === "lost" || activity.tone === "gone" ? "#bdb1a4" : activity.tone === "dim" ? "#8b7577" : "#55ced1");
-      labels.name.setAlpha(dim ? 0.5 : activity.tone === "lost" || activity.tone === "gone" ? 0.6 : 1);
+      labels.plate.container.setAlpha(dim ? 0.5 : activity.tone === "lost" || activity.tone === "gone" ? 0.6 : 1);
     }
   }
 
   drawHolograms(state) {
-    this.hologramLayer.removeAll(true);
-    const characters = state.charactersById;
+    const live = new Set();
     for (const venue of state.wire.layout.venues) {
       for (const room of venue.rooms) {
         if (room.canonical) continue;
-        const character = characters.get(room.id);
+        const character = state.charactersById.get(room.id);
         if (!character || (character.source === "process" && !state.ui.showProcesses)) continue;
-        const key = textureFor(character.appearance, "idle_a");
-        if (!this.textures.exists(key)) continue;
+        const texture = textureFor(character.appearance, "idle_a");
+        if (!this.textures.exists(texture)) continue;
+        const key = `${venue.key}:${room.id}`;
+        live.add(key);
+        let entry = this.holograms.get(key);
+        if (!entry) {
+          const sprite = this.add.image(0, 0, texture).setOrigin(0.5, 1).setTint(COLORS.cyan).setAlpha(0.35);
+          this.hologramLayer.add(sprite);
+          entry = { sprite, plate: this.createPlate(this.hologramLayer) };
+          entry.plate.container.setAlpha(0.75);
+          this.holograms.set(key, entry);
+        }
         const x = room.rect.x * 8 + 40;
         const y = (room.rect.y + room.rect.height) * 8 - 2;
-        const sprite = this.add.image(x, y, key).setOrigin(0.5, 1).setTint(COLORS.cyan).setAlpha(0.35);
-        this.hologramLayer.add(sprite);
-        const label = this.add.text(x, y - 54, `@${sanitizeLabel(character.name)}`, {
-          fontFamily: "Silkscreen", fontSize: "8px", color: "#55ced1", stroke: "#100609", strokeThickness: 2,
-        }).setOrigin(0.5, 1).setAlpha(0.75);
-        this.hologramLayer.add(label);
+        if (entry.sprite.texture.key !== texture) entry.sprite.setTexture(texture);
+        entry.sprite.setPosition(x, y);
+        const activity = poseFor(character, state.animations.get(room.id), performance.now(), state.wire.connection, state.wire.reducedMotion);
+        this.updatePlate(entry.plate, `@${plateText(character.name)}`, character.name, this.plateBorder(character, activity),
+          state.unreadByKey?.get(`c:${room.id}`) ?? 0);
+        entry.plate.container.setPosition(x, y - 54);
       }
+    }
+    for (const [key, entry] of this.holograms) {
+      if (live.has(key)) continue;
+      entry.sprite.destroy();
+      entry.plate.container.destroy();
+      this.holograms.delete(key);
+    }
+  }
+
+  plateBorder(character, activity) {
+    if (["offline", "lost", "gone"].includes(activity.tone)) return 0x8b7577;
+    return character.role === "orchestrator" ? COLORS.yellow : character.role === "worker" ? COLORS.cyan : COLORS.cream;
+  }
+
+  createPlate(layer, decorative = false) {
+    const panel = this.add.graphics();
+    const text = this.add.text(0, 0, "", {
+      fontFamily: decorative ? "Silkscreen" : "Share Tech Mono",
+      fontSize: decorative ? "16px" : "10px", color: decorative ? "#55ced1" : "#e8dec8",
+    }).setOrigin(0, 0);
+    const subtitle = this.add.text(0, 0, "", { fontFamily: "Share Tech Mono", fontSize: "9px", color: "#8b7577" });
+    const pill = this.add.graphics();
+    const unread = this.add.text(0, 0, "", { fontFamily: "Share Tech Mono", fontSize: "9px", color: "#100609" });
+    const container = this.add.container(0, 0, [panel, text, subtitle, pill, unread]);
+    layer.add(container);
+    const plate = { container, panel, text, subtitle, pill, unread, decorative };
+    text.setInteractive();
+    text.on("pointerover", () => this.hud?.setHover?.(plate.fullName));
+    text.on("pointerout", () => this.hud?.setHover?.(""));
+    return plate;
+  }
+
+  updatePlate(plate, label, fullName, border, count, subtitle = "") {
+    plate.fullName = fullName;
+    const zoom = this.mainCamera.zoom;
+    const signature = `${label}:${border}:${count}:${subtitle}:${zoom}`;
+    if (signature === plate.signature) return;
+    plate.signature = signature;
+    plate.text.setResolution(zoom).setText(label);
+    plate.subtitle.setResolution(zoom).setText(subtitle).setVisible(Boolean(subtitle));
+    plate.unread.setResolution(zoom).setText(count > 0 ? String(count) : "").setVisible(count > 0);
+    const width = Math.ceil(Math.max(plate.text.width, plate.subtitle.width)) + 8;
+    const height = Math.ceil(plate.text.height + (subtitle ? plate.subtitle.height : 0)) + 4;
+    const left = plate.decorative ? 0 : -Math.floor(width / 2);
+    plate.text.setPosition(left + 4, -height + 2);
+    plate.subtitle.setPosition(left + 4, -height + 2 + plate.text.height);
+    plate.panel.clear().fillStyle(COLORS.burgundy, 0.85).fillRect(left, -height, width, height);
+    plate.panel.lineStyle(1, border, 1).strokeRect(left + 0.5, -height + 0.5, width - 1, height - 1);
+    plate.pill.clear();
+    if (count > 0) {
+      const pillWidth = Math.ceil(plate.unread.width) + 6;
+      const pillHeight = Math.ceil(plate.unread.height) + 2;
+      plate.pill.fillStyle(COLORS.yellow, 1).fillRoundedRect(left + width, -height, pillWidth, pillHeight, 3);
+      plate.unread.setPosition(left + width + 3, -height + 1);
     }
   }
 
@@ -494,8 +587,7 @@ export class CityScene extends Phaser.Scene {
   update(time, delta) {
     if (!this.state.wire || this.state.ui.tab !== "map") return;
     this.clock = performance.now();
-    this.farTile.tilePositionX = this.mainCamera.scrollX * 0.15 / this.tileScale;
-    this.midTile.tilePositionX = this.mainCamera.scrollX * 0.35 / this.tileScale;
+    this.setView(this.mainCamera.scrollX, this.mainCamera.scrollY);
     this.drawCharactersFrame(this.state, this.clock);
     const done = [];
     for (const [id, walk] of this.walks) if (this.clock - walk.start >= walk.duration) done.push(id);
@@ -552,35 +644,77 @@ export class CityScene extends Phaser.Scene {
     const tx = x - this.scale.width / (2 * zoom);
     const ty = y - this.scale.height / (2 * zoom);
     const f = 1 - Math.pow(0.9, Math.max(1, delta / 16.67));
-    this.mainCamera.setScroll(this.mainCamera.scrollX + (tx - this.mainCamera.scrollX) * f, this.mainCamera.scrollY + (ty - this.mainCamera.scrollY) * f);
+    this.setView(this.mainCamera.scrollX + (tx - this.mainCamera.scrollX) * f, this.mainCamera.scrollY + (ty - this.mainCamera.scrollY) * f);
   }
 
   createBackdropTiles(width, height) {
-    const scale = Math.max(2, Math.floor(height / 270));
-    this.tileScale = scale;
-    const tileWidth = Math.ceil(width / scale) + 2;
-    this.farTile = this.add.tileSprite(0, height - 270 * scale, tileWidth, 270, "skyline-far").setOrigin(0, 0).setScale(scale);
-    this.midTile = this.add.tileSprite(0, height - 270 * scale, tileWidth, 270, "skyline-mid").setOrigin(0, 0).setScale(scale);
+    this.skyFill = this.add.graphics();
+    this.bgLayer.add(this.skyFill);
+    this.farTile = this.add.tileSprite(0, 0, width, 270, "skyline-far").setOrigin(0, 0);
+    this.midTile = this.add.tileSprite(0, 0, width, 270, "skyline-mid").setOrigin(0, 0);
     this.bgLayer.add([this.farTile, this.midTile]);
-    this.bgCamera.setZoom(1);
+    this.groundFill = this.add.graphics();
+    this.bgLayer.add(this.groundFill);
     this.resizeBackdrop(width, height);
   }
 
   resizeBackdrop(width, height) {
-    const scale = Math.max(2, Math.floor(height / 270));
-    if (scale !== this.tileScale) {
-      this.tileScale = scale;
-      this.farTile?.setScale(scale);
-      this.midTile?.setScale(scale);
-    }
-    const tileWidth = Math.ceil(width / this.tileScale) + 2;
-    for (const tile of [this.farTile, this.midTile]) {
-      if (!tile) continue;
-      tile.setSize(tileWidth, 270).setPosition(0, height - 270 * this.tileScale);
-    }
     this.bgCamera.setSize(width, height);
     this.fxCamera.setSize(width, height);
     this.mainCamera.setSize(width, height);
+    this.backdropSignature = null;
+    this.updateBackdrop();
+  }
+
+  updateBackdrop() {
+    if (!this.farTile) return;
+    const camera = this.mainCamera;
+    const width = camera.width, height = camera.height;
+    const signature = `${width}:${height}:${camera.scrollX}:${camera.scrollY}:${camera.zoom}`;
+    if (signature === this.backdropSignature) return;
+    this.backdropSignature = signature;
+    this.tileScale = camera.zoom;
+    const tileWidth = Math.ceil(width / this.tileScale) + 2;
+    const farBottom = (8 - camera.scrollY) * camera.zoom;
+    const midBottom = (48 - camera.scrollY) * camera.zoom;
+    this.farTile.setScale(this.tileScale).setSize(tileWidth, 270).setPosition(0, farBottom - 270 * this.tileScale);
+    this.midTile.setScale(this.tileScale).setSize(tileWidth, 270).setPosition(0, midBottom - 270 * this.tileScale);
+    this.farTile.tilePositionX = camera.scrollX * 0.15 / this.tileScale;
+    this.midTile.tilePositionX = camera.scrollX * 0.35 / this.tileScale;
+    this.skyFill.clear().fillStyle(0x100609, 1).fillRect(0, 0, width, height);
+    this.groundFill.clear();
+    const groundTop = clamp(midBottom, 0, height);
+    this.groundFill.fillStyle(0x0b0407, 1).fillRect(0, groundTop, width, height - groundTop);
+    if (midBottom >= 0 && midBottom < height) {
+      this.groundFill.fillStyle(0xa52b3a, 1).fillRect(0, midBottom, width, 1);
+    }
+  }
+
+  nextVacantX(wire) {
+    return Math.floor((Math.max(...wire.layout.venues.map((venue) => venue.rect.x / 48), -1) + 1) * 48) * 8;
+  }
+
+  worldBounds() {
+    const bounds = this.state.wire?.layout.bounds;
+    const lotX = this.vacantX ?? (this.state.wire ? this.nextVacantX(this.state.wire) : 0);
+    const left = Math.min(bounds ? bounds.x * 8 : 0, lotX);
+    const top = Math.min(bounds ? bounds.y * 8 : -32, -32);
+    const right = Math.max(bounds ? (bounds.x + bounds.width) * 8 : 320, lotX + 320);
+    const bottom = Math.max(bounds ? (bounds.y + bounds.height) * 8 : 48, 48);
+    return { x: left - 320, y: top - 96, width: right - left + 640, height: bottom - top + 192 };
+  }
+
+  setView(scrollX, scrollY, zoom = this.mainCamera.zoom) {
+    const camera = this.mainCamera;
+    const view = clampView({ scrollX, scrollY, zoom }, { width: camera.width, height: camera.height }, this.worldBounds());
+    const zoomChanged = camera.zoom !== zoom;
+    camera.setZoom(zoom).setScroll(view.scrollX, view.scrollY);
+    this.updateBackdrop();
+    if (zoomChanged && this.characterReady && this.state.wire) {
+      this.drawSigns(this.state);
+      this.drawCharactersFrame(this.state, performance.now());
+      this.drawHolograms(this.state);
+    }
   }
 
   proceduralSkyline(key, mid) {
@@ -662,6 +796,7 @@ export class CityScene extends Phaser.Scene {
 
   resize(width, height) {
     this.resizeBackdrop(width, height);
+    this.setView(this.mainCamera.scrollX, this.mainCamera.scrollY);
     if (this.state.wire) this.applyOfflineEffect(this.state.wire.connection === "offline");
     this.drawRain(performance.now());
     this.hud?.refreshViewport?.();
@@ -675,6 +810,7 @@ export class CityScene extends Phaser.Scene {
   onPointerDown(pointer) {
     if (pointer.button !== 0) return;
     this.lastPointer = { x: pointer.x, y: pointer.y, scrollX: this.mainCamera.scrollX, scrollY: this.mainCamera.scrollY, dragged: false };
+    this.game.canvas.style.cursor = "grabbing";
   }
 
   onPointerMove(pointer) {
@@ -683,13 +819,13 @@ export class CityScene extends Phaser.Scene {
     if (Math.abs(dx) + Math.abs(dy) > 3) this.lastPointer.dragged = true;
     if (!this.lastPointer.dragged) return;
     this.store.setFollow(false);
-    this.mainCamera.setScroll(this.lastPointer.scrollX - dx / this.mainCamera.zoom, this.lastPointer.scrollY - dy / this.mainCamera.zoom);
+    this.setView(this.lastPointer.scrollX - dx / this.mainCamera.zoom, this.lastPointer.scrollY - dy / this.mainCamera.zoom);
   }
 
   onPointerUp(pointer) {
     if (!this.lastPointer) return;
     const pointerState = this.lastPointer;
-    this.lastPointer = null;
+    this.endDrag();
     if (pointerState.dragged) return;
     const now = performance.now();
     const worldX = this.mainCamera.scrollX + pointer.x / this.mainCamera.zoom;
@@ -698,9 +834,14 @@ export class CityScene extends Phaser.Scene {
     if (!target) { this.lastClickAt = 0; this.lastClickKey = null; return; }
     const selectedKey = targetKey(target);
     this.store.setSelected(target);
-    if (this.lastClickKey === selectedKey && now - this.lastClickAt < 350) this.openTranscript(target);
+    if (this.lastClickKey === selectedKey && now - this.lastClickAt < 350) this.openChat(target);
     this.lastClickAt = now;
     this.lastClickKey = selectedKey;
+  }
+
+  endDrag() {
+    this.lastPointer = null;
+    this.game.canvas.style.cursor = "grab";
   }
 
   hitTarget(x, y) {
@@ -717,16 +858,19 @@ export class CityScene extends Phaser.Scene {
   }
 
   onWheel(pointer, objects, dx, dy) {
-    if (!this.state.wire || dy === 0) return;
-    const current = this.mainCamera.zoom;
-    const index = this.cameraZooms.indexOf(current);
-    const next = this.cameraZooms[clamp(index + (dy < 0 ? 1 : -1), 0, this.cameraZooms.length - 1)];
-    if (next === current) return;
-    const worldX = this.mainCamera.scrollX + pointer.x / current;
-    const worldY = this.mainCamera.scrollY + pointer.y / current;
-    this.mainCamera.setZoom(next);
-    this.mainCamera.setScroll(worldX - pointer.x / next, worldY - pointer.y / next);
-    this.store.setFollow(false);
+    if (!this.state.wire) return;
+    if (!pointer.event.ctrlKey) {
+      this.wheelZoomDelta = 0;
+      this.pan(dx, dy);
+      return;
+    }
+    if (dy === 0) return;
+    this.wheelZoomDelta += dy;
+    while (Math.abs(this.wheelZoomDelta) >= 80) {
+      const direction = this.wheelZoomDelta < 0 ? 1 : -1;
+      this.wheelZoomDelta += direction * 80;
+      this.zoomStep(direction, pointer.x, pointer.y);
+    }
   }
 
   onKeyDown(event) {
@@ -735,7 +879,7 @@ export class CityScene extends Phaser.Scene {
     if (this.state.ui.tab !== "map") {
       if (key === "Escape") {
         if (this.state.ui.searchOpen) this.hud?.closeSearch();
-        else if (this.state.ui.transcript) this.hud?.closeTranscript();
+        else if (this.state.ui.chat) this.hud?.closeChat();
         else return;
         event.preventDefault();
       }
@@ -754,10 +898,10 @@ export class CityScene extends Phaser.Scene {
         if (item) { this.store.setSelected(item.target); this.centerTarget(item.target); }
         break;
       }
-      case "Enter": if (selected) this.openTranscript(selected); else handled = false; break;
+      case "Enter": if (selected) this.openChat(selected); else handled = false; break;
       case "Escape":
         if (this.state.ui.searchOpen) this.hud?.closeSearch();
-        else if (this.state.ui.transcript) this.hud?.closeTranscript();
+        else if (this.state.ui.chat) this.hud?.closeChat();
         else if (selected) this.store.setSelected(null);
         else handled = false;
         break;
@@ -765,6 +909,12 @@ export class CityScene extends Phaser.Scene {
       case "+": case "=": this.zoomStep(1); break;
       case "-": this.zoomStep(-1); break;
       case "0": this.fitSelection(); break;
+      case "Home": this.fitCity(); break;
+      case "c": case "C":
+        if (selected && this.hud?.scopeFor?.(selected)) this.openChat(selected);
+        else this.hud?.openChat(null);
+        break;
+      case "m": case "M": this.hud?.openManage(selected); break;
       case "/": this.hud?.openSearch(); break;
       case "f": case "F": {
         const character = selected?.kind !== "venue" ? this.state.charactersById.get(selected?.id) : null;
@@ -786,14 +936,18 @@ export class CityScene extends Phaser.Scene {
 
   pan(dx, dy) {
     const zoom = this.mainCamera.zoom;
-    this.mainCamera.setScroll(this.mainCamera.scrollX + dx / zoom, this.mainCamera.scrollY + dy / zoom);
+    this.setView(this.mainCamera.scrollX + dx / zoom, this.mainCamera.scrollY + dy / zoom);
     this.store.setFollow(false);
   }
 
-  zoomStep(direction) {
-    const at = this.cameraZooms.indexOf(this.mainCamera.zoom);
+  zoomStep(direction, screenX = this.mainCamera.width / 2, screenY = this.mainCamera.height / 2) {
+    const camera = this.mainCamera;
+    const current = camera.zoom;
+    const at = this.cameraZooms.indexOf(current);
     const next = this.cameraZooms[clamp(at + direction, 0, this.cameraZooms.length - 1)];
-    this.mainCamera.setZoom(next);
+    const worldX = camera.scrollX + screenX / current;
+    const worldY = camera.scrollY + screenY / current;
+    this.setView(worldX - screenX / next, worldY - screenY / next, next);
     this.store.setFollow(false);
   }
 
@@ -801,12 +955,14 @@ export class CityScene extends Phaser.Scene {
     if (!this.mainCamera) return;
     const position = this.state.targetsByKey.get(targetKey(target));
     if (!position) return;
-    this.mainCamera.centerOn(position.anchor.x * 8, position.anchor.y * 8);
+    this.setView(position.anchor.x * 8 - this.mainCamera.width / (2 * this.mainCamera.zoom),
+      position.anchor.y * 8 - this.mainCamera.height / (2 * this.mainCamera.zoom));
     this.hud?.refreshViewport?.();
   }
   centerAt(x, y) {
     if (!this.mainCamera) return;
-    this.mainCamera.centerOn(x, y);
+    this.setView(x - this.mainCamera.width / (2 * this.mainCamera.zoom),
+      y - this.mainCamera.height / (2 * this.mainCamera.zoom));
     this.store.setFollow(false);
     this.hud?.refreshViewport?.();
   }
@@ -814,19 +970,35 @@ export class CityScene extends Phaser.Scene {
   fitSelection() {
     if (!this.mainCamera) return;
     const target = this.state.ui.selected;
-    if (!target) return;
+    if (!target) { this.fitCity(); return; }
     const position = this.state.targetsByKey.get(targetKey(target));
     if (!position) return;
     const width = position.rect.width * 8, height = position.rect.height * 8;
     const zoom = [...this.cameraZooms].reverse().find((value) => width * value <= this.scale.width * 0.82 && height * value <= this.scale.height * 0.82) ?? 1;
-    this.mainCamera.setZoom(zoom);
-    this.mainCamera.centerOn((position.rect.x + position.rect.width / 2) * 8, (position.rect.y + position.rect.height / 2) * 8);
+    this.setView((position.rect.x + position.rect.width / 2) * 8 - this.mainCamera.width / (2 * zoom),
+      (position.rect.y + position.rect.height / 2) * 8 - this.mainCamera.height / (2 * zoom), zoom);
     this.store.setFollow(false);
   }
 
-  openTranscript(target) {
+  fitCity() {
+    if (!this.mainCamera || !this.state.wire) return;
+    const venues = this.state.wire.layout.venues;
+    const world = this.worldBounds();
+    const left = venues.length ? Math.min(...venues.map((venue) => venue.rect.x * 8)) : world.x + 320;
+    const top = venues.length ? Math.min(...venues.map((venue) => venue.rect.y * 8 - 54)) : world.y + 96;
+    const right = venues.length ? Math.max(...venues.map((venue) => (venue.rect.x + venue.rect.width) * 8)) : world.x + world.width - 320;
+    const bottom = venues.length ? Math.max(...venues.map((venue) => (venue.rect.y + venue.rect.height) * 8)) : world.y + world.height - 96;
+    const bounds = { x: left, y: top, width: right - left, height: bottom - top };
+    const zoom = [...this.cameraZooms].reverse().find((value) =>
+      bounds.width * value <= this.mainCamera.width && bounds.height * value <= this.mainCamera.height) ?? 1;
+    this.setView(bounds.x + bounds.width / 2 - this.mainCamera.width / (2 * zoom),
+      bounds.y + bounds.height / 2 - this.mainCamera.height / (2 * zoom), zoom);
+    this.store.setFollow(false);
+  }
+
+  openChat(target) {
     const scope = this.hud?.scopeFor?.(target);
-    if (scope) this.hud.openTranscript(scope);
+    if (scope) this.hud.openChat(scope);
   }
 
   viewportCells() {

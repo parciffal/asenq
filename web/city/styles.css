@@ -65,8 +65,8 @@ button:disabled { opacity: .45; cursor: default; }
 .status-warning { color: var(--yellow); overflow: hidden; text-overflow: ellipsis; }
 .status-notice { color: var(--alert); overflow: hidden; text-overflow: ellipsis; }
 #city-area { grid-area: city; position: relative; overflow: hidden; background: #100609; }
-#city { position: absolute; inset: 0; overflow: hidden; }
-#city canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+#city { position: absolute; inset: 0; overflow: hidden; touch-action: none; user-select: none; }
+#city canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; cursor: grab; touch-action: none; user-select: none; }
 #side-panel { grid-area: side; display: flex; flex-direction: column; overflow-y: auto; padding: 12px; scrollbar-color: var(--red) var(--burgundy); }
 #feed-panel { grid-area: feed; display: flex; flex-direction: column; overflow: hidden; padding: 8px 12px; }
 .feed-heading, .section-heading, .transcript-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 7px; color: var(--cyan); font: 12px "Silkscreen", monospace; letter-spacing: .05em; text-transform: uppercase; }
