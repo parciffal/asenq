@@ -520,6 +520,7 @@ export class CityScene extends Phaser.Scene {
     const followTarget = state.ui.follow === "session" && selected.kind === "membership"
       ? { kind: "character", id: selected.id } : selected;
     const target = state.targetsByKey.get(targetKey(followTarget));
+    if (!target) return;
     if (state.ui.follow === "traffic") {
       const selected = state.ui.selected;
       let recent = null;
