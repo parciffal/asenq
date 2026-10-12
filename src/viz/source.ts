@@ -99,7 +99,9 @@ export class CitySource {
       const pending = [...this.pending.values()].filter((item) => item.position > this.watermark).sort((a, b) => a.position - b.position);
       rebaseCitySnapshot(bundle, pending);
       this.identities = bundle.identities;
-      for (const item of pending) this.applyEvent(item, item.animate);
+      this.watermark = pending[pending.length - 1]?.position ?? this.watermark;
+      // Rename reservations before placement, but resolve messages only against the coherent new city.
+      for (const item of pending) if (item.event.type !== "message") this.dispatchEvent(item.event, item.animate);
       this.pending.clear();
       if (bundle.gap) this.sink.setNotice("HISTORY GAP · missing channel renames cannot be recovered");
       this.sink.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
@@ -107,6 +109,8 @@ export class CitySource {
       this.subscribed = true;
       this.hydrated = true;
       if (pending.some((item) => item.event.type === "session" || item.event.type === "channel" || item.event.type === "ping")) this.refreshAgain = true;
+      this.hooks.changed();
+      for (const item of pending) if (item.event.type === "message") this.dispatchEvent(item.event, item.animate);
     } catch {
       if (this.closed || attempt !== this.loadSeq) return;
       this.subscribed = false;
@@ -188,7 +192,10 @@ export class CitySource {
   private applyEvent(item: PositionedEvent, animate: boolean): void {
     if (item.position <= this.watermark) return;
     this.watermark = item.position;
-    const event = item.event;
+    this.dispatchEvent(item.event, animate);
+  }
+
+  private dispatchEvent(event: TailEvent, animate: boolean): void {
     this.hooks.event?.(event, animate);
     if (event.type === "message") this.sink.onMessage(event.msg, animate);
     else if (event.type === "channel" && event.action === "renamed" && event.oldName) this.sink.renameChannel(event.oldName, event.channel.name);

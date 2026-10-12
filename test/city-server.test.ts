@@ -164,6 +164,57 @@ test("SSE projects empty venues and real sessions then sends one human packet pe
   assert.equal(packets[1].data.senderId, operator.id);
 });
 
+test("a first human post publishes its new venue before exactly one packet", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  const s = await stream(c.base + `/api/events?token=${c.token}`);
+  t.after(() => s.close());
+  assert.equal(c.host.current().connection, "connected");
+  assert.equal(c.host.current().venues.length, 0);
+  const posted = await http(c.base + "/api/send", {
+    method: "POST", headers: c.headers,
+    body: JSON.stringify({ target: { kind: "channel", name: "brandnew" }, text: "first post" }),
+  });
+  assert.equal(posted.status, 200);
+  const reply = JSON.parse(posted.body) as ChannelSendResult;
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.feed.some((line) => line.text === "first post")));
+  await c.host.idle();
+  const venue = c.host.current().venues.find((item) => item.name === "brandnew")!;
+  const packets = s.events.filter((event) => event.event === "packet");
+  assert.equal(packets.length, 1);
+  assert.deepEqual(packets[0].data.from, { kind: "character", id: "human" });
+  assert.deepEqual(packets[0].data.to, { kind: "venue", venueKey: venue.key });
+  const venueState = s.events.findIndex((event) => event.event === "state" && event.data.layout.venues.some((item) => item.key === venue.key));
+  assert.ok(venueState >= 0 && venueState < s.events.indexOf(packets[0]), "state must make the endpoints available before the packet");
+  await c.env.human().request("channel_create", { channel: "followup" });
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.venues.some((item) => item.name === "followup")));
+  await c.host.idle();
+  assert.equal(s.events.filter((event) => event.event === "packet").length, 1, "a followup refresh must not replay the first post");
+  const history = JSON.parse((await http(c.base + "/api/history?scope=channel&channel=brandnew", { headers: c.headers })).body) as HistoryPage;
+  assert.equal(history.messages.find((message) => message.id === reply.msgId)?.text, "first post");
+});
+
+test("wire feed preserves long message text and control characters exactly as retained history", { timeout: 10_000 }, async (t) => {
+  const c = await city(t);
+  await c.env.human().request("channel_create", { channel: "raw" });
+  await c.host.idle();
+  const s = await stream(c.base + `/api/events?token=${c.token}`);
+  t.after(() => s.close());
+  const text = "a".repeat(500) + "\u001b[31m\u202e raw \n\t\u2066";
+  const posted = await http(c.base + "/api/send", {
+    method: "POST", headers: c.headers,
+    body: JSON.stringify({ target: { kind: "channel", name: "raw" }, text }),
+  });
+  assert.equal(posted.status, 200);
+  await s.until((events) => events.some((event) => event.event === "state" && event.data.feed.some((line) => line.channel === "raw")));
+  const feedState = s.events.find((event) => event.event === "state" && event.data.feed.some((line) => line.channel === "raw"));
+  assert.ok(feedState && feedState.event === "state");
+  assert.equal(feedState.data.feed.find((line) => line.channel === "raw")!.text, text);
+  assert.equal(c.host.current().feed.find((line) => line.channel === "raw")!.text, text);
+  const reply = JSON.parse(posted.body) as ChannelSendResult;
+  const history = JSON.parse((await http(c.base + "/api/history?scope=channel&channel=raw", { headers: c.headers })).body) as HistoryPage;
+  assert.equal(history.messages.find((message) => message.id === reply.msgId)!.text, text);
+});
+
 test("send validates Origin, JSON, targets and body limit and preserves daemon errors", { timeout: 10_000 }, async (t) => {
   const c = await city(t);
   const body = JSON.stringify({ target: { kind: "channel", name: "missing" }, text: "hi" });

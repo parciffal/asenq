@@ -1,5 +1,5 @@
 import type { ChannelSummary, HistoryScope, ListedSession, SessionIdentity, StoredMessage } from "../shared/protocol.js";
-import { sanitizeTerminalText, terminalSupportsColor, truncateTerminalText } from "../tui/terminal.js";
+import { sanitizeTerminalText, terminalSupportsColor } from "../tui/terminal.js";
 import type { KeyInput, MouseInput, TerminalLine, TerminalSize } from "../tui/terminal.js";
 import { CharacterAnimator } from "./animate.js";
 import { appearanceOf } from "./appearance.js";
@@ -40,7 +40,6 @@ export function within<T>(task: Promise<T>, ms: number): Promise<T> {
   task.then(resolve, reject).finally(() => clearTimeout(timer));
   return promise;
 }
-const clean = (text: string): string => truncateTerminalText(sanitizeTerminalText(text), 200);
 const same = (a: CityTarget | null, b: CityTarget): boolean => a !== null && targetKey(a) === targetKey(b);
 
 /** Screen/client/timer-free city controller. The host alone advances its visible clock. */
@@ -172,8 +171,8 @@ export class VizMap {
     const line: FeedLine = {
       seq: ++this.feedSeq, at: msg.createdAt, fromId: msg.fromSessionId ?? from?.id ?? null,
       toId: channel === undefined ? msg.toSessionId ?? to?.id ?? null : null,
-      from: from?.name ?? clean(msg.from), to: channel !== undefined ? `#${clean(channel)}` : to?.name ?? clean(msg.to),
-      kind: msg.kind ?? "chat", text: clean(msg.text || msg.file?.summary || ""),
+      from: from?.name ?? msg.from, to: channel !== undefined ? `#${channel}` : to?.name ?? msg.to,
+      kind: msg.kind ?? "chat", text: msg.text || msg.file?.summary || "",
       ...(channel !== undefined ? { channel, channelTarget } : {}),
     };
     this.feed.push(line);
