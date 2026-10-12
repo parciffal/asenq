@@ -732,6 +732,15 @@ export class CityScene extends Phaser.Scene {
   onKeyDown(event) {
     if (event.defaultPrevented || isTextEntry(event.target) || isTextEntry(document.activeElement)) return;
     const key = event.key;
+    if (this.state.ui.tab !== "map") {
+      if (key === "Escape") {
+        if (this.state.ui.searchOpen) this.hud?.closeSearch();
+        else if (this.state.ui.transcript) this.hud?.closeTranscript();
+        else return;
+        event.preventDefault();
+      }
+      return;
+    }
     let handled = true;
     const selected = this.state.ui.selected;
     switch (key) {
