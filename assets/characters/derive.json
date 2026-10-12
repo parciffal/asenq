@@ -21,6 +21,22 @@
     "claude": { "4": ["walk_a", "walk_b"] },
     "mistral": { "2": ["send_a"] }
   },
+  "web": {
+    "width": 32,
+    "height": 48,
+    "baseline": 47,
+    "anchorX": 15.5,
+    "headRows": 18,
+    "followHead": true,
+    "headFix": {
+      "codex": { "2": ["work_a"], "3": ["work_a"], "5": ["work_a"], "6": ["work_a", "walk_a"] },
+      "qwen": { "5": ["walk_a", "walk_b"] },
+      "claude": { "3": ["idle_b"], "4": ["walk_a", "walk_b"] },
+      "llama": { "1": ["idle_b"] },
+      "mistral": { "2": ["send_a"], "6": ["work_a"] },
+      "operator": { "1": ["work_a"] }
+    }
+  },
   "neutral": { "hueMin": 8, "hueMax": 48, "saturationMin": 0.6, "valueMin": 0.35 },
   "neutralKeep": {
     "1": [6, 7],
