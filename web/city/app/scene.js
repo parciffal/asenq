@@ -229,8 +229,8 @@ export class CityScene extends Phaser.Scene {
 
   drawStreet(wire) {
     const bounds = wire.layout.bounds;
-    const pixelWidth = Math.max(320, Math.ceil(bounds.width * 8));
     const x = bounds.x * 8;
+    const pixelWidth = Math.max(320, Math.ceil(bounds.width * 8), this.vacantX + 320 - x);
     const signature = `${x}:${pixelWidth}`;
     if (this.streetSignature !== signature) {
       const canvas = document.createElement("canvas");
@@ -239,6 +239,7 @@ export class CityScene extends Phaser.Scene {
       this.replaceCanvasTexture("city-street", canvas);
       this.streetSprite = this.add.image(x, STREET.top, "city-street").setOrigin(0, 0);
       this.streetLayer.add(this.streetSprite);
+      this.streetLayer.sendToBack(this.streetSprite);
       this.streetSignature = signature;
     }
     this.streetSprite?.setPosition(x, STREET.top);
@@ -250,13 +251,11 @@ export class CityScene extends Phaser.Scene {
     this.vacantPosition = x;
     this.vacantGraphics ??= this.add.graphics();
     this.vacantGraphics.clear();
-    this.vacantGraphics.fillStyle(COLORS.burgundy, 0.75);
-    this.vacantGraphics.fillRect(x, STREET.top, 320, STREET.height);
     this.vacantGraphics.lineStyle(1, COLORS.border, 0.9);
-    dashedRect(this.vacantGraphics, x, STREET.top, 320, STREET.height, 7, 5);
+    dashedRect(this.vacantGraphics, x, STREET.top, 320, STREET.roadTop, 7, 5);
     this.streetLayer.add(this.vacantGraphics);
     this.vacantText ??= this.add.text(0, 0, "VACANT LOT", { fontFamily: "Silkscreen", fontSize: "8px", color: "#a52b3a" });
-    this.vacantText.setPosition(x + 16, STREET.spine * 8);
+    this.vacantText.setPosition(x + 16, STREET.top + STREET.roadTop / 2);
     this.vacantText.setOrigin(0, 0.5);
     this.streetLayer.add(this.vacantText);
   }

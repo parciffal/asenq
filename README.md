@@ -353,6 +353,8 @@ Outfits: `claude`, `codex`, `gemini`, `qwen`, `llama`, `mistral`, `neutral`. Ses
 
 The browser street has a 48-pixel upper sidewalk, a 72-pixel road and a 24-pixel lower sidewalk at native scale. Workstation stalls sit below the lower sidewalk, with busy floor glows visible above their scenery. Buildings retain their original size. Selection, walking, message routes, the camera and minimap use the same expanded browser layout; terminal geometry is unchanged.
 
+Road markings and both sidewalks continue through the vacant lot. Its outline and label sit on the upper sidewalk without darkening or covering the road; the street extent still grows and shrinks with live channels.
+
 ```sh
 asenq city                         # choose a free port and open the browser
 asenq city --no-open --port 8787    # print the URL without opening it
