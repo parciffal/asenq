@@ -148,12 +148,10 @@ test("message matching isolates channel history and includes both sides of a DM"
   assert.equal(city.messageTouches(dm, { scope: "session", sessionId: "c" }), false);
 });
 
-test("walk paths return to the street spine and sample route segments in cell units", () => {
-  assert.deepEqual(city.walkPath({ x: 1, y: -4 }, { x: 7, y: -2 }), [
-    { x: 1, y: -4 }, { x: 1, y: 0 }, { x: 7, y: 0 }, { x: 7, y: -2 },
-  ]);
+test("route sampling uses cell distance and clamps beyond the destination", () => {
   const route = { length: 10, segments: [{ from: { x: 0, y: 0 }, to: { x: 10, y: 0 }, length: 10, start: 0 }] };
   assert.deepEqual(city.sample(route, 4), { x: 4, y: 0 });
+  assert.deepEqual(city.sample(route, 100), { x: 10, y: 0 });
 });
 
 test("conversation sorting uses recency then title and filtering includes previews", () => {

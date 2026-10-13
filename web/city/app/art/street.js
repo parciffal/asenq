@@ -1,4 +1,5 @@
 import { PAL } from "./palette.js";
+import { STREET } from "../mapkit.js";
 
 function rect(ctx, color, x, y, width, height) {
   ctx.fillStyle = color;
@@ -25,48 +26,51 @@ function lamp(ctx, x) {
   rect(ctx, PAL.border, x, 24, 2, 2);
 }
 
-/** x0 and width are world pixels, not cells. Place at world (x0, -32).
- * Local y 0..31 = upper sidewalk; 32..71 = road; 72..79 = lower sidewalk.
+/** x0 and width are world pixels, not cells. Place at world (x0, STREET.top).
+ * Local y 0..47 = upper sidewalk; 48..119 = road; 120..143 = lower sidewalk.
  * World-phased details keep adjacent tiles and resized strips aligned.
  */
 export function paintStreetTile(canvas, x0, width) {
   canvas.width = width;
-  canvas.height = 80;
+  canvas.height = STREET.height;
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingEnabled = false;
-  rect(ctx, PAL.sidewalk, 0, 0, width, 32);
-  rect(ctx, PAL.road, 0, 32, width, 40);
-  rect(ctx, PAL.sidewalk, 0, 72, width, 8);
-  for (let y = 0; y < 32; y += 8) {
+  rect(ctx, PAL.sidewalk, 0, 0, width, STREET.roadTop);
+  rect(ctx, PAL.road, 0, STREET.roadTop, width, STREET.roadHeight);
+  rect(ctx, PAL.sidewalk, 0, STREET.lowerTop, width, STREET.height - STREET.lowerTop);
+  for (let y = 0; y < STREET.roadTop; y += 8) {
     rect(ctx, PAL.steel, 0, y, width, 1);
     for (let worldX = Math.floor((x0 - 8) / 16) * 16; worldX < x0 + width; worldX += 16) {
       rect(ctx, PAL.panel, worldX - x0 + (y % 16 ? 8 : 0), y + 1, 1, 7);
     }
   }
-  for (let worldX = Math.floor(x0 / 16) * 16; worldX < x0 + width; worldX += 16) {
-    rect(ctx, PAL.steel, worldX - x0, 73, 1, 7);
+  for (let y = STREET.lowerTop; y < STREET.height; y += 8) {
+    rect(ctx, PAL.steel, 0, y, width, 1);
+    for (let worldX = Math.floor(x0 / 16) * 16; worldX < x0 + width; worldX += 16) {
+      rect(ctx, PAL.panel, worldX - x0 + (y % 16 ? 8 : 0), y + 1, 1, 7);
+    }
   }
-  rect(ctx, PAL.steelLight, 0, 30, width, 1);
-  rect(ctx, PAL.void, 0, 31, width, 2);
-  rect(ctx, PAL.steelLight, 0, 72, width, 1);
-  rect(ctx, PAL.void, 0, 79, width, 1);
+  rect(ctx, PAL.steelLight, 0, STREET.roadTop - 2, width, 1);
+  rect(ctx, PAL.void, 0, STREET.roadTop - 1, width, 2);
+  rect(ctx, PAL.steelLight, 0, STREET.lowerTop, width, 1);
+  rect(ctx, PAL.void, 0, STREET.height - 1, width, 1);
   // Fine road wear is periodic, with no vehicles or simulated message activity.
   for (let worldX = Math.floor(x0 / 64) * 64; worldX < x0 + width; worldX += 64) {
-    rect(ctx, PAL.grid, worldX - x0 + 7, 38, 9, 1);
-    rect(ctx, PAL.grid, worldX - x0 + 25, 62, 13, 1);
-    rect(ctx, PAL.steel, worldX - x0 + 46, 68, 2, 1);
+    rect(ctx, PAL.grid, worldX - x0 + 7, STREET.roadTop + 8, 9, 1);
+    rect(ctx, PAL.grid, worldX - x0 + 25, STREET.lowerTop - 10, 13, 1);
+    rect(ctx, PAL.steel, worldX - x0 + 46, STREET.lowerTop - 4, 2, 1);
   }
   for (let worldX = Math.floor(x0 / 48) * 48; worldX < x0 + width; worldX += 48) {
-    rect(ctx, PAL.orange, worldX - x0 + 8, 51, 18, 1);
-    rect(ctx, PAL.panel, worldX - x0 + 8, 53, 18, 1);
+    rect(ctx, PAL.orange, worldX - x0 + 8, STREET.roadTop + STREET.roadHeight / 2 - 1, 18, 1);
+    rect(ctx, PAL.panel, worldX - x0 + 8, STREET.roadTop + STREET.roadHeight / 2 + 1, 18, 1);
   }
   // One crossing per 48-cell venue strip, centred at its +160px entrance.
   for (let base = Math.floor((x0 - 192) / 384) * 384; base < x0 + width; base += 384) {
     const x = base + 148 - x0;
-    rect(ctx, PAL.road, x, 32, 24, 40);
-    for (let y = 35; y < 71; y += 6) rect(ctx, PAL.steelLight, x, y, 24, 3);
-    rect(ctx, PAL.yellow, x, 28, 24, 1);
-    rect(ctx, PAL.yellow, x, 75, 24, 1);
+    rect(ctx, PAL.road, x, STREET.roadTop, 24, STREET.roadHeight);
+    for (let y = STREET.roadTop + 3; y < STREET.lowerTop - 1; y += 6) rect(ctx, PAL.steelLight, x, y, 24, 3);
+    rect(ctx, PAL.yellow, x, STREET.roadTop - 4, 24, 1);
+    rect(ctx, PAL.yellow, x, STREET.lowerTop + 3, 24, 1);
   }
   for (let worldX = Math.floor(x0 / 96) * 96; worldX < x0 + width + 96; worldX += 96) {
     const x = worldX + 48 - x0;

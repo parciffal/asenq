@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 // The browser stays uncompiled; static imports cannot resolve its shipped URL from dist/test.
-const { clampView, plateText, vacantLotX, cityWorld } = await import(new URL("../../web/city/app/mapkit.js", import.meta.url).href);
+const { clampView, plateText, vacantLotX, cityWorld, streetLayout, streetRoute } = await import(new URL("../../web/city/app/mapkit.js", import.meta.url).href);
+// Runtime URL exercises the browser's uncompiled route sampler.
+const { sample, walkPath } = await import(new URL("../../web/city/app/logic.js", import.meta.url).href);
 
 const world = { x: -320, y: -496, width: 2400, height: 1200 };
 const viewport = { width: 1001, height: 701 };
@@ -54,4 +56,41 @@ test("city world follows live channels: adding extends, removing and deleting th
   assert.equal(cityWorld({ x: 0, y: -14, width: 88, height: 30 }, 768).width, 1728);
   assert.equal(vacantLotX([]), 0);
   assert.deepEqual(cityWorld({ x: 0, y: -14, width: 40, height: 30 }, 0), { x: -320, y: -208, width: 960, height: 432 });
+});
+
+test("wider streets preserve buildings and station sizes while aligning hits, routes and movement", () => {
+  const rect = { x: 18, y: 6, width: 16, height: 8 };
+  const anchor = { x: 22, y: 7 };
+  const building = { x: 0, y: -14, width: 40, height: 10 };
+  const layout = {
+    venues: [{ key: "v", rect: building, entrance: { x: 20, y: -4 }, rooms: [] }],
+    characters: [{ id: "s", rect, anchor, home: null }],
+    targets: [{ target: { kind: "character", id: "s" }, rect, anchor, order: 0 }],
+    routes: {},
+    bounds: { x: 0, y: -14, width: 40, height: 30 },
+    moved: [{ id: "s", from: { x: 2, y: -4 }, to: anchor }],
+  };
+  const mapped = streetLayout(layout);
+  assert.deepEqual(mapped.venues[0].rect, building);
+  assert.deepEqual(mapped.characters[0].rect, { x: 18, y: 14, width: 16, height: 8 });
+  assert.deepEqual(mapped.targets[0].rect, mapped.characters[0].rect);
+  assert.deepEqual(mapped.targets[0].anchor, mapped.characters[0].anchor);
+  assert.deepEqual(mapped.moved[0].to, mapped.characters[0].anchor);
+  assert.deepEqual(mapped.bounds, { x: 0, y: -14, width: 40, height: 38 });
+  assert.equal(cityWorld(mapped.bounds, 0).height, 496);
+  assert.deepEqual(streetLayout(layout), mapped);
+  assert.equal(layout.characters[0]!.rect.y, 6);
+
+  const route = streetRoute({ length: 21, segments: [
+    { from: { x: 2, y: -4 }, to: { x: 2, y: 0 }, start: 0, length: 4 },
+    { from: { x: 2, y: 0 }, to: { x: 12, y: 0 }, start: 4, length: 10 },
+    { from: { x: 12, y: 0 }, to: { x: 12, y: 7 }, start: 14, length: 7 },
+  ] });
+  assert.equal(route.length, 29);
+  assert.deepEqual(sample(route, 20.5), { x: 12, y: 6.5 });
+  assert.deepEqual(sample(route, 29), { x: 12, y: 15 });
+  assert.deepEqual(sample(route, 100), { x: 12, y: 15 });
+  const walk = walkPath(mapped.moved[0].from, mapped.moved[0].to);
+  assert.equal(walk[1].y, route.segments[0].to.y);
+  assert.equal(walk[2].y, route.segments[1].to.y);
 });

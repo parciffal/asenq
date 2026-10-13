@@ -1,6 +1,7 @@
 import { targetKey, scopeOf, search, messageTouches } from "./logic.js";
 import { filterConversations, groupByDay, statusMark, awaitingReply, mentionSuggestions } from "./chat.js";
 import { characterTextureKey } from "./art/characters.js";
+import { STREET } from "./mapkit.js";
 
 const element = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -1124,7 +1125,7 @@ export class CityHud {
     const ox = (width - bounds.width * 8 * scale) / 2;
     const oy = (height - bounds.height * 8 * scale) / 2;
     const point = (x, y) => ({ x: ox + (x - bounds.x) * 8 * scale, y: oy + (y - bounds.y) * 8 * scale });
-    const spineY = point(0, 0).y;
+    const spineY = point(0, STREET.spine).y;
     context.strokeStyle = "rgba(85,206,209,.7)"; context.lineWidth = Math.max(1, 2 * scale);
     context.beginPath(); context.moveTo(ox, spineY); context.lineTo(width - ox, spineY); context.stroke();
     const selectedKey = state.ui.selected ? targetKey(state.ui.selected) : null;

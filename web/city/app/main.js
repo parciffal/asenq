@@ -2,6 +2,7 @@ import { createApi } from "./api.js";
 import { CityStore } from "./store.js";
 import { CityHud } from "./hud.js";
 import { CityScene } from "./scene.js";
+import { streetLayout, streetRoute } from "./mapkit.js";
 
 async function main() {
   const api = createApi();
@@ -43,8 +44,8 @@ async function main() {
   hud.setScene(scene);
 
   const closeEvents = api.events({
-    state: (wire) => hud.handleState(wire),
-    packet: (packet) => scene.handlePacket(packet),
+    state: (wire) => hud.handleState({ ...wire, layout: streetLayout(wire.layout) }),
+    packet: (packet) => scene.handlePacket({ ...packet, path: streetRoute(packet.path) }),
     message: (data) => hud.handleMessage(data),
     read: (data) => hud.handleRead(data),
     connection: (open) => {

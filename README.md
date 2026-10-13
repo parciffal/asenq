@@ -351,6 +351,8 @@ Outfits: `claude`, `codex`, `gemini`, `qwen`, `llama`, `mistral`, `neutral`. Ses
 
 `asenq city` opens a pixel-art city in your browser, with furnished buildings for real channels, characters for sessions, and packets for observed messages. The inspector shows session state, memberships and outfit mappings; search and the Sessions/Channels tables help you find targets. The terminal `asenq viz` command and the TUI **Map** tab remain available.
 
+The browser street has a 48-pixel upper sidewalk, a 72-pixel road and a 24-pixel lower sidewalk at native scale. Workstation stalls sit below the lower sidewalk, with busy floor glows visible above their scenery. Buildings retain their original size. Selection, walking, message routes, the camera and minimap use the same expanded browser layout; terminal geometry is unchanged.
+
 ```sh
 asenq city                         # choose a free port and open the browser
 asenq city --no-open --port 8787    # print the URL without opening it

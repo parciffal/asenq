@@ -1,3 +1,5 @@
+import { STREET } from "./mapkit.js";
+
 export const CELL = 8;
 export const px = (point) => ({ x: point.x * CELL, y: point.y * CELL });
 
@@ -138,7 +140,7 @@ export function messageTouches(msg, scope) {
 }
 
 export function walkPath(from, to) {
-  return [from, { x: from.x, y: 0 }, { x: to.x, y: 0 }, to];
+  return [from, { x: from.x, y: STREET.spine }, { x: to.x, y: STREET.spine }, to];
 }
 
 export function sample(path, distance) {

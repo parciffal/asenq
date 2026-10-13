@@ -1,5 +1,5 @@
 import { sample, orderedTargets, cycle, targetKey, walkPath, poseFor, px, fnv1a } from "./logic.js";
-import { clampView, plateText, vacantLotX, cityWorld } from "./mapkit.js";
+import { clampView, plateText, vacantLotX, cityWorld, STREET } from "./mapkit.js";
 import { paintVenue } from "./art/buildings.js";
 import { paintStreetTile, paintWorkstation } from "./art/street.js";
 import { textureFor, loadCharacterTextures } from "./art/characters.js";
@@ -160,7 +160,7 @@ export class CityScene extends Phaser.Scene {
       const last = second ?? first;
       const left = first.rect.x * 8;
       const right = (last.rect.x + last.rect.width) * 8;
-      this.centerAt((left + right) / 2, 0);
+      this.centerAt((left + right) / 2, STREET.spine * 8);
       return;
     }
     const operator = state.wire.layout.characters.find((item) => state.charactersById.get(item.id)?.source === "human");
@@ -234,16 +234,14 @@ export class CityScene extends Phaser.Scene {
     const signature = `${x}:${pixelWidth}`;
     if (this.streetSignature !== signature) {
       const canvas = document.createElement("canvas");
-      canvas.width = pixelWidth;
-      canvas.height = 80;
       paintStreetTile(canvas, x, pixelWidth);
       this.streetSprite?.destroy();
       this.replaceCanvasTexture("city-street", canvas);
-      this.streetSprite = this.add.image(x, -32, "city-street").setOrigin(0, 0);
+      this.streetSprite = this.add.image(x, STREET.top, "city-street").setOrigin(0, 0);
       this.streetLayer.add(this.streetSprite);
       this.streetSignature = signature;
     }
-    this.streetSprite?.setPosition(x, -32);
+    this.streetSprite?.setPosition(x, STREET.top);
     this.drawVacant(this.vacantX);
   }
 
@@ -253,12 +251,12 @@ export class CityScene extends Phaser.Scene {
     this.vacantGraphics ??= this.add.graphics();
     this.vacantGraphics.clear();
     this.vacantGraphics.fillStyle(COLORS.burgundy, 0.75);
-    this.vacantGraphics.fillRect(x, -32, 320, 80);
+    this.vacantGraphics.fillRect(x, STREET.top, 320, STREET.height);
     this.vacantGraphics.lineStyle(1, COLORS.border, 0.9);
-    dashedRect(this.vacantGraphics, x, -32, 320, 80, 7, 5);
+    dashedRect(this.vacantGraphics, x, STREET.top, 320, STREET.height, 7, 5);
     this.streetLayer.add(this.vacantGraphics);
     this.vacantText ??= this.add.text(0, 0, "VACANT LOT", { fontFamily: "Silkscreen", fontSize: "8px", color: "#a52b3a" });
-    this.vacantText.setPosition(x + 16, 0);
+    this.vacantText.setPosition(x + 16, STREET.spine * 8);
     this.vacantText.setOrigin(0, 0.5);
     this.streetLayer.add(this.vacantText);
   }
@@ -364,6 +362,8 @@ export class CityScene extends Phaser.Scene {
       } else entry.image.setPosition(placed.rect.x * 8, placed.rect.y * 8);
     }
     for (const [id, entry] of this.stationImages) if (!live.has(id)) { entry.image.destroy(); this.stationImages.delete(id); }
+    // Keep the floor glow above opaque workstation floors, but below the characters.
+    this.stationLayer.bringToTop(this.activityGraphics);
   }
 
   drawCharacters(state) {
