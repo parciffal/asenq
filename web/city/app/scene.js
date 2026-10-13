@@ -1,9 +1,9 @@
 import { sample, orderedTargets, cycle, targetKey, walkPath, poseFor, px, fnv1a } from "./logic.js";
-import { clampView, plateText } from "./mapkit.js";
+import { clampView, plateText, vacantLotX, cityWorld } from "./mapkit.js";
 import { paintVenue } from "./art/buildings.js";
 import { paintStreetTile, paintWorkstation } from "./art/street.js";
 import { textureFor, loadCharacterTextures } from "./art/characters.js";
-import { PAL } from "./art/palette.js";
+import { PAL, HARNESS_COLORS } from "./art/palette.js";
 
 const color = (name) => Number.parseInt(PAL[name].slice(1), 16);
 const COLORS = {
@@ -65,6 +65,7 @@ export class CityScene extends Phaser.Scene {
     this.fxCamera.ignore([...this.worldLayers, this.bgLayer]);
 
     this.conduits = this.add.graphics(); this.conduitLayer.add(this.conduits);
+    this.activityGraphics = this.add.graphics(); this.stationLayer.add(this.activityGraphics);
     this.packetGraphics = this.add.graphics(); this.packetLayer.add(this.packetGraphics);
     this.selectionGraphics = this.add.graphics(); this.selectionLayer.add(this.selectionGraphics);
     this.rainGraphics = this.add.graphics(); this.fxLayer.add(this.rainGraphics);
@@ -129,7 +130,7 @@ export class CityScene extends Phaser.Scene {
     const wasOffline = this.lastWire?.connection === "offline";
     const offline = wire.connection === "offline";
     this.lastWire = wire;
-    this.vacantX = Math.max(this.vacantX ?? 0, this.nextVacantX(wire));
+    this.vacantX = vacantLotX(wire.layout.venues);
     if (offline) {
       this.packets.length = 0;
       this.walks.clear();
@@ -370,7 +371,7 @@ export class CityScene extends Phaser.Scene {
     for (const placed of state.wire.layout.characters) {
       const character = state.charactersById.get(placed.id);
       if (!character || (character.source === "process" && !state.ui.showProcesses)) continue;
-      const key = textureFor(character.appearance, "idle_a");
+      const key = textureFor(character.appearance, "idle_a", character.harness);
       if (!this.textures.exists(key)) continue;
       live.add(character.id);
       let entry = this.characterSprites.get(character.id);
@@ -401,13 +402,14 @@ export class CityScene extends Phaser.Scene {
 
   drawCharactersFrame(state, now) {
     const wire = state.wire;
+    this.activityGraphics.clear();
     if (!wire) return;
     const reduced = wire.reducedMotion;
     for (const [id, item] of this.characterSprites) {
       const { sprite, placed, character } = item;
       const anim = state.animations.get(id);
       const activity = poseFor(character, anim, now, wire.connection, reduced);
-      const key = textureFor(character.appearance, activity.pose);
+      const key = textureFor(character.appearance, activity.pose, character.harness);
       if (this.textures.exists(key) && sprite.texture.key !== key) sprite.setTexture(key);
       const selected = keyOf(state.ui.selected) === `c:${id}`;
       const filtered = state.ui.filter !== null && character.source !== "human" && character.harness !== state.ui.filter;
@@ -422,6 +424,11 @@ export class CityScene extends Phaser.Scene {
         y = position.y * 8 + walk.yOffset;
       }
       sprite.setPosition(x, y);
+      if (character.source === "registered" && character.busy === true && activity.tone === "normal") {
+        const glowColor = Number.parseInt((HARNESS_COLORS[character.harness] ?? PAL.cyan).slice(1), 16);
+        const alpha = (reduced ? 0.6 : 0.45 + 0.2 * Math.sin(now / 300)) * (dim ? 0.3 : 1);
+        this.activityGraphics.fillStyle(glowColor, alpha).fillEllipse(x, y, 30, 6);
+      }
       sprite.setAlpha(activity.tone === "lost" ? 0.6 : activity.tone === "gone" ? 0.4 : dim ? 0.3 : 1);
       if (activity.tone === "offline") sprite.setTint(0x8c8c8c); else sprite.clearTint();
       const labels = this.characterLabels.get(id);
@@ -433,7 +440,7 @@ export class CityScene extends Phaser.Scene {
       const role = character.source === "human" ? "[H]" : character.role === "orchestrator" ? "[O]" : character.role === "worker" ? "[W]" : "[-]";
       labels.badges.setText(`${harness}\n${role}\n${activity.label}${activity.badge ? ` ${activity.badge}` : ""}`);
       labels.badges.setPosition(x + 20, y - 48);
-      labels.badges.setColor(activity.tone === "offline" || activity.tone === "lost" || activity.tone === "gone" ? "#bdb1a4" : activity.tone === "dim" ? "#8b7577" : "#55ced1");
+      labels.badges.setColor(activity.tone === "offline" || activity.tone === "lost" || activity.tone === "gone" ? "#bdb1a4" : activity.tone === "dim" ? "#8b7577" : HARNESS_COLORS[character.harness] ?? "#55ced1");
       labels.plate.container.setAlpha(dim ? 0.5 : activity.tone === "lost" || activity.tone === "gone" ? 0.6 : 1);
     }
   }
@@ -445,7 +452,7 @@ export class CityScene extends Phaser.Scene {
         if (room.canonical) continue;
         const character = state.charactersById.get(room.id);
         if (!character || (character.source === "process" && !state.ui.showProcesses)) continue;
-        const texture = textureFor(character.appearance, "idle_a");
+        const texture = textureFor(character.appearance, "idle_a", character.harness);
         if (!this.textures.exists(texture)) continue;
         const key = `${venue.key}:${room.id}`;
         live.add(key);
@@ -691,18 +698,8 @@ export class CityScene extends Phaser.Scene {
     }
   }
 
-  nextVacantX(wire) {
-    return Math.floor((Math.max(...wire.layout.venues.map((venue) => venue.rect.x / 48), -1) + 1) * 48) * 8;
-  }
-
   worldBounds() {
-    const bounds = this.state.wire?.layout.bounds;
-    const lotX = this.vacantX ?? (this.state.wire ? this.nextVacantX(this.state.wire) : 0);
-    const left = Math.min(bounds ? bounds.x * 8 : 0, lotX);
-    const top = Math.min(bounds ? bounds.y * 8 : -32, -32);
-    const right = Math.max(bounds ? (bounds.x + bounds.width) * 8 : 320, lotX + 320);
-    const bottom = Math.max(bounds ? (bounds.y + bounds.height) * 8 : 48, 48);
-    return { x: left - 320, y: top - 96, width: right - left + 640, height: bottom - top + 192 };
+    return cityWorld(this.state.wire?.layout.bounds ?? null, this.vacantX ?? 0);
   }
 
   setView(scrollX, scrollY, zoom = this.mainCamera.zoom) {

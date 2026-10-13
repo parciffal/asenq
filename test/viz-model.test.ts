@@ -126,7 +126,7 @@ test("aged-out gone registrations and short resume ids never hide a detected pro
   assert.ok(short.characters.some((c) => c.id === "proc:8"));
 });
 
-test("expanding streets and floors preserve surviving coordinates and retained reservations", () => {
+test("expanding streets and floors preserve surviving coordinates; removed channels release their space", () => {
   const place = new CityPlacement();
   const a = session({ id: "a", name: "alpha" });
   const b = session({ id: "b", name: "street", role: "worker" });
@@ -146,7 +146,41 @@ test("expanding streets and floors preserve surviving coordinates and retained r
   const rejoined = place.update(world([a, b], [channel("ops", ["a"]), channel("empty")]));
   assert.deepEqual(rejoined.byCharacter.get("a")!.anchor, pos);
   assert.deepEqual(rejoined.byCharacter.get("b")!.anchor, street);
-  assert.equal(rejoined.venues.find((v) => v.venue.name === "ops")!.floors, 14);
+  assert.equal(rejoined.venues.find((v) => v.venue.name === "ops")!.floors, 1);
+});
+
+test("removing channels compacts the city and deleting the last returns the baseline", () => {
+  const place = new CityPlacement();
+  const x = session({ id: "x", name: "x" });
+  const first = place.update(world([x], [channel("a"), channel("b"), channel("c", ["x"])]));
+  const originalB = first.venues.find((v) => v.venue.name === "b")!;
+  const originalC = first.venues.find((v) => v.venue.name === "c")!;
+  assert.deepEqual(first.venues.map((v) => v.rect.x), [0, 48, 96]);
+  assert.equal(first.bounds.width, 136);
+  const cut = place.update(world([x], [channel("a"), channel("c", ["x"])]));
+  const compactedC = cut.venues.find((v) => v.venue.name === "c")!;
+  assert.equal(compactedC.rect.x, 48);
+  assert.equal(compactedC.venue.key, originalC.venue.key);
+  assert.deepEqual(cut.venues[0]!.rect, first.venues[0]!.rect);
+  assert.ok(cut.moved.some((m) => m.id === "x"));
+  assert.equal(cut.bounds.width, 88);
+  const grown = place.update(world([x], [channel("a"), channel("c", ["x"]), channel("d")]));
+  assert.equal(grown.venues.find((v) => v.venue.name === "d")!.rect.x, 96);
+  assert.equal(grown.venues.find((v) => v.venue.name === "c")!.rect.x, 48);
+  const back = place.update(world([x], [channel("a"), channel("b"), channel("c", ["x"]), channel("d")]));
+  const newB = back.venues.find((v) => v.venue.name === "b")!;
+  assert.equal(newB.rect.x, 144);
+  assert.notEqual(newB.venue.key, originalB.venue.key);
+  assert.deepEqual(place.update(world([], [])).bounds, { x: 0, y: -14, width: 40, height: 30 });
+});
+
+test("a channel's floors follow its live roster", () => {
+  const place = new CityPlacement();
+  const people = ["s1", "s2", "s3"].map((id) => session({ id, name: id }));
+  const full = place.update(world(people, [channel("ops", ["s1", "s2", "s3"])]));
+  assert.equal(full.venues[0]!.floors, 2);
+  const small = place.update(world(people, [channel("ops", ["s1"])]));
+  assert.equal(small.venues[0]!.floors, 1);
 });
 
 test("canonical membership changes alone move a home and observed renames retain keys and appearance", () => {

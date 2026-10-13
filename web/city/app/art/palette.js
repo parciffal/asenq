@@ -21,3 +21,8 @@ export const PAL = Object.freeze({
   road: "#18151d",
   sidewalk: "#302b33",
 });
+
+// Harness identity, not LLM model metadata.
+export const HARNESS_COLORS = Object.freeze({
+  claude: "#f6893e", omp: "#3fd27f", opencode: "#6aa8ff", codex: "#c86dd7",
+});

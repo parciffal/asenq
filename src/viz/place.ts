@@ -72,8 +72,8 @@ export function matchingTargets(world: World, layout: CityLayout, ui: VizUi): Ta
   });
 }
 
-type VenueReservation = { key: string; name: string; appearance: CityVenue["appearance"]; strip: number; slots: Map<string, number>; floors: number };
-/** All reservations are retained until this map instance is destroyed. */
+type VenueReservation = { key: string; name: string; appearance: CityVenue["appearance"]; serial: number; slots: Map<string, number>; floors: number };
+/** Reservations live while their channel exists; live channels occupy contiguous strips in creation order. */
 export class CityPlacement {
   private readonly names = new Map<string, VenueReservation>();
   private readonly streets = new Map<string, number>([["human", 0]]);
@@ -82,7 +82,6 @@ export class CityPlacement {
   private previous = new Map<string, Point>();
   private nextVenue = 0;
   private nextOrder = 0;
-  private bounds: Rect = { x: 0, y: -14, width: 40, height: 30 };
 
   renameChannel(oldName: string, name: string): void {
     const reservation = this.names.get(oldName);
@@ -93,15 +92,18 @@ export class CityPlacement {
   }
 
   update(world: World): CityLayout {
+    const live = new Set(world.venues.map((v) => v.name));
+    for (const name of this.names.keys()) if (!live.has(name)) this.names.delete(name);
     for (const v of [...world.venues].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
       if (!this.names.has(v.name)) {
-        const strip = this.nextVenue++;
-        this.names.set(v.name, { key: `venue:${strip}`, name: v.name, appearance: venueAppearance(v.name), strip, slots: new Map(), floors: 1 });
+        const serial = this.nextVenue++;
+        this.names.set(v.name, { key: `venue:${serial}`, name: v.name, appearance: venueAppearance(v.name), serial, slots: new Map(), floors: 1 });
       }
       const reservation = this.names.get(v.name)!;
       v.key = reservation.key;
       v.appearance = reservation.appearance;
       for (const id of v.roster.map((c) => c.id).sort()) if (!reservation.slots.has(id)) reservation.slots.set(id, reservation.slots.size);
+      reservation.floors = 1;
       for (const c of v.roster) reservation.floors = Math.max(reservation.floors, Math.floor(reservation.slots.get(c.id)! / 2) + 1);
     }
     const byName = new Map(world.venues.map((v) => [v.name, v]));
@@ -124,9 +126,11 @@ export class CityPlacement {
       targets.push({ target, anchor, rect, order: this.orders.get(key)! });
       routes.set(key, routePoints(points));
     };
-    for (const venue of world.venues.sort((a, b) => this.names.get(a.name)!.strip - this.names.get(b.name)!.strip)) {
+    const orderedVenues = world.venues.sort((a, b) => this.names.get(a.name)!.serial - this.names.get(b.name)!.serial);
+    for (let strip = 0; strip < orderedVenues.length; strip++) {
+      const venue = orderedVenues[strip]!;
       const r = this.names.get(venue.name)!;
-      const x = r.strip * 48;
+      const x = strip * 48;
       const rect = { x, y: -14 - (r.floors - 1) * 10, width: 40, height: r.floors * 10 };
       const entrance = { x: x + 20, y: -4 };
       const rooms: CityRoom[] = [];
@@ -163,14 +167,15 @@ export class CityPlacement {
       if (from && (from.x !== c.anchor.x || from.y !== c.anchor.y)) moved.push({ id: c.character.id, from, to: c.anchor });
     }
     this.previous = new Map(characters.map((c) => [c.character.id, c.anchor]));
+    let bounds: Rect = { x: 0, y: -14, width: 40, height: 30 };
     for (const rect of [...venues.map((v) => v.rect), ...characters.map((c) => c.rect)]) {
-      const x = Math.min(this.bounds.x, rect.x);
-      const y = Math.min(this.bounds.y, rect.y);
-      this.bounds = { x, y, width: Math.max(this.bounds.x + this.bounds.width, rect.x + rect.width) - x,
-        height: Math.max(this.bounds.y + this.bounds.height, rect.y + rect.height) - y };
+      const x = Math.min(bounds.x, rect.x);
+      const y = Math.min(bounds.y, rect.y);
+      bounds = { x, y, width: Math.max(bounds.x + bounds.width, rect.x + rect.width) - x,
+        height: Math.max(bounds.y + bounds.height, rect.y + rect.height) - y };
     }
     targets.sort((a, b) => a.order - b.order);
-    return { venues, characters, targets, routes, bounds: this.bounds, moved,
+    return { venues, characters, targets, routes, bounds, moved,
       byVenue: new Map(venues.map((v) => [v.venue.key, v])), byCharacter: new Map(characters.map((c) => [c.character.id, c])) };
   }
 }

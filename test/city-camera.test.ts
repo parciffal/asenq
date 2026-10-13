@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 // The browser stays uncompiled; static imports cannot resolve its shipped URL from dist/test.
-const { clampView, plateText } = await import(new URL("../../web/city/app/mapkit.js", import.meta.url).href);
+const { clampView, plateText, vacantLotX, cityWorld } = await import(new URL("../../web/city/app/mapkit.js", import.meta.url).href);
 
 const world = { x: -320, y: -496, width: 2400, height: 1200 };
 const viewport = { width: 1001, height: 701 };
@@ -45,4 +45,13 @@ test("name plates preserve case and both ends of long code-point names", () => {
   const plate = plateText(name);
   assert.equal(Array.from(plate).length, 24);
   assert.equal(plate, "abcdefghijklmn…XYZ123456");
+});
+
+test("city world follows live channels: adding extends, removing and deleting the last shrink", () => {
+  assert.equal(vacantLotX([0, 48, 96].map((x) => ({ rect: { x } }))), 1152);
+  assert.deepEqual(cityWorld({ x: 0, y: -14, width: 136, height: 30 }, 1152), { x: -320, y: -208, width: 2112, height: 432 });
+  assert.equal(vacantLotX([0, 48].map((x) => ({ rect: { x } }))), 768);
+  assert.equal(cityWorld({ x: 0, y: -14, width: 88, height: 30 }, 768).width, 1728);
+  assert.equal(vacantLotX([]), 0);
+  assert.deepEqual(cityWorld({ x: 0, y: -14, width: 40, height: 30 }, 0), { x: -320, y: -208, width: 960, height: 432 });
 });

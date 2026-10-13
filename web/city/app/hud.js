@@ -1,5 +1,6 @@
 import { targetKey, scopeOf, search, messageTouches } from "./logic.js";
 import { filterConversations, groupByDay, statusMark, awaitingReply, mentionSuggestions } from "./chat.js";
+import { characterTextureKey } from "./art/characters.js";
 
 const element = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -259,7 +260,7 @@ export class CityHud {
     const section = this.makeSection(character.name);
     const canvas = element("canvas", "character-preview");
     canvas.width = 32; canvas.height = 48;
-    this.drawCharacterPreview(canvas, character.appearance);
+    this.drawCharacterPreview(canvas, character.appearance, character.harness);
     section.append(canvas);
     if (character.previousNames?.length) this.addDetail(section, "FORMER NAMES", character.previousNames.join(", "));
     this.addDetail(section, "SOURCE", character.source);
@@ -317,8 +318,8 @@ export class CityHud {
     section.append(row);
   }
 
-  drawCharacterPreview(canvas, appearance) {
-    const source = this.scene?.textures?.get?.(`ch:${appearance.outfit}:${appearance.variant}:idle_a`)?.getSourceImage?.();
+  drawCharacterPreview(canvas, appearance, harness) {
+    const source = this.scene?.textures?.get?.(characterTextureKey(appearance, "idle_a", harness))?.getSourceImage?.();
     const context = canvas.getContext("2d");
     context.imageSmoothingEnabled = false;
     context.clearRect(0, 0, canvas.width, canvas.height);
