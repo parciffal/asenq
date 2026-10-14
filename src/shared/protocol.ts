@@ -1,9 +1,10 @@
-export const PROTOCOL = 3;
+export const PROTOCOL = 19;
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 export const RESERVED = ["human", "asenq", "all", "daemon"];
 export const MAX_TEXT = 32_000;
 export const MAX_LINE = 1024 * 1024;
 export const GRACE_MS = 120_000;
+export const QUEUE_TTL_MS = 86_400_000;
 export const ACK_TIMEOUT_MS = 10_000;
 export const RETRY_MS = 30_000;
 export const MAX_ATTEMPTS = 5;
@@ -11,30 +12,50 @@ export const PROBE_MS = 30_000;
 
 export type Harness = "claude" | "opencode" | "omp";
 export type Inbound = "accept" | "hold" | "refuse";
-export type Kind = "chat" | "task" | "result" | "status";
-export const KINDS: Kind[] = ["chat", "task", "result", "status"];
+export type Role = "orchestrator" | "worker";
+export type Kind = "chat" | "task" | "result" | "status" | "control";
+export const KINDS: Kind[] = ["chat", "task", "result", "status", "control"];
+export type ControlAction = "pause" | "resume" | "cancel";
+export const CONTROL_ACTIONS: readonly ControlAction[] = ["pause", "resume", "cancel"];
 export const INBOUND: Inbound[] = ["accept", "hold", "refuse"];
+export const MENTION_KEYWORDS: readonly string[] = ["orch", "orchestrator", "orchestrators", "wrk", "worker", "workers", "all"];
+
+const MENTION_OPENING = /[\s(\[<{"'`]/;
+
+/** Whether a candidate @ may open a mention at this UTF-16 offset. */
+export function hasMentionOpening(text: string, index: number): boolean {
+  return index === 0 || (index > 0 && MENTION_OPENING.test(text[index - 1]));
+}
 
 export type ErrCode =
   | "bad_request" | "unknown_target" | "name_taken" | "invalid_name"
-  | "too_large" | "not_registered" | "no_session" | "rate_limited" | "internal";
+  | "unknown_channel" | "channel_renamed" | "not_live" | "ambiguous_target" | "unknown_mention"
+  | "too_large" | "not_registered" | "not_permitted" | "no_session" | "rate_limited" | "internal";
 
 export type Req = { id: number; op: string; [k: string]: unknown };
 export type Res =
   | { id: number; ok: true; [k: string]: unknown }
   | { id: number; ok: false; error: { code: ErrCode; message: string } };
 
+export type FileReference = { path: string; summary: string; sha256: string; size: number };
+
+export type ResetResult = "compacted" | "unsupported" | "failed";
+
 export type WireMsg = {
   id: string; from: string; to: string;
-  kind?: Kind; thread?: string; replyTo?: string; done?: boolean;
-  text: string; createdAt: number;
+  kind?: Kind; action?: ControlAction; thread?: string; replyTo?: string; done?: boolean;
+  /** The reply target is no longer retained or is not readable by this caller. */
+  replyToMissing?: boolean;
+  text: string; file?: FileReference; createdAt: number; sourceChannel?: string;
+  reset?: "compact"; resetResult?: ResetResult;
 };
 
 export type MsgStatus =
-  | "queued" | "delivered" | "held" | "rejected" | "failed"
+  | "queued" | "delivered" | "replied" | "held" | "rejected" | "failed"
   | "expired" | "posted" | "dropped";
 
-/** A retained message together with its durable paging order and current delivery state. */
+/** Retained history and held replies include durable order and delivery state.
+ * Scope held actions by session ids; historical from/to names can outlive a rename. */
 export type StoredMessage = WireMsg & {
   order: number;
   fromSessionId?: string;
@@ -45,6 +66,7 @@ export type StoredMessage = WireMsg & {
 };
 
 export type SessionState = "live" | "gone" | "removed";
+export type PingStatus = "responding" | "not_responding" | "unknown";
 
 /** Stable historical identity; names can be reused, but ids cannot. */
 export type SessionIdentity = {
@@ -55,8 +77,36 @@ export type SessionIdentity = {
   cwd?: string;
   state: SessionState;
   inbound: Inbound;
+  role?: Role | null;
   createdAt: number;
   removedAt?: number;
+  closedAt?: number;
+};
+
+/** Current registered session, including harness-reported availability and resume metadata. */
+export type ListedSession = {
+  id: string;
+  name: string;
+  previousNames: string[];
+  harness: Harness;
+  cwd: string | null;
+  state: "live" | "gone" | "stale";
+  stale: boolean;
+  ping: PingStatus | null;
+  inbound: Inbound;
+  role: Role | null;
+  channels: string[];
+  lastSeen: number | null;
+  busy: boolean | null;
+  harnessSessionId: string | null;
+  resumeCommand?: string;
+  you: boolean;
+};
+
+export type ReplacementResult = {
+  from: SessionIdentity;
+  to: SessionIdentity;
+  skippedNames: string[];
 };
 
 export type ChannelSummary = {
@@ -64,6 +114,7 @@ export type ChannelSummary = {
   count: number;
   lastAt: number;
   lastOrder: number;
+  memberIds?: string[];
 };
 
 export type HistoryScope =
@@ -85,9 +136,11 @@ export type ReadState = {
 
 export type TailEvent =
   | { type: "session"; action: "registered" | "renamed" | "gone" | "removed" | "updated";
-      name: string; harness: Harness; cwd?: string; oldName?: string; session: SessionIdentity }
-  | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string }
+      name: string; harness: Harness; cwd?: string; oldName?: string; reason?: string; session: SessionIdentity }
+  | { type: "channel"; action: "created" | "updated" | "renamed" | "deleted"; channel: ChannelSummary; oldName?: string }
+  | { type: "message"; msg: StoredMessage; status: MsgStatus; reason?: string; failedCount?: number }
   | { type: "read"; state: ReadState }
+  | { type: "ping"; sessionId: string; ping: PingStatus }
   | { type: "retention" };
 
 export type PositionedEvent = { position: number; event: TailEvent };
@@ -98,8 +151,12 @@ export type SyncResult = {
   sessions: SessionIdentity[];
   channels: ChannelSummary[];
   readStates: ReadState[];
+  failedCount: number;
   /** Latest retained non-channel message order per stable session identity; absent means zero. */
   sessionLastOrders: Record<string, number>;
+  /** Durable direct activity: outgoing creation or first incoming delivery, excluding channel posts. */
+  sessionLastActivity: Record<string, number>;
+  sessionPings: Record<string, PingStatus>;
 };
 
 /** Latest incoming human-inbox message from one sender; `sessionId` is absent for legacy name-only senders. */
@@ -123,18 +180,22 @@ export type ReplayResult = {
 
 export type ReadMutationResult = { applied: boolean; state: ReadState };
 
-/** `session`/`key` identify the target binding on connections that host several sessions. */
+/** `session`/`key` identify the target binding; a compact push requires a per-attempt `resetAttempt` receipt token. */
 export type Push =
-  | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string }
+  | { push: "deliver"; msg: WireMsg; text: string; session: string; key: string; reset?: "compact"; resetAttempt?: string }
+  | { push: "ping"; pingId: string }
   | { push: "event"; position: number; event: TailEvent };
 
-export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unknown_target"; reason?: string };
+export type SendResult = { to: string; msgId?: string; status: MsgStatus | "unknown_target"; reason?: string; reset?: ResetResult | "pending" };
+export type ChannelSendResult = { msgId: string; results: SendResult[] };
 
 export type SendOptions = {
   kind?: Kind;
+  action?: ControlAction;
   thread?: string;
   replyTo?: string;
   done?: boolean;
+  reset?: "compact";
 };
 
 export class AsenqError extends Error {

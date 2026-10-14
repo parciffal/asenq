@@ -6,6 +6,15 @@ export type OmpZod = { object(shape: Record<string, unknown>): unknown } & Recor
 
 export type Timer = unknown;
 
+/** Minimal copy of omp's `CompactOptions` (`ctx.compact`), omp 18.x. */
+export interface CompactOptions {
+  /**
+   * A manual compaction aborts any turn in flight; set this when the caller dispatches its own
+   * follow-up turn so the compaction does not also resume the interrupted turn.
+   */
+  suppressContinuation?: boolean;
+}
+
 export type ExtensionContext = {
   agent: { kind: "main" | "sub"; id: string; name: string; depth: number; parentId?: string };
   cwd: string;
@@ -14,6 +23,8 @@ export type ExtensionContext = {
   ui: { setStatus(key: string, text: string | undefined): void };
   setTimeout(callback: () => void, ms?: number): Timer;
   clearTimer(timer: Timer): void;
+  /** Compact the session context; rejects when compaction fails. */
+  compact(options?: CompactOptions): Promise<void>;
 };
 
 export type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
@@ -41,6 +52,8 @@ export type ExtensionAPI = {
   on(event: "session_start", handler: Handler<{ type: "session_start" }>): void;
   on(event: "session_switch", handler: Handler<{ type: "session_switch"; reason: "new" | "resume" | "fork" }>): void;
   on(event: "session_shutdown", handler: Handler<{ type: "session_shutdown" }>): void;
+  on(event: "agent_start", handler: Handler<{ type: "agent_start" }>): void;
+  on(event: "agent_end", handler: Handler<{ type: "agent_end"; messages: unknown[]; willContinue?: boolean }>): void;
   registerTool(tool: ToolDefinition): void;
   sendUserMessage(content: string, options?: { deliverAs?: "steer" | "followUp" | "aside"; attribution?: "user" | "agent" }): void;
   getActiveTools(): string[];

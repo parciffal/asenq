@@ -9,18 +9,33 @@ if (!process.versions.bun && (major < 22 || (major === 22 && minor < 13))) {
 
 const USAGE = `usage: asenq <command>
 
-  ls                                   list sessions
-  send <name|*|human> <text…>          send as the user [--kind k] [--thread t] [--reply-to id] [--done]
-  tail                                 follow messages and session events
+  ls [--cwd prefix] [--harness claude|omp|opencode] [--channel name] [--json]  list sessions
+  send <name|*|human> <text…>          send as the user [--kind k] [--action pause|resume|cancel] [--reset compact] [--thread t] [--reply-to id] [--done]
+  tail                                 follow messages, sessions and channel events
   log [--session name] [--id msgId] [--limit n]
   inbox                                messages addressed to "human"
   rename <old> <new>
+  replace <from> <to>                   move a session onto a live one
+  replace --from-id <id> <to> | replace <from> --to-id <id>
+  replace --from-id <id> --to-id <id>
+  close <name|identity>                 terminally archive a session
+  purge <name|identity> | purge --all    permanently delete archived conversations
   inbound <name> accept|hold|refuse
+  role <name> orchestrator|worker|unset
   held [name] | release <msgId> | drop <msgId>
-  channels | channel read <ch> [--limit n] | channel send <ch> <text…>
+  channels [--json]                     list channels, including those with no posts
+  channel create <ch>                   create an empty channel
+  channel rename <ch> <new>              rename a channel
+  channel add <ch> <name>               add a live session
+  channel remove <ch> <name>            remove a member by current or former name
+  channel remove <ch> --session-id <id> remove a member by stable identity
+  channel members <ch> [--json]          list names, roles, states and identity IDs
+  channel read <ch> [--limit n] | channel send <ch> <text…>
   daemon run|start|stop|status
   setup [--remove]
-  tui                                  interactive human messaging console
+  tui [--reduced-motion]                interactive human messaging console
+  viz [--reduced-motion]                live cyberpunk city map of channels and sessions
+  city [--port n] [--no-open] [--reduced-motion]  pixel city map in the browser (localhost)
   doctor`;
 
 async function main(argv: string[]): Promise<number> {
@@ -54,7 +69,17 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === "tui") {
     // Lazy by design: hook and MCP invocations must not initialize terminal input or renderer dependencies.
     const { runTui } = await import("./tui/app.js");
-    return runTui();
+    return runTui(argv.slice(1));
+  }
+  if (cmd === "viz") {
+    // Lazy for the same reason as `tui`: no terminal renderer may load on hook/MCP paths.
+    const { runViz } = await import("./viz/app.js");
+    return runViz(argv.slice(1));
+  }
+  if (cmd === "city") {
+    // Keep the browser host and terminal map dependencies off hook/MCP paths.
+    const { runCity } = await import("./city/command.js");
+    return runCity(argv.slice(1));
   }
   const { runCommand } = await import("./cli/commands.js");
   return runCommand(cmd, argv.slice(1), USAGE);

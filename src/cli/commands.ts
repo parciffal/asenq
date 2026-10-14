@@ -1,12 +1,13 @@
 import { parseArgs } from "node:util";
 import { lockedPid, runDaemon } from "../daemon/main.js";
 import { AsenqClient, ensureDaemon } from "../shared/client.js";
-import type { SendResult, TailEvent } from "../shared/protocol.js";
-import { formatSendResults } from "../shared/tools.js";
+import { AsenqError, type ChannelSummary, type ControlAction, type ListedSession, type ReplacementResult, type ResetResult, type Role, type SendResult, type SessionIdentity, type TailEvent } from "../shared/protocol.js";
+import { formatSendResults, formatSessions } from "../shared/tools.js";
 
 type LoggedMsg = {
   id: string; from: string; to: string; text: string; createdAt: number;
-  kind?: string; thread?: string; replyTo?: string; done?: boolean; status: string; reason?: string;
+  kind?: string; action?: ControlAction; thread?: string; replyTo?: string; replyToMissing?: boolean; done?: boolean; status: string; reason?: string; sourceChannel?: string;
+  reset?: "compact"; resetResult?: ResetResult;
 };
 
 const out = (s: string): void => void process.stdout.write(s + "\n");
@@ -18,7 +19,7 @@ const oneLine = (s: string, n: number): string => {
 
 function msgLine(m: Omit<LoggedMsg, "status"> & { status?: string; reason?: string }): string {
   const status = m.status ? ` (${m.status}${m.reason ? `: ${m.reason}` : ""})` : "";
-  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.kind ? ` [${m.kind}]` : ""} ${oneLine(m.text, 120)}${status}`;
+  return `${hhmmss(m.createdAt)} ${m.id} ${m.from} → ${m.to}${m.sourceChannel ? ` via #${m.sourceChannel}` : ""}${m.kind ? ` [${m.kind}${m.action ? ` action=${m.action}` : ""}]` : ""}${m.reset ? ` reset=${m.reset}` : ""}${m.resetResult ? ` resetResult=${m.resetResult}` : ""}${m.replyToMissing && m.replyTo ? ` reply-to=${m.replyTo} (purged message)` : ""} ${oneLine(m.text, 120)}${status}`;
 }
 
 function need(args: string[], n: number, usage: string): void {
@@ -74,22 +75,30 @@ export async function runCommand(cmd: string, argv: string[], usage: string): Pr
 async function runClientCommand(client: AsenqClient, cmd: string, argv: string[], usage: string): Promise<number> {
   switch (cmd) {
     case "ls": {
-      const r = await client.request("list");
-      const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; inbound: string }[];
-      const table = [["NAME", "HARNESS", "STATE", "INBOUND", "CWD"], ...rows.map((s) => [s.name, s.harness, s.state, s.inbound, s.cwd ?? ""])];
-      const widths = table[0].map((_, i) => Math.max(...table.map((row) => row[i].length)));
-      for (const row of table) out(row.map((c, i) => (i === row.length - 1 ? c : c.padEnd(widths[i]))).join("  "));
+      const { values } = parseArgs({
+        args: argv, options: { cwd: { type: "string" }, harness: { type: "string" }, channel: { type: "string" }, json: { type: "boolean" } },
+      });
+      if (values.harness !== undefined && !["claude", "omp", "opencode"].includes(values.harness)) {
+        throw new Error("harness must be claude, omp or opencode");
+      }
+      const r = await client.request("list", values);
+      const sessions = r.sessions as ListedSession[];
+      if (values.json) {
+        out(JSON.stringify(sessions));
+      } else {
+        out(formatSessions(sessions, values.cwd !== undefined || values.harness !== undefined || values.channel !== undefined));
+      }
       return 0;
     }
     case "send": {
       const { values, positionals } = parseArgs({
         args: argv, allowPositionals: true,
-        options: { kind: { type: "string" }, thread: { type: "string" }, "reply-to": { type: "string" }, done: { type: "boolean" } },
+        options: { kind: { type: "string" }, action: { type: "string" }, reset: { type: "string" }, thread: { type: "string" }, "reply-to": { type: "string" }, done: { type: "boolean" } },
       });
       need(positionals, 2, "usage: asenq send <name|*|human> <text…>");
       const r = await client.request("send", {
         to: positionals[0], text: positionals.slice(1).join(" "),
-        kind: values.kind, thread: values.thread, replyTo: values["reply-to"], done: values.done,
+        kind: values.kind, action: values.action, reset: values.reset, thread: values.thread, replyTo: values["reply-to"], done: values.done,
       });
       const results = r.results as SendResult[];
       out(formatSendResults(results));
@@ -103,11 +112,17 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           const e: TailEvent = p.event;
           if (e.type === "session") {
             out(`${hhmmss(Date.now())} session ${e.name} (${e.harness}) ${e.action}${e.oldName ? ` from ${e.oldName}` : ""}`);
+          } else if (e.type === "channel") {
+            const detail = e.action === "deleted" ? ""
+              : `${e.oldName ? ` from #${e.oldName}` : ""} (${e.channel.memberIds?.length ?? 0} members)`;
+            out(`${hhmmss(Date.now())} channel #${e.channel.name} ${e.action}${detail}`);
+          } else if (e.type === "ping") {
+            out(`${hhmmss(Date.now())} ping ${e.sessionId}: ${e.ping}`);
           } else if (e.type === "message") {
             out(msgLine({ ...e.msg, status: e.status, reason: e.reason }));
           } else if (e.type === "retention") {
             out(`${hhmmss(Date.now())} retention pruned older history`);
-          } else {
+          } else if (e.type === "read") {
             const stream = e.state.scope.scope === "session" ? e.state.scope.sessionId : `#${e.state.scope.channel}`;
             out(`${hhmmss(Date.now())} read ${stream}: ${e.state.unread} unread`);
           }
@@ -132,8 +147,8 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       const msgs = r.messages as LoggedMsg[];
       if (values.id) {
         const m = msgs[0];
-        out(`${m.id} ${m.from} → ${m.to} ${new Date(m.createdAt).toISOString()} ${m.status}${m.reason ? ` (${m.reason})` : ""}`);
-        const meta = [m.kind && `kind=${m.kind}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}`, m.done && "done"].filter(Boolean);
+        out(`${m.id} ${m.from} → ${m.to}${m.sourceChannel ? ` via #${m.sourceChannel}` : ""} ${new Date(m.createdAt).toISOString()} ${m.status}${m.reason ? ` (${m.reason})` : ""}`);
+        const meta = [m.kind && `kind=${m.kind}`, m.action && `action=${m.action}`, m.reset && `reset=${m.reset}`, m.resetResult && `resetResult=${m.resetResult}`, m.thread && `thread=${m.thread}`, m.replyTo && `reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}`, m.done && "done"].filter(Boolean);
         if (meta.length) out(meta.join(" · "));
         out("");
         out(m.text);
@@ -144,12 +159,53 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
     }
     case "inbox": {
       const r = await client.request("inbox", { name: "human" });
-      const msgs = r.messages as LoggedMsg[];
+      const msgs = (r.messages as LoggedMsg[]).reverse();
       if (msgs.length === 0) out("no messages");
       for (const m of msgs) {
-        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}` : ""}${m.done ? " · done" : ""}`);
+        out(`[${new Date(m.createdAt).toISOString()}] ${m.from} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyTo ? ` · reply-to=${m.replyTo}${m.replyToMissing ? " (purged message)" : ""}` : ""}${m.done ? " · done" : ""}`);
         out(m.text);
         out("");
+      }
+      return 0;
+    }
+    case "close": case "purge": {
+      const { values, positionals } = parseArgs({
+        args: argv, allowPositionals: true,
+        options: cmd === "purge" ? { all: { type: "boolean" } } : {},
+      });
+      if (values.all ? positionals.length !== 0 : positionals.length !== 1) {
+        throw new Error(`usage: asenq ${cmd} <name|identity>${cmd === "purge" ? " | asenq purge --all" : ""}`);
+      }
+      if (values.all) {
+        const reply = await client.request("purge", { all: true });
+        const purged = reply.purged as string[];
+        out(purged.length ? purged.map((id) => `purged ${id}`).join("\n") : "no archived conversations");
+        return 0;
+      }
+      const target = positionals[0];
+      const { sessions } = await client.sync();
+      let session = sessions.find((s) => s.id === target);
+      if (!session) {
+        const matching = sessions.filter((s) => s.name === target);
+        const active = matching.filter((s) => s.state !== "removed");
+        if (cmd === "purge" && active.length) {
+          throw new Error(`cannot purge live or reconnecting name "${target}"; use an archived identity ID`);
+        }
+        const candidates = cmd === "close" && active.length ? active : matching;
+        if (!candidates.length) throw new Error(`unknown current session name or identity "${target}"`);
+        if (candidates.length > 1) {
+          throw new Error(`ambiguous session name "${target}"; use an identity ID: ${candidates.map((s) => s.id).join(", ")}`);
+        }
+        session = candidates[0];
+      }
+      if (cmd === "close") {
+        const reply = await client.request("close", { identity: session.id });
+        const closed = reply.session as SessionIdentity;
+        out(`closed ${closed.name} (${closed.id})`);
+      } else {
+        const reply = await client.request("purge", { identity: session.id });
+        const purged = reply.purged as string[];
+        out(purged.length ? purged.map((id) => `purged ${id}`).join("\n") : "no archived conversations purged");
       }
       return 0;
     }
@@ -159,10 +215,45 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       out(`renamed ${argv[0]} → ${String(r.name)}`);
       return 0;
     }
+    case "replace": {
+      const { values, positionals } = parseArgs({
+        args: argv, allowPositionals: true,
+        options: { "from-id": { type: "string" }, "to-id": { type: "string" } },
+      });
+      const fromId = values["from-id"];
+      const toId = values["to-id"];
+      const hasFromId = fromId !== undefined;
+      const hasToId = toId !== undefined;
+      const usage = "usage: asenq replace <from> <to> | asenq replace --from-id <id> <to> | asenq replace <from> --to-id <id> | asenq replace --from-id <id> --to-id <id>";
+      if ((hasFromId && !fromId) || (hasToId && !toId)
+        || positionals.length !== Number(!hasFromId) + Number(!hasToId)) throw new Error(usage);
+      let positional = 0;
+      const from = hasFromId ? undefined : positionals[positional++];
+      const to = hasToId ? undefined : positionals[positional++];
+      try {
+        const result = await client.request("replace", {
+          ...(hasFromId ? { fromId } : { from }),
+          ...(hasToId ? { toId } : { to }),
+        }) as ReplacementResult;
+        out(`replaced ${result.from.name} (${result.from.id}) with ${result.to.name} (${result.to.id}); source closed and archived`);
+        if (result.skippedNames.length) out(`skipped names: ${result.skippedNames.join(", ")}`);
+        return 0;
+      } catch (e) {
+        if (e instanceof AsenqError) throw new Error(`replace failed (${e.code}): ${e.message}`);
+        throw e;
+      }
+    }
     case "inbound": {
       need(argv, 2, "usage: asenq inbound <name> accept|hold|refuse");
       await client.request("set_inbound", { name: argv[0], mode: argv[1] });
       out(`${argv[0]} inbound ${argv[1]}`);
+      return 0;
+    }
+    case "role": {
+      need(argv, 2, "usage: asenq role <name> orchestrator|worker|unset");
+      if (!["orchestrator", "worker", "unset"].includes(argv[1])) throw new Error("role must be orchestrator, worker or unset");
+      await client.request("set_role", { name: argv[0], role: argv[1] === "unset" ? null : argv[1] });
+      out(`${argv[0]} role ${argv[1]}`);
       return 0;
     }
     case "held": {
@@ -185,14 +276,74 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       return 0;
     }
     case "channels": {
+      const { values: chValues } = parseArgs({ args: argv, allowPositionals: true, options: { json: { type: "boolean" } } });
       const r = await client.request("channel_list");
-      const rows = r.channels as { name: string; count: number; lastAt: number }[];
-      if (rows.length === 0) out("no channels");
-      for (const c of rows) out(`#${c.name}  ${c.count} messages  last ${new Date(c.lastAt).toLocaleString()}`);
+      const rows = r.channels as ChannelSummary[];
+      if (chValues.json) {
+        const identities = (await client.sync()).sessions;
+        const idMap = new Map(identities.map((s) => [s.id, s]));
+        out(JSON.stringify(rows.map((c) => ({
+          name: c.name,
+          members: (c.memberIds ?? []).map((id) => {
+            const s = idMap.get(id);
+            return { name: s?.name ?? id, role: s?.role ?? null, state: s?.state ?? "removed", id };
+          }),
+          count: c.count, lastAt: c.lastAt, lastOrder: c.lastOrder,
+        }))));
+      } else {
+        if (rows.length === 0) out("no channels");
+        for (const c of rows) out(`#${c.name}  ${c.count ? `${c.count} messages  last ${new Date(c.lastAt).toLocaleString()}` : "no posts"}  ${c.memberIds?.length ?? 0} members`);
+      }
       return 0;
     }
     case "channel": {
       const [sub, ch, ...rest] = argv;
+      if (sub === "create" && ch && rest.length === 0) {
+        await client.request("channel_create", { channel: ch });
+        out(`#${ch} created`);
+        return 0;
+      }
+      if (sub === "add" && ch && rest.length === 1) {
+        await client.request("channel_add", { channel: ch, name: rest[0] });
+        out(`${rest[0]} added to #${ch}`);
+        return 0;
+      }
+      if (sub === "remove" && ch) {
+        const { values, positionals } = parseArgs({
+          args: rest, allowPositionals: true, options: { "session-id": { type: "string" } },
+        });
+        const sessionId = values["session-id"];
+        if (sessionId ? positionals.length !== 0 : positionals.length !== 1) {
+          throw new Error("usage: asenq channel remove <ch> <name> | asenq channel remove <ch> --session-id <id>");
+        }
+        await client.request("channel_remove", { channel: ch, ...(sessionId ? { sessionId } : { name: positionals[0] }) });
+        out(`${sessionId ?? positionals[0]} removed from #${ch}`);
+        return 0;
+      }
+      if (sub === "rename" && ch && rest.length === 1) {
+        const r = await client.request("channel_rename", { channel: ch, name: rest[0] });
+        const renamed = r.channel as ChannelSummary;
+        out(`#${ch} renamed to #${renamed.name}`);
+        return 0;
+      }
+      if (sub === "members") {
+        const { values: memberValues, positionals: memberPositionals } = parseArgs({
+          args: argv.slice(1), allowPositionals: true, options: { json: { type: "boolean" } },
+        });
+        if (memberPositionals.length !== 1) {
+          throw new Error("usage: asenq channel members <ch> [--json]");
+        }
+        const memberChannel = memberPositionals[0];
+        const r = await client.request("channel_members", { channel: memberChannel });
+        const members = r.members as SessionIdentity[];
+        if (memberValues.json) {
+          out(JSON.stringify(members.map((m) => ({ name: m.name, role: m.role ?? null, state: m.state, id: m.id }))));
+        } else {
+          if (members.length === 0) out(`#${memberChannel} has no members`);
+          for (const member of members) out(`${member.name}  ${member.role ?? "unset"}  ${member.state}  ${member.id}`);
+        }
+        return 0;
+      }
       if (sub === "read" && ch) {
         const { values } = parseArgs({ args: rest, options: { limit: { type: "string" } } });
         const r = await client.request("channel_read", { channel: ch, limit: values.limit ? Number(values.limit) : undefined });
@@ -202,9 +353,11 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
       if (sub === "send" && ch && rest.length) {
         const r = await client.request("channel_send", { channel: ch, text: rest.join(" ") });
         out(`#${ch} ${String(r.msgId)} posted`);
+        const results = r.results as SendResult[];
+        out(results.length ? formatSendResults(results) : "no mention targets; no direct messages pushed");
         return 0;
       }
-      throw new Error("usage: asenq channel read <ch> [--limit n] | asenq channel send <ch> <text…>");
+      throw new Error("usage: asenq channel create <ch> | rename <ch> <new> | add <ch> <name> | remove <ch> <name> | remove <ch> --session-id <id> | members <ch> | read <ch> [--limit n] | send <ch> <text…>");
     }
     default:
       throw new Error(`unknown command "${cmd}"\n${usage}`);

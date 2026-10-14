@@ -1,10 +1,14 @@
 import type { MsgStatus, PositionedEvent, StoredMessage } from "../shared/protocol.js";
+import { renderMessageBody } from "../shared/render.js";
 import {
   sanitizeTerminalText, terminalTextWidth, truncateTerminalText, wrapTerminalText,
   type TerminalLine, type TerminalSpan, type TerminalStyle,
 } from "./terminal.js";
 
-/** Semantic styles. Colors are foreground-only so the terminal's own background shows through. */
+/**
+ * Semantic styles use foreground colors so the terminal's own background shows through.
+ * The terminal adapter drops unsupported colors, retaining bold/dim/inverse fallback.
+ */
 export const theme = {
   brand: { foreground: "brightCyan", bold: true },
   accent: { foreground: "cyan" },
@@ -13,6 +17,8 @@ export const theme = {
   agent: { foreground: "magenta", bold: true },
   dim: { dim: true },
   bold: { bold: true },
+  border: { foreground: "brightBlack", dim: true },
+  key: { inverse: true, dim: true },
   ok: { foreground: "green" },
   warn: { foreground: "yellow" },
   bad: { foreground: "red", bold: true },
@@ -24,9 +30,15 @@ export const theme = {
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 export function statusStyle(status: MsgStatus | string): TerminalStyle {
-  if (status === "delivered" || status === "posted") return theme.ok;
+  if (status === "delivered" || status === "posted" || status === "replied") return theme.ok;
   if (status === "queued" || status === "held") return theme.warn;
   return theme.bad;
+}
+
+export function harnessShortName(harness: string): string {
+  if (harness === "claude") return "cc";
+  if (harness === "opencode") return "oc";
+  return harness;
 }
 
 /** Truncate a label to `width` cells, marking any cut with an ellipsis. */
@@ -108,7 +120,7 @@ function wrappedBody(message: StoredMessage, width: number): string[] {
   let rows = wrapCache.get(key);
   if (!rows) {
     if (wrapCache.size > 4000) wrapCache.clear();
-    rows = wrapTerminalText(message.text, width);
+    rows = wrapTerminalText(renderMessageBody(message), width);
     wrapCache.set(key, rows);
   }
   return rows;
@@ -122,6 +134,8 @@ export type TranscriptOptions = {
   selectedId?: string;
   expanded?: (id: string) => boolean;
   firstUnreadId?: string;
+  /** Authoritative human unread count at firstUnreadId; defaults to 1, never counts agent traffic. */
+  unreadCount?: number;
   /** Rows before the first message, such as the older-history hint. */
   leading?: TerminalLine[];
   empty?: string;
@@ -132,66 +146,118 @@ export function senderLabel(message: StoredMessage): string {
   return message.from === "human" ? "you" : message.from;
 }
 
-function headerSpans(message: StoredMessage, now: number): TerminalSpan[] {
-  const human = message.from === "human";
-  const spans: TerminalSpan[] = [
-    { text: human ? "› " : "● ", style: human ? theme.human : theme.agent },
-    { text: senderLabel(message), style: human ? theme.human : theme.agent },
+function headerSpans(message: StoredMessage, now: number, width: number, fill?: TerminalStyle): TerminalSpan[] {
+  const sender = senderLabel(message);
+  const target = message.channel ? `#${message.channel}` : message.to === "human" ? "you" : message.to;
+  const senderWidth = terminalTextWidth(sender);
+  const targetWidth = terminalTextWidth(target);
+  const minimumIdentity = Math.min(width, Math.min(6, senderWidth) + 3 + Math.min(6, targetWidth));
+  const status: TerminalSpan = {
+    text: `${message.status === "delivered" || message.status === "posted" ? "✓ " : ""}${message.status}`,
+    style: statusStyle(message.status),
+  };
+  const time: TerminalSpan = { text: `  ${formatTime(message.createdAt, now)}`, style: theme.dim };
+  const tags: TerminalSpan[] = [];
+  if (message.kind && message.kind !== "chat") {
+    const kind = ` ${message.kind}${message.kind === "control" && message.action ? ` ${message.action}` : ""} `;
+    if (terminalTextWidth(kind) + 2 + minimumIdentity <= width) {
+      tags.push({ text: "  " }, { text: kind, style: { ...theme.warn, inverse: true } });
+    }
+  }
+  if (message.done && spansWidth(tags) + 7 + minimumIdentity <= width) {
+    tags.push({ text: " · done", style: theme.dim });
+  }
+  if (!message.channel && message.sourceChannel) {
+    const source = ` via #${message.sourceChannel}`;
+    if (spansWidth(tags) + terminalTextWidth(source) + minimumIdentity <= width) {
+      tags.push({ text: source, style: theme.dim });
+    }
+  }
+  const tagWidth = spansWidth(tags);
+  let right = [status, time];
+  // Keep both labels and message meaning readable; time yields first, then delivery state.
+  if (spansWidth(right) + 1 + minimumIdentity + tagWidth > width) right = [status];
+  if (spansWidth(right) + 1 + minimumIdentity + tagWidth > width) right = [];
+  const leftWidth = width - spansWidth(right) - (right.length ? 1 : 0);
+  const identityWidth = leftWidth - tagWidth;
+  let senderBudget = senderWidth;
+  let targetBudget = targetWidth;
+  if (senderWidth + 3 + targetWidth > identityWidth) {
+    const namesWidth = Math.max(0, identityWidth - 3);
+    senderBudget = Math.min(senderWidth, Math.ceil(namesWidth / 2));
+    targetBudget = Math.min(targetWidth, namesWidth - senderBudget);
+    senderBudget = Math.min(senderWidth, namesWidth - targetBudget);
+  }
+  const identity: TerminalSpan[] = identityWidth >= 5 ? [
+    { text: ellipsize(sender, senderBudget), style: message.from === "human" ? theme.human : theme.agent },
+    { text: " → ", style: theme.dim },
+    { text: ellipsize(target, targetBudget), style: theme.dim },
+  ] : [
+    { text: sender, style: message.from === "human" ? theme.human : theme.agent },
+    { text: " → ", style: theme.dim },
+    { text: target, style: theme.dim },
   ];
-  if (message.channel) spans.push({ text: ` in #${message.channel}`, style: theme.dim });
-  else if (message.to !== "human" && !human) spans.push({ text: ` → ${message.to}`, style: theme.agent });
-  else if (human) spans.push({ text: ` → ${message.to === "human" ? "you" : message.to}`, style: theme.dim });
-  spans.push({ text: "  " }, { text: message.status, style: statusStyle(message.status) });
-  if (message.kind && message.kind !== "chat") spans.push({ text: ` · ${message.kind}`, style: theme.dim });
-  if (message.done) spans.push({ text: " · done", style: theme.dim });
-  spans.push({ text: `  ${formatTime(message.createdAt, now)}`, style: theme.dim });
-  return spans;
+  return justify([...identity, ...tags], right, width, fill);
 }
 
 function detailLines(message: StoredMessage): string[] {
   const lines = [
-    `id ${message.id}${message.kind ? ` · kind ${message.kind}` : ""}${message.done ? " · done" : ""}`,
+    `id ${message.id}${message.kind ? ` · kind ${message.kind}` : ""}${message.action ? ` · action ${message.action}` : ""}${message.done ? " · done" : ""}`,
     `from ${message.from}${message.fromSessionId ? ` (${message.fromSessionId})` : ""} → ${message.channel ? `#${message.channel}` : message.to}${message.toSessionId ? ` (${message.toSessionId})` : ""}`,
     `status ${message.status}${message.reason ? `: ${message.reason}` : ""} · order ${message.order} · ${new Date(message.createdAt).toLocaleString()}`,
   ];
+  if (message.reset) lines.push(`reset ${message.reset}`);
+  if (message.resetResult) lines.push(`resetResult ${message.resetResult}`);
+  if (message.sourceChannel) lines.push(`via #${message.sourceChannel}`);
   if (message.thread) lines.push(`thread ${message.thread}`);
-  if (message.replyTo) lines.push(`reply to ${message.replyTo}`);
+  if (message.replyTo) lines.push(`reply to ${message.replyTo}${message.replyToMissing ? " (purged message)" : ""}`);
   return lines;
 }
 
 /**
- * Lay out each message as a distinct block: header, wrapped body and optional details.
- * Bodies are wrapped, never clipped; ranges let callers map rows back to messages.
+ * Lay out each message as a distinct block: fitted header, full wrapped body and optional details.
+ * Only direct nonhuman exchanges are dim and omit the spacer between adjacent such blocks.
+ * The divider uses the caller's human unread count, not the number of subsequent messages.
+ * Ranges exclude dividers/spacers; bodyEnd precedes details so read-on-view still requires the full body.
  */
 export function layoutTranscript(messages: readonly StoredMessage[], options: TranscriptOptions): TranscriptLayout {
   const width = Math.max(1, options.width);
-  const bodyWidth = Math.max(1, width - 2);
+  const indent = " ".repeat(Math.min(2, width - 1));
+  const bodyWidth = width - indent.length;
   const now = options.now ?? Date.now();
   const rows: TerminalLine[] = [...(options.leading ?? [])];
   if (rows.length && messages.length) rows.push("");
   const ranges = new Map<string, MessageRange>();
   const order: string[] = [];
   if (!messages.length && options.empty) rows.push([{ text: ellipsize(options.empty, width), style: theme.dim }]);
+  let previousCompact = false;
   for (const message of messages) {
-    if (order.length) rows.push("");
+    const compact = !message.channel && message.from !== "human" && message.to !== "human";
+    if (order.length && !(previousCompact && compact)) rows.push("");
     if (message.id === options.firstUnreadId) {
-      rows.push(clipSpans([{ text: "── new ", style: theme.unread }, { text: "─".repeat(Math.max(0, width - 7)), style: theme.accent }], width));
+      const label = `${options.unreadCount ?? 1} new `;
+      rows.push(clipSpans([{ text: label, style: theme.unread }, { text: "┄".repeat(Math.max(0, width - terminalTextWidth(label))), style: theme.accent }], width));
     }
     const start = rows.length;
     const selected = message.id === options.selectedId;
-    const header = justify(headerSpans(message, now), [], width, selected ? theme.selected : undefined);
-    rows.push(header);
-    for (const line of wrappedBody(message, bodyWidth)) rows.push(`  ${line}`);
+    const fill = compact ? { ...theme.dim, ...(selected ? theme.selected : {}) } : selected ? theme.selected : undefined;
+    rows.push(headerSpans(message, now, width, fill));
+    for (const line of wrappedBody(message, bodyWidth)) {
+      const text = `${indent}${line}`;
+      rows.push(compact ? [{ text, style: theme.dim }] : text);
+    }
     const bodyEnd = rows.length - 1;
     if (options.expanded?.(message.id)) {
+      const prefix = truncateTerminalText("  ┊ ", Math.max(0, width - 1));
       for (const detail of detailLines(message)) {
-        for (const line of wrapTerminalText(detail, Math.max(1, width - 4))) {
-          rows.push([{ text: "  ┊ ", style: theme.accent }, { text: line, style: theme.dim }]);
+        for (const line of wrapTerminalText(detail, width - terminalTextWidth(prefix))) {
+          rows.push([{ text: prefix, style: compact ? { ...theme.accent, dim: true } : theme.accent }, { text: line, style: theme.dim }]);
         }
       }
     }
     ranges.set(message.id, { start, bodyEnd, end: rows.length - 1 });
     order.push(message.id);
+    previousCompact = compact;
   }
   return { rows, ranges, order };
 }
@@ -288,13 +354,22 @@ export function activitySpans(item: PositionedEvent, names: (id: string) => stri
       { text: ` → ${where}  ` },
       { text: event.status, style: statusStyle(event.status) },
       ...(event.reason ? [{ text: ` (${event.reason})`, style: theme.dim }] : []),
-      { text: `  ${sanitizeTerminalText(m.text)}`, style: theme.dim },
+      { text: `  ${sanitizeTerminalText(renderMessageBody(m))}`, style: theme.dim },
     ];
   }
   if (event.type === "session") {
     const detail = event.action === "renamed" ? `${event.oldName ?? "?"} → ${event.name}` : event.name;
     const style = event.action === "gone" ? theme.warn : event.action === "removed" ? theme.dim : theme.ok;
     return [position, { text: "session  ", style: theme.accent }, { text: `${event.action} `, style }, { text: detail, style: theme.bold }, { text: `  ${event.harness}`, style: theme.dim }];
+  }
+  if (event.type === "channel") {
+    if (event.action === "deleted") {
+      return [position, { text: "channel  ", style: theme.accent }, { text: `#${event.channel.name} deleted`, style: theme.dim }];
+    }
+    return [position, { text: "channel  ", style: theme.accent }, { text: `${event.action} #${event.channel.name}`, style: theme.bold }, { text: `  ${event.channel.memberIds?.length ?? 0} members`, style: theme.dim }];
+  }
+  if (event.type === "ping") {
+    return [position, { text: "ping     ", style: theme.accent }, { text: names(event.sessionId) ?? event.sessionId, style: theme.bold }, { text: `  ${event.ping}`, style: event.ping === "not_responding" ? theme.warn : theme.dim }];
   }
   if (event.type === "read") {
     const scope = event.state.scope;

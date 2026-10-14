@@ -6,7 +6,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { lockedPid } from "../daemon/main.js";
 import { readConfig, writeConfig } from "../shared/config.js";
 import { configPath, dbPath } from "../shared/paths.js";
+import { QUEUE_TTL_MS } from "../shared/protocol.js";
 import { editJson, isObj, readJson, report, type Json } from "./jsonfile.js";
+import { installSkills, removeSkills, SKILL_NAMES, skillsSourceDir } from "./skills.js";
 
 export const CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "PostToolUse", "UserPromptSubmit", "Stop"] as const;
 export const ASENQ_HOOK_RE = /asenq.* hook claude$/;
@@ -27,6 +29,15 @@ export function install(): Install {
 export const claudeDir = (): string => join(homedir(), ".claude");
 export const opencodeDir = (): string => join(homedir(), ".config", "opencode");
 export const ompAgentDir = (): string => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
+
+/** Harness directories that receive skills, each flagged with whether that harness is installed. */
+export type SkillTarget = { harness: "claude" | "opencode" | "omp"; base: string; detected: boolean };
+export const skillTargets = (): SkillTarget[] =>
+  [
+    { harness: "claude" as const, base: claudeDir() },
+    { harness: "opencode" as const, base: opencodeDir() },
+    { harness: "omp" as const, base: ompAgentDir() },
+  ].map((d) => ({ ...d, detected: existsSync(d.base) }));
 export const hookCommand = (i: Install): string => `"${i.runtime}" "${i.cli}" hook claude`;
 export const opencodeShim = (i: Install): string => `export { server } from "${pathToFileURL(i.opencodeAdapter).href}";\n`;
 export const ompShim = (i: Install): string => `export { default } from "${pathToFileURL(i.ompAdapter).href}";\n`;
@@ -213,6 +224,7 @@ async function remove(): Promise<number> {
   }
   removeFile(join(opencodeDir(), "plugins", "asenq.js"));
   removeFile(join(ompAgentDir(), "extensions", "asenq.js"));
+  for (const { base, detected } of skillTargets()) if (detected) removeSkills(join(base, "skills"));
   await stopDaemon();
   removeFile(configPath());
   process.stdout.write(`note: kept message history at ${dbPath()}\n`);
@@ -223,8 +235,18 @@ export async function setup(argv: string[]): Promise<number> {
   if (argv.includes("--remove")) return remove();
   const i = install();
 
+  const source = skillsSourceDir();
+  const missing = SKILL_NAMES.filter((name) => !existsSync(join(source, name, "SKILL.md")));
+  if (missing.length) {
+    report("!", `shipped skills missing ${missing.join(", ")} from ${source}; reinstall asenq`);
+    return 1;
+  }
+
   const prev = readConfig();
-  const cfg = { runtime: i.runtime, cli: i.cli, historyDays: prev?.historyDays ?? 7, claude: { envelope: prev?.claude.envelope ?? false } };
+  const cfg = {
+    runtime: i.runtime, cli: i.cli, historyDays: prev?.historyDays ?? 7,
+    queueTtlMs: prev?.queueTtlMs ?? QUEUE_TTL_MS, claude: { envelope: prev?.claude.envelope ?? false },
+  };
   if (prev && JSON.stringify(prev) === JSON.stringify(cfg)) report("=", `${configPath()} (unchanged)`);
   else {
     writeConfig(cfg);
@@ -237,6 +259,8 @@ export async function setup(argv: string[]): Promise<number> {
   else process.stdout.write("skip opencode: not installed\n");
   if (existsSync(ompAgentDir())) writeShim(join(ompAgentDir(), "extensions", "asenq.js"), ompShim(i));
   else process.stdout.write("skip omp: not installed\n");
+
+  for (const { base, detected } of skillTargets()) if (detected) installSkills(join(base, "skills"), source);
 
   if (removeLegacy()) {
     process.stdout.write(

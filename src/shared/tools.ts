@@ -1,14 +1,17 @@
 import type { AsenqClient } from "./client.js";
-import { AsenqError, KINDS, type SendResult } from "./protocol.js";
+import { AsenqError, CONTROL_ACTIONS, KINDS, type ChannelSummary, type ListedSession, type MsgStatus, type ReplacementResult, type Role, type SendResult, type SessionIdentity, type WireMsg } from "./protocol.js";
+import { renderMessageBody } from "./render.js";
 
 export type ParamSpec = {
-  type: "string" | "integer" | "boolean";
   description: string;
   optional?: boolean;
   enum?: readonly string[];
   min?: number;
   max?: number;
-};
+} & (
+  | { type: "string" | "integer" | "boolean" }
+  | { type: "object"; properties: Record<string, ParamSpec> }
+);
 
 export type ToolSpec = { name: string; label: string; description: string; params: Record<string, ParamSpec> };
 
@@ -19,40 +22,160 @@ export const TOOLS: ToolSpec[] = [
     name: "asenq_send",
     label: "Asenq Send",
     description:
-      "Send a text message to another agent session on this machine (Claude Code, OpenCode or omp) through asenq. " +
+      "Send a message with text, a file reference, or both to another agent session on this machine (Claude Code, OpenCode or omp) through asenq. " +
       "An idle target starts a new turn; a busy target sees it between tool calls. " +
-      `${NAMES_HINT} Use "*" to broadcast to every live session, or "human" to reach the user.`,
+      `${NAMES_HINT} Use "*" to broadcast once to each other live session sharing any of your channels; if you belong to no channel, it reaches every other live session on the machine. Use "human" to reach the user. ` +
+      "Prefer a file reference for anything over ~4,000 characters: use an absolute readable regular-file path and a required summary of at most 500 characters. " +
+      "The daemon records path, summary, byte size and a send-time SHA-256 snapshot, never copies contents; the receiver reads on demand with the same OS user's permissions. " +
+      "Files can change or disappear; use asenq_file_check to compare the current file with the snapshot. " +
+      "Control messages carry urgent pause/resume/cancel labels; asenq only delivers them and never changes session state or inbound policy.",
     params: {
-      to: { type: "string", description: 'Target session name, "*" for all live sessions, or "human"' },
-      text: { type: "string", description: "Message text" },
-      kind: { type: "string", enum: KINDS, optional: true, description: "Message kind: chat, task, result or status" },
+      to: { type: "string", description: 'Target session name, "*" for live co-members (machine-wide if you belong to no channel), or "human"' },
+      text: { type: "string", optional: true, description: "Message text; required unless file is present. Prefer a file reference for anything over ~4,000 characters." },
+      file: {
+        type: "object", optional: true, description: "On-demand file reference, not an attachment; contents are never copied.",
+        properties: {
+          path: { type: "string", description: "Absolute path to a readable regular file on this machine, accessible under the same OS user" },
+          summary: { type: "string", description: "Required summary of the file, at most 500 characters" },
+        },
+      },
+      kind: { type: "string", enum: KINDS, optional: true, description: "Message kind: chat, task, result, status or control" },
+      action: { type: "string", enum: CONTROL_ACTIONS, optional: true, description: "Required for kind=control: pause, resume or cancel. Invalid on other kinds; asenq labels and delivers, but does not enforce the action." },
+      reset: { type: "string", enum: ["compact"], optional: true, description: 'Compact the target context before delivering this direct message. Human/orchestrator only; one named session, never "*" or "human". Receipt reports pending or unsupported; history reports resetResult when compaction finishes. Failed/unsupported compaction still delivers the message.' },
       thread: { type: "string", optional: true, description: "Free-form thread label to group related messages" },
       reply_to: { type: "string", optional: true, description: "Id of the message this answers (m_…)" },
       done: { type: "boolean", optional: true, description: "Marks the final message of a task or thread" },
     },
   },
   {
+    name: "asenq_file_check",
+    label: "Asenq File Check",
+    description: "Compare a direct message's referenced file with its send-time SHA-256 snapshot. Returns match, changed or missing. Only the retained message's sender or recipient may check it. A match is not a lock: the file can change before or during your read.",
+    params: { id: { type: "string", description: "Id of a retained direct message carrying a file reference (m_…)" } },
+  },
+  {
     name: "asenq_list",
     label: "Asenq List",
-    description: "List agent sessions registered on asenq (name, harness, working directory). Your own session is marked [you].",
-    params: {},
+    description:
+      "List registered sessions with current and former names, identity id, harness/cwd, role/channels, inbound policy, state/stale, ping, last-seen harness contact, busy/idle, harness session id and a resume command when known. " +
+      "Filters use current metadata: cwd is a literal path prefix; harness and channel membership are exact; combined filters use AND, with no matches returning an empty list. " +
+      "Gone sessions are stale; live sessions are stale only after a not-responding ping, never because of quiet DMs. Never pinged differs from unavailable ping; unknown last-seen and busy are not idle. Your own session is marked [you]. " +
+      "The human can edit any role; an orchestrator can edit roles only for sessions sharing a channel. Roles do not restrict delivery; asenq does not coordinate work.",
+    params: {
+      cwd: { type: "string", optional: true, description: "Literal prefix of the session's current working directory" },
+      harness: { type: "string", enum: ["claude", "omp", "opencode"], optional: true, description: "Exact harness" },
+      channel: { type: "string", optional: true, description: "Exact channel name; matches current members" },
+    },
   },
   {
     name: "asenq_inbox",
     label: "Asenq Inbox",
-    description: "Show the most recent asenq messages sent to this session, including ones already shown to you.",
-    params: {},
+    description: "Read delivered unread direct messages oldest delivery first, exactly once through plain unread reads, and advance this session's durable inbox delivery position. Held or queued messages become unread only when delivered. Filtered or unread_only=false reads do not advance it. Output is capped at 16,000 characters except explicit full-text id lookup.",
+    params: {
+      id: { type: "string", optional: true, description: "Recover one full, uncapped sent or received message by id; overrides all other filters and never advances the inbox" },
+      limit: { type: "integer", optional: true, min: 1, max: 200, description: "Maximum messages (default 20)" },
+      since: { type: "string", optional: true, description: "Exclusive newer-than cursor: ISO timestamp, decimal Unix milliseconds, or retained message id" },
+      before: { type: "string", optional: true, description: "Exclusive older-than cursor: ISO timestamp, decimal Unix milliseconds, or retained message id" },
+      thread: { type: "string", optional: true, description: "Only messages with this exact thread label" },
+      from: { type: "string", optional: true, description: "Only messages from this sender name" },
+      unread_only: { type: "boolean", optional: true, description: "Only delivered unread messages (default true); false reads recent history newest creation first" },
+    },
+  },
+  {
+    name: "asenq_thread_read",
+    label: "Asenq Thread Read",
+    description: "Read the full retained direct-message thread involving this caller, sent and received, in durable oldest-first order. Does not advance the inbox position.",
+    params: {
+      thread: { type: "string", description: "Exact thread label" },
+      since: { type: "string", optional: true, description: "Exclusive newer-than cursor: ISO timestamp, decimal Unix milliseconds, or retained message id" },
+    },
   },
   {
     name: "asenq_rename",
     label: "Asenq Rename",
-    description: `Rename this session on asenq. Other sessions address you by this name. ${NAMES_HINT}`,
+    description: `Rename this session on asenq. Messages to former names still reach this identity under its current name. Returns name_taken if another live or reconnecting session holds the new name as its current or former name. ${NAMES_HINT}`,
     params: { name: { type: "string", description: "New name: lowercase letters, digits, - and _" } },
+  },
+  {
+    name: "asenq_replace",
+    label: "Asenq Replace",
+    description:
+      "Move a non-closed source identity's role, channel memberships, unreserved former-name chain and queued or held messages to a live destination, then close and archive the source. " +
+      "Provide exactly one of from or from_id and exactly one of to or to_id; names use the daemon's ranked lookup, while stable ids select an identity directly. " +
+      "The destination keeps its name, cwd, inbound policy, history, read position and harness association. An orchestrator must share a channel with the source; the human may replace any source. " +
+      "Replacement can partially succeed: the reply's skippedNames lists source names still held by another live or reconnecting identity. Other names and waiting messages still move. Late acknowledgments cannot change moved messages or destination state, and already-received messages cannot be un-received.",
+    params: {
+      from: { type: "string", optional: true, description: "Source current or former name; provide exactly one of from and from_id" },
+      to: { type: "string", optional: true, description: "Live destination current or former name; provide exactly one of to and to_id" },
+      from_id: { type: "string", optional: true, description: "Source stable identity id; provide exactly one of from and from_id" },
+      to_id: { type: "string", optional: true, description: "Live destination stable identity id; provide exactly one of to and to_id" },
+    },
+  },
+  {
+    name: "asenq_set_role",
+    label: "Asenq Set Role",
+    description:
+      "Set a session's role or unset it. Only the human or an orchestrator sharing a channel with the target may edit its role. " +
+      "The human assigns initial orchestrator roles; an orchestrator can create a new channel with itself as first member or join an existing channel. Workers and sessions with an unset role cannot edit roles. " +
+      "Roles are informational for message delivery; asenq is a messenger, not a coordinator.",
+    params: {
+      name: { type: "string", description: `Target session name. ${NAMES_HINT}` },
+      role: { type: "string", enum: ["orchestrator", "worker", "unset"], description: "Role to assign, or unset to clear it" },
+    },
+  },
+  {
+    name: "asenq_channel_create",
+    label: "Asenq Channel Create",
+    description:
+      "Create an asenq channel. The human or an orchestrator may create it; a new channel created by an orchestrator atomically includes that orchestrator as its first member. " +
+      "Creating an existing channel is idempotent and does not join it; an orchestrator can use asenq_channel_add with its own name to join. Workers and sessions with an unset role cannot create channels. " +
+      "Roles are informational for message delivery; asenq is a messenger, not a coordinator.",
+    params: { channel: { type: "string", description: "Channel name: lowercase letters, digits, - and _" } },
+  },
+  {
+    name: "asenq_channel_add",
+    label: "Asenq Channel Add",
+    description:
+      "Add a live session to an existing channel's roster. The human may add anyone; an orchestrator may add itself to any existing channel, or add other sessions only to channels it belongs to. " +
+      "Workers and sessions with an unset role cannot edit rosters. An orchestrator joins a new channel by creating it; posting to an unknown channel creates an empty roster, without joining it. " +
+      "Roles are informational for message delivery; roster editing permissions do not make asenq a coordinator.",
+    params: {
+      channel: { type: "string", description: "Existing channel name" },
+      name: { type: "string", description: `Live target session name. ${NAMES_HINT}` },
+    },
+  },
+  {
+    name: "asenq_channel_remove",
+    label: "Asenq Channel Remove",
+    description:
+      "Remove a member from an existing channel's roster by its current or former name. Only the human or an orchestrator who is a member of that channel may edit it. " +
+      "An orchestrator can create a new channel with itself as first member or join an existing channel. Current member names take precedence over former names; ambiguous names are refused. " +
+      "Use asenq_channel_members to inspect candidate identities; only the human can remove by identity id. " +
+      "Roles are informational for message delivery; asenq is not a coordinator.",
+    params: {
+      channel: { type: "string", description: "Existing channel name" },
+      name: { type: "string", description: "Member's current or former session name" },
+    },
+  },
+  {
+    name: "asenq_channel_members",
+    label: "Asenq Channel Members",
+    description:
+      "Read an existing channel's members with their full name, role or unset, raw state and identity id. Reads are unrestricted. " +
+      "The human may edit any roster; an orchestrator can create a new channel with itself as first member or join an existing channel, then edit channels it belongs to. Workers and sessions with an unset role cannot edit rosters. " +
+      "Roles are informational for message delivery; asenq does not coordinate work.",
+    params: { channel: { type: "string", description: "Existing channel name" } },
   },
   {
     name: "asenq_channel_send",
     label: "Asenq Channel Send",
-    description: "Post a message to a named asenq channel. Channels are read on demand and never pushed into sessions.",
+    description:
+      "Post text to a named asenq channel. Posts stay read on demand unless they contain standalone @member mentions (current or former member names), " +
+      "@orch/@orchestrator/@orchestrators, @wrk/@worker/@workers, or @all. Keywords take precedence over names. " +
+      "Mentions are case-sensitive ASCII names (letters, digits, _ and -). An @ starts a mention only at the start of text, after whitespace, or after ( [ { < \" ' or a backtick; other preceding characters block mentions, including email local parts. Tokens end at the first non-name character. Markdown/code blocks have no exceptions. " +
+      "Only channel members resolve; each identity is targeted once, excluding the poster and the human. " +
+      "An unknown, non-member or ambiguous mention fails the whole post with unknown_mention and lists valid members. " +
+      "Target inbound policies apply; the result lists resolved targets and their actual delivery states, including held, rejected, queued or failed rather than claiming every target was pushed.",
     params: {
       channel: { type: "string", description: "Channel name: lowercase letters, digits, - and _" },
       text: { type: "string", description: "Message text" },
@@ -70,23 +193,84 @@ export const TOOLS: ToolSpec[] = [
   {
     name: "asenq_channel_list",
     label: "Asenq Channel List",
-    description: "List asenq channels with message counts.",
+    description: "List asenq channels with message counts, including channels with no posts.",
     params: {},
   },
 ];
 
-type Msg = { id: string; from: string; to: string; text: string; createdAt: number; kind?: string; thread?: string };
+export function formatSessions(sessions: ListedSession[], filtered = false): string {
+  if (sessions.length === 0) return filtered ? "no sessions match filters" : "no sessions registered";
+  return sessions.map((s) => [
+    `${s.name}${s.you ? " [you]" : ""}`,
+    `  id=${s.id} · you=${s.you ? "yes" : "no"} · former=${s.previousNames.join(", ") || "none"}`,
+    `  harness=${s.harness} · cwd=${s.cwd ?? "unknown"}`,
+    `  role=${s.role ?? "unset"} · channels=${s.channels.map((channel) => `#${channel}`).join(", ") || "none"}`,
+    `  inbound=${s.inbound} · state=${s.state} · stale=${s.stale ? "yes" : "no"}`,
+    `  ping=${s.ping === null ? "never" : s.ping === "unknown" ? "unknown (unavailable)" : s.ping} · busy=${s.busy === null ? "unknown" : s.busy ? "busy" : "idle"}`,
+    `  lastSeen=${s.lastSeen === null ? "unknown" : new Date(s.lastSeen).toISOString()}`,
+    `  harnessSessionId=${s.harnessSessionId ?? "unknown"}`,
+    ...(s.resumeCommand === undefined ? [] : [`  resume=${s.resumeCommand}`]),
+  ].join("\n")).join("\n\n");
+}
+
+type Msg = WireMsg & { status?: MsgStatus };
 
 export function formatSendResults(results: SendResult[]): string {
   if (results.length === 0) return "no live sessions to send to";
-  return results.map((r) => `${r.to} ${r.msgId ?? "-"} ${r.status}${r.reason ? ` (${r.reason})` : ""}`).join("\n");
+  return results.map((r) => `${r.to} ${r.msgId ?? "-"} ${r.status}${r.reset ? ` reset=${r.reset}` : ""}${r.reason ? ` (${r.reason})` : ""}`).join("\n");
+}
+
+export function formatReplace(result: ReplacementResult): string {
+  const lines = [`replaced ${result.from.name} (${result.from.id}) with ${result.to.name} (${result.to.id}); source closed and archived`];
+  if (result.skippedNames.length) lines.push(`skipped names: ${result.skippedNames.join(", ")}`);
+  return lines.join("\n");
 }
 
 function formatMsgs(msgs: Msg[], empty: string): string {
   if (msgs.length === 0) return empty;
   return msgs
-    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.kind ? ` · kind=${m.kind}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}\n${m.text}`)
+    .map((m) => `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.status ? ` · status=${m.status}` : ""}${m.reset ? ` · reset=${m.reset}` : ""}${m.resetResult ? ` · resetResult=${m.resetResult}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}${m.thread ? ` · thread=${m.thread}` : ""}${m.replyToMissing ? ` · reply-to=${m.replyTo} (purged message)` : ""}\n${renderMessageBody(m)}`)
     .join("\n\n");
+}
+
+function formatInbox(msgs: Msg[], hasMore: boolean, advancing: boolean): string {
+  if (msgs.length === 0) return "no messages";
+  const more = (id: string): string => advancing
+    ? "[more available; call asenq_inbox again to read the next unread messages.]"
+    : `[more available; call asenq_inbox with before=${id} and the same filters for older messages.]`;
+  const parts: string[] = [];
+  let length = 0;
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    const text = formatMsgs([m], "");
+    const separator = parts.length ? 2 : 0;
+    const tail = hasMore || i < msgs.length - 1 ? 2 + more(m.id).length : 0;
+    if (length + separator + text.length + tail > 16_000) {
+      const compact = "[more available]";
+      if (length + separator + text.length + 2 + compact.length <= 16_000) {
+        parts.push(text, compact);
+        return parts.join("\n\n");
+      }
+      if (parts.length === 0) {
+        const recovery = `Full text: asenq_inbox id=${m.id}.`
+          + (m.thread ? " Or use asenq_thread_read with this message's thread." : "");
+        const marker = `\n\n[truncated message ${m.id}; more available. ${recovery}]`;
+        const header = `[${new Date(m.createdAt).toISOString()}] ${m.from} → ${m.to} · ${m.id}${m.sourceChannel ? ` · via #${m.sourceChannel}` : ""}${m.status ? ` · status=${m.status}` : ""}${m.kind ? ` · kind=${m.kind}` : ""}${m.action ? ` · action=${m.action}` : ""}\n`;
+        const body = renderMessageBody(m);
+        const visible = text.length - body.length < 16_000 - marker.length ? text : header + body;
+        let end = Math.min(visible.length, 16_000 - marker.length);
+        if (end > 0 && visible.charCodeAt(end - 1) >= 0xD800 && visible.charCodeAt(end - 1) <= 0xDBFF
+          && visible.charCodeAt(end) >= 0xDC00 && visible.charCodeAt(end) <= 0xDFFF) end--;
+        return visible.slice(0, end) + marker;
+      }
+      hasMore = true;
+      break;
+    }
+    parts.push(text);
+    length += separator + text.length;
+  }
+  if (hasMore) parts.push(more(msgs[parts.length - 1].id));
+  return parts.join("\n\n");
 }
 
 /**
@@ -100,29 +284,73 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
     switch (name) {
       case "asenq_send": {
         const r = await client.request("send", {
-          ...who, to: args.to, text: args.text, kind: args.kind, thread: args.thread, replyTo: args.reply_to, done: args.done,
+          ...who, to: args.to, text: args.text, file: args.file, kind: args.kind, action: args.action, reset: args.reset, thread: args.thread, replyTo: args.reply_to, done: args.done,
         });
         return formatSendResults(r.results as SendResult[]);
       }
+      case "asenq_file_check": {
+        const r = await client.request("file_check", { ...who, msgId: args.id });
+        return String(r.status);
+      }
       case "asenq_list": {
-        const r = await client.request("list", who);
-        const rows = r.sessions as { name: string; harness: string; cwd: string | null; state: string; you: boolean }[];
-        if (rows.length === 0) return "no sessions registered";
-        return rows
-          .map((s) => `${s.name} (${s.harness}) ${s.cwd ?? ""}${s.state === "live" ? "" : ` [${s.state}]`}${s.you ? " [you]" : ""}`)
-          .join("\n");
+        const r = await client.request("list", { ...who, cwd: args.cwd, harness: args.harness, channel: args.channel });
+        return formatSessions(r.sessions as ListedSession[], args.cwd !== undefined || args.harness !== undefined || args.channel !== undefined);
       }
       case "asenq_inbox": {
-        const r = await client.request("inbox", who);
+        if (args.id !== undefined) {
+          const r = await client.request("inbox", { ...who, msgId: args.id });
+          return formatMsgs(r.messages as Msg[], "no messages");
+        }
+        const unreadOnly = args.unread_only ?? true;
+        const r = await client.request("inbox", {
+          ...who, limit: args.limit, since: args.since, before: args.before, thread: args.thread,
+          from: args.from, unread_only: unreadOnly, max_chars: 15_000,
+        });
+        const advancing = unreadOnly === true && args.since === undefined && args.before === undefined
+          && args.thread === undefined && args.from === undefined;
+        return formatInbox(r.messages as Msg[], r.hasMore === true, advancing);
+      }
+      case "asenq_thread_read": {
+        const r = await client.request("thread_read", { ...who, thread: args.thread, since: args.since });
         return formatMsgs(r.messages as Msg[], "no messages");
       }
       case "asenq_rename": {
         const r = await client.request("rename", { ...who, name: args.name });
         return `renamed to ${String(r.name)}`;
       }
+      case "asenq_replace": {
+        const result = await client.request("replace", {
+          ...who, from: args.from, fromId: args.from_id, to: args.to, toId: args.to_id,
+        }) as ReplacementResult;
+        return formatReplace(result);
+      }
+      case "asenq_set_role": {
+        await client.request("set_role", { ...who, name: args.name, role: args.role === "unset" ? null : args.role });
+        return `${String(args.name)} role ${String(args.role)}`;
+      }
+      case "asenq_channel_create": {
+        const r = await client.request("channel_create", { ...who, channel: args.channel });
+        return `channel #${(r.channel as ChannelSummary).name} ready`;
+      }
+      case "asenq_channel_add": {
+        const r = await client.request("channel_add", { ...who, channel: args.channel, name: args.name });
+        return `added ${String(args.name)} to #${(r.channel as ChannelSummary).name}`;
+      }
+      case "asenq_channel_remove": {
+        const r = await client.request("channel_remove", { ...who, channel: args.channel, name: args.name });
+        return `removed ${String(args.name)} from #${(r.channel as ChannelSummary).name}`;
+      }
+      case "asenq_channel_members": {
+        const r = await client.request("channel_members", { ...who, channel: args.channel });
+        const members = r.members as SessionIdentity[];
+        if (members.length === 0) return `#${String(args.channel)} has no members`;
+        return members.map((s) => `${s.name} · role=${s.role ?? "unset"} · state=${s.state} · id=${s.id}`).join("\n");
+      }
       case "asenq_channel_send": {
         const r = await client.request("channel_send", { ...who, channel: args.channel, text: args.text });
-        return `posted ${String(r.msgId)} to #${String(args.channel)}`;
+        const results = r.results as SendResult[];
+        const delivery = results.length ? `mention targets:\n${formatSendResults(results)}` : "mention targets: none; no direct messages pushed";
+        return `posted ${String(r.msgId)} to #${String(args.channel)}\n${delivery}`;
       }
       case "asenq_channel_read": {
         const r = await client.request("channel_read", { ...who, channel: args.channel, limit: args.limit });
@@ -130,9 +358,9 @@ export async function callTool(client: AsenqClient, name: string, args: Record<s
       }
       case "asenq_channel_list": {
         const r = await client.request("channel_list", who);
-        const rows = r.channels as { name: string; count: number; lastAt: number }[];
+        const rows = r.channels as ChannelSummary[];
         if (rows.length === 0) return "no channels";
-        return rows.map((c) => `#${c.name} ${c.count} messages, last ${new Date(c.lastAt).toISOString()}`).join("\n");
+        return rows.map((c) => `#${c.name} ${c.count} messages, ${c.lastAt === 0 ? "no posts" : `last ${new Date(c.lastAt).toISOString()}`}`).join("\n");
       }
       default:
         return `asenq error (bad_request): unknown tool ${name}`;

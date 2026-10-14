@@ -1,20 +1,34 @@
 import { spawnSync } from "node:child_process";
-import { AsenqClient, type ClientOpts } from "../shared/client.js";
-import { KINDS } from "../shared/protocol.js";
+import { AsenqClient } from "../shared/client.js";
+import type { ClientOpts } from "../shared/client.js";
+import { KINDS, MENTION_KEYWORDS, hasMentionOpening } from "../shared/protocol.js";
+import { isStaleSession } from "../shared/sessions.js";
 import type {
-  ChannelSummary, HistoryScope, InboxSummary, PositionedEvent, ReadScope, ReadState, SendResult,
+  ChannelSummary, HistoryScope, InboxSummary, ListedSession, PingStatus, PositionedEvent, ReadScope, ReadState, ReplacementResult, SendResult,
   SessionIdentity, StoredMessage, SyncResult,
 } from "../shared/protocol.js";
+import { renderMessageBody } from "../shared/render.js";
 import {
-  activitySpans, clipSpans, editorLayout, ellipsize, formatTime, isImportantEvent, justify, layoutTranscript,
+  activitySpans, clipSpans, editorLayout, ellipsize, formatTime, harnessShortName, isImportantEvent, justify, layoutTranscript,
   maxTop, padSpans, paneWidths, stepGrapheme, theme, viewportAt, viewportTop,
-  type ActivityFilter, type TranscriptLayout, type Viewport,
 } from "./layout.js";
+import type { ActivityFilter, TranscriptLayout, Viewport } from "./layout.js";
 import {
   sanitizeTerminalText, TerminalAdapter, TerminalUnavailableError, terminalTextWidth, wrapTerminalText,
-  type KeyInput, type MouseInput, type TerminalAdapterOptions, type TerminalCursor, type TerminalFrame,
-  type TerminalLine, type TerminalSize, type TerminalSpan,
 } from "./terminal.js";
+import type {
+  KeyInput, MouseInput, TerminalAdapterOptions, TerminalCursor, TerminalFrame, TerminalLine, TerminalSize, TerminalSpan,
+} from "./terminal.js";
+import { roundedPanel } from "./panel.js";
+import { hintSpans } from "./chrome.js";
+import { heldBar } from "./held.js";
+import { REQUEST_TIMEOUT_MS, TICK_MS, VizMap, within } from "../viz/map.js";
+import type { MapDue } from "../viz/map.js";
+import { scanProcesses } from "../viz/scan.js";
+import type { ProcInfo } from "../viz/scan.js";
+import { readVizSettings } from "../viz/settings.js";
+import type { VizSettings } from "../viz/settings.js";
+import { rebaseCitySnapshot } from "../viz/model.js";
 
 /** The drawing surface the console needs; `TerminalAdapter` in production, a recorder in tests. */
 export interface Screen {
@@ -27,17 +41,27 @@ export interface Screen {
 export type ConsoleDeps = {
   client?(options: ClientOpts): AsenqClient;
   screen?(options: TerminalAdapterOptions): Screen;
+  /** Process detection for the Map tab; defaults to `ps`. */
+  scan?(): Promise<ProcInfo[]>;
+  /** Epoch ms for the Map tab's relative times; defaults to Date.now. */
+  now?(): number;
+  /** Repeating timer driving the Map tab's animation while it is shown; returns its canceller. Defaults to setInterval. */
+  schedule?(fn: () => void, ms: number): () => void;
+  settings?(): { settings: VizSettings; warning: string | null };
+  reducedMotion?: boolean;
 };
 
-const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"]] as const;
+const TABS = [["sessions", "Sessions"], ["inbox", "Inbox"], ["channels", "Channels"], ["activity", "Activity"], ["map", "Map"]] as const;
 type Tab = typeof TABS[number][0];
 type Focus = "tabs" | "list" | "transcript" | "composer";
 
 const ACTION_GROUPS = [
-  ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
+  ["Navigate", ["Sessions", "Inbox", "Channels", "Activity", "Map", "Quick jump", "Search sessions", "Toggle archive", "Toggle inbox feed", "Toggle activity filter"]],
   ["Messages", ["Compose / send", "Full editor", "Broadcast", "Mark read", "Mark latest unread", "Read channel", "Post channel", "Log by session or message ID"]],
   ["Held", ["Held messages", "Release held message", "Drop held message"]],
-  ["Sessions", ["Rename session", "Inbound policy"]],
+  ["Sessions", ["Rename session", "Replace session", "Inbound policy", "Set role", "Ping sessions", "Close session", "Close all stale"]],
+  ["Channels", ["Create channel", "Add channel member", "Remove channel member"]],
+  ["Archive", ["Purge conversation", "Purge all archives"]],
   ["Daemon", ["Daemon status", "Daemon start", "Daemon stop", "Reconnect", "Setup", "Remove setup", "Doctor"]],
   ["Help", ["Help", "Error details", "Quit"]],
 ] as const;
@@ -45,19 +69,26 @@ type Action = typeof ACTION_GROUPS[number][1][number];
 const ACTIONS: { group: string; label: Action }[] = ACTION_GROUPS.flatMap(([group, labels]) =>
   labels.map((label: Action) => ({ group, label })));
 const SHORTCUTS: Partial<Record<Action, string>> = {
-  Sessions: "s", Inbox: "i", Channels: "#", Activity: "a", "Search sessions": "/", "Toggle inbox feed": "v",
+  Sessions: "s", Inbox: "i", Channels: "#", Activity: "a", Map: "m", "Quick jump": "Ctrl+K", "Search sessions": "/", "Toggle inbox feed": "v",
   "Toggle activity filter": "f", "Compose / send": "c", "Full editor": "Ctrl+E", "Mark read": "End",
+  "Close session": "Ctrl+X",
   "Mark latest unread": "u", Help: "?", Quit: "q",
 };
 
 const HELP = [
   "asenq TUI",
   "",
-  "Tabs: s Sessions · i Inbox · # Channels · a Activity. Tab / Shift+Tab move focus between tabs, list, conversation and composer.",
+  "Tabs: s Sessions · i Inbox · # Channels · a Activity · m Map. Tab / Shift+Tab move focus between tabs, list, conversation and composer (on Map they cycle all matching city targets, unless the tab bar has focus).",
   "List: ↑↓ move · Enter open · / search current and former session names · Enter on Archive expands it.",
+  "Ctrl+K: quick-jump from anywhere to a session (including former names and archives) or #channel. Type an ordered subsequence · ↑↓ choose · Enter open · Esc returns with your draft.",
+  "Channels: member rows stay in the channel conversation; use ? to create channels or add/remove members. Removal targets the selected member's stable identity.",
+  "Session list: Ctrl+X closes the selected session after y/n confirmation. ? → Ping sessions refreshes responding status without a model turn. ? → Close all stale pings first and previews disconnected or not_responding sessions; quiet responding and unknown sessions are kept. Archive: ? → Purge conversation / Purge all archives permanently deletes only the confirmed identities.",
+  "Replace: ? → Replace session picks any non-closed source, then a live destination other than itself. The y/n preview uses the captured identities; role, channel memberships and waiting messages move to the destination, then the source is closed.",
   "Conversation: ↑↓ select messages (long ones scroll) · Enter shows message details · PgUp/PgDn scroll · End jumps to the latest. An open conversation is read once its newest incoming message is on screen · u marks the latest item unread again.",
   "Composer: c to write · Enter sends · Shift+Enter (or Alt+Enter / Ctrl+J) inserts a newline · Ctrl+E full editor with kind/thread/reply/done · Esc leaves it (the draft is kept).",
   "Inbox: v switches between grouped senders and the chronological feed. Activity: f shows read-marker events too; Enter opens the conversation.",
+  "Map: the live city of real channels and session identities (same view as asenq viz). Arrows pan · hjkl spatial select · Tab cycle · +/- zoom · 0 frame selection · / search · Enter open conversation · Space dim others · f harness filter · u detected processes · r refresh · F follow session · T follow observed traffic · I focused inspector · PgUp/PgDn inspect. Empty channels remain venues; memberships are not delivery links. It only polls while shown.",
+  "Map search consumes ordinary shortcuts; Ctrl+K still opens the global finder. Enter in search selects without opening. I is the inspector, i is Inbox; F follows, f filters. --reduced-motion or viz.json disables motion. Costumes are explicit viz.json mappings, not reported model metadata.",
   "? opens this action palette; type to filter. Esc dismisses errors, closes panels and returns to Sessions. q quits.",
   "CLI commands remain available in another terminal.",
 ];
@@ -85,22 +116,36 @@ type Form = {
   draftKey?(form: Form): string;
 };
 type Panel = { title: string; lines?: string[]; messages?: StoredMessage[]; top: number; height: number; rows: number };
+type Confirmation = {
+  title: string;
+  lines: string[];
+  top: number;
+  height: number;
+  rows: number;
+  busy: boolean;
+  submit(): Promise<void>;
+};
 type Notice = { text: string; kind: "info" | "new" | "error"; until?: number };
 type Target =
   | { kind: "tab"; tab: Tab }
   | { kind: "entry"; key: string }
   | { kind: "message"; id: string }
   | { kind: "palette"; index: number }
+  | { kind: "finder"; key: string }
   | { kind: "field"; index: number }
   | { kind: "composer" }
   | { kind: "picker" }
   | { kind: "list" }
   | { kind: "transcript" };
 type Hit = { row: number; start: number; end: number; target: Target };
-type Entry = { key?: string; rows(width: number, selected: boolean, focused: boolean): TerminalLine[] };
+type Entry = { key?: string; rows(width: number, selected: boolean): TerminalLine[] };
 type Shown = { key: string; layout: TranscriptLayout; top: number; height: number };
 type ComposeTarget = { kind: "session"; id: string; name: string } | { kind: "channel"; name: string };
 type Pane = { rows: TerminalLine[]; cursor?: TerminalCursor };
+type JumpItem = { key: string; name: string; former?: string; session?: SessionIdentity; rank: number; state: number };
+type MentionItem = { key: string; name: string; former?: string; session?: SessionIdentity };
+type MentionPicker = { key: string; start: number; end: number; query: string; selected?: string; top: number };
+type FinderPurpose = "jump" | "replace-source" | "replace-target";
 
 /** Shift+Enter where the terminal reports it; Alt+Enter and Ctrl+J (iTerm's Shift+Enter) elsewhere. */
 const NEWLINE_KEYS: Record<string, true> = { SHIFT_ENTER: true, ALT_ENTER: true, CTRL_J: true };
@@ -112,21 +157,45 @@ const senderKey = (m: { fromSessionId?: string; from: string }): string =>
 const cleanInput = (text: string): string =>
   sanitizeTerminalText(text.replace(/\r\n?/g, "\n"), { multiline: true });
 
+/** Keys that still move the console's own focus when it rests on the tab bar, even on the Map tab. */
+const MAP_TAB_KEYS: Record<string, true> = { LEFT: true, RIGHT: true, UP: true, DOWN: true, ENTER: true, KP_ENTER: true, TAB: true, SHIFT_TAB: true };
+
+/** Exact and prefix matches precede case-insensitive ordered subsequences. */
+const jumpRank = (name: string, query: string): number => {
+  const value = name.toLowerCase();
+  if (!query || value === query) return 0;
+  if (value.startsWith(query)) return 1;
+  let offset = 0;
+  for (const character of query) {
+    const index = value.indexOf(character, offset);
+    if (index < 0) return Infinity;
+    offset = index + character.length;
+  }
+  return 2;
+};
+
 export class ConsoleApp {
   private readonly screen: Screen;
   private readonly client: AsenqClient;
   private sessions: SessionIdentity[] = [];
   private sessionOrders: Record<string, number> = {};
+  private sessionOrdersDirty = false;
+  private sessionPings: Record<string, PingStatus> = {};
   private channels: ChannelSummary[] = [];
   private summaries: InboxSummary[] = [];
   private readStates = new Map<string, ReadState>();
+  private heldMessages = new Map<string, StoredMessage>();
+  private shownHeldId?: string;
+  private heldActionPending = false;
+  private heldDirty = false;
+  private failedCount = 0;
   private streams = new Map<string, Stream>();
   private activity: PositionedEvent[] = [];
   private activityFilter: ActivityFilter = "important";
   private tab: Tab = "sessions";
   private focus: Focus = "list";
-  private selection: Record<Tab, string | undefined> = { sessions: undefined, inbox: undefined, channels: undefined, activity: undefined };
-  private listTop: Record<Tab, number> = { sessions: 0, inbox: 0, channels: 0, activity: 0 };
+  private selection: Record<Tab, string | undefined> = { sessions: undefined, inbox: undefined, channels: undefined, activity: undefined, map: undefined };
+  private listTop: Record<Tab, number> = { sessions: 0, inbox: 0, channels: 0, activity: 0, map: 0 };
   private followActivity = true;
   private archiveOpen = false;
   private query = "";
@@ -135,6 +204,9 @@ export class ConsoleApp {
   private panel?: Panel;
   private form?: Form;
   private palette?: { query: string; selected: number; top: number };
+  private finder?: { query: string; selected?: string; top: number; purpose: FinderPurpose; replaceFrom?: string };
+  private confirmation?: Confirmation;
+  private mention?: MentionPicker;
   private notice?: Notice;
   private noticeTimer?: NodeJS.Timeout;
   private errorDetail = "";
@@ -150,22 +222,46 @@ export class ConsoleApp {
   private syncing = false;
   private replaying = false;
   private resync = false;
+  private recovering = true;
+  /** Only positions pushed freshly while the uncovered map was shown may animate during replay. */
+  private readonly freshMapPositions = new Set<number>();
   private closed = false;
   private tasks = new Set<Promise<unknown>>();
   /** Stream whose `u` reminder must survive until the user scrolls, presses End or reopens it. */
   private readHold?: string;
   private reading = false;
+  private readonly map: VizMap;
+  private readonly scan: () => Promise<ProcInfo[]>;
+  private readonly schedule: (fn: () => void, ms: number) => () => void;
+  private stopMapTicks?: () => void;
+  private mapLoading = false;
+  private mapAgain = false;
+  private mapScanning = false;
+  private scanAgain = false;
+  /** Events arriving during the active city fetch; cleared after that pass settles. */
+  private mapEvents: PositionedEvent[] | null = null;
+  /** Bumped whenever the Map stops being active; fetches started before are discarded when they settle. */
+  private mapGen = 0;
+  /** Screen row and height of the map region, for translating clicks; height is 0 while it is not drawn. */
+  private mapTop = 0;
+  private mapHeight = 0;
   private resolve?: (code: number) => void;
 
   constructor(deps: ConsoleDeps = {}) {
     const clientOptions: ClientOpts = {
       autoStart: true,
       onPush: (p) => {
-        if (p.push !== "event") return;
+        if (p.push !== "event" || p.position <= this.watermark) return;
         this.pushedPosition = Math.max(this.pushedPosition, p.position);
+        if (!this.syncing && !this.recovering && this.mapActive() && this.connection === "connected") this.freshMapPositions.add(p.position);
         if (p.position > this.watermark) this.track(this.replay());
       },
-      onReconnect: async () => { await this.hydrate(); },
+      onReconnect: async () => {
+        this.recovering = true;
+        this.freshMapPositions.clear();
+        this.map.setConnection("offline");
+        await this.hydrate();
+      },
     };
     this.client = deps.client ? deps.client(clientOptions) : new AsenqClient(clientOptions);
     const screenOptions: TerminalAdapterOptions = {
@@ -176,6 +272,13 @@ export class ConsoleApp {
       onInterrupt: () => this.quit(),
     };
     this.screen = deps.screen ? deps.screen(screenOptions) : new TerminalAdapter(screenOptions);
+    this.scan = deps.scan ?? (() => scanProcesses());
+    const { settings, warning } = (deps.settings ?? readVizSettings)();
+    this.map = new VizMap({ now: deps.now, embedded: true, settings, settingsWarning: warning, reducedMotion: deps.reducedMotion });
+    this.schedule = deps.schedule ?? ((fn, ms) => {
+      const timer = setInterval(fn, ms);
+      return () => clearInterval(timer);
+    });
   }
 
   async run(): Promise<number> {
@@ -206,6 +309,7 @@ export class ConsoleApp {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.noticeTimer);
+    this.stopMapTicks?.();
     this.client.close();
     this.screen.cleanup();
     this.resolve?.(code);
@@ -243,8 +347,21 @@ export class ConsoleApp {
       if (this.inboxFeed || !selected) return { scope: "inbox" };
       return selected.startsWith("i:n:") ? { scope: "inbox" } : { scope: "session", sessionId: selected.slice(2) };
     }
-    if (this.tab === "channels") return selected ? { scope: "channel", channel: selected.slice(2) } : undefined;
+    if (this.tab === "channels") {
+      const channel = this.selectedChannel();
+      return channel ? { scope: "channel", channel } : undefined;
+    }
     return undefined;
+  }
+
+  private selectedChannel(): string | undefined {
+    const key = this.selection.channels;
+    return key?.startsWith("m:") ? key.slice(2, key.indexOf(":", 2)) : key?.slice(2);
+  }
+
+  private selectedChannelMember(): string | undefined {
+    const key = this.selection.channels;
+    return key?.startsWith("m:") ? key.slice(key.indexOf(":", 2) + 1) : undefined;
   }
 
   private readScope(): ReadScope | undefined {
@@ -275,13 +392,39 @@ export class ConsoleApp {
     return target.kind === "session" ? `session:${target.id}` : `channel:${target.name}`;
   }
 
+  /** Selects the oldest incoming held message by durable target identity, independent of names. */
+  private heldForSession(sessionId: string): { message: StoredMessage; count: number } | undefined {
+    let message: StoredMessage | undefined;
+    let count = 0;
+    for (const held of this.heldMessages.values()) {
+      if (held.toSessionId !== sessionId) continue;
+      count++;
+      if (!message || held.order < message.order) message = held;
+    }
+    return message ? { message, count } : undefined;
+  }
+
+  /** Replaces held state from the authoritative operation, including transitions missed by replay. */
+  private async refreshHeld(): Promise<void> {
+    const held = await this.client.request("held");
+    this.heldMessages = new Map((held.messages as StoredMessage[]).map((m) => [m.id, m]));
+    this.heldDirty = false;
+  }
+
   private async hydrate(): Promise<void> {
     if (this.closed || this.syncing) return;
     this.syncing = true;
+    this.recovering = true;
+    this.freshMapPositions.clear();
+    this.mapGen++;
+    this.map.suspend();
+    this.map.setConnection("offline");
     try {
       const previous = this.watermark;
       const snapshot = await this.client.sync();
-      const [summaries, events] = await Promise.all([this.client.inboxSummaries(), this.client.recentEvents()]);
+      const [summaries, events] = await Promise.all([
+        this.client.inboxSummaries(), this.client.recentEvents(), this.refreshHeld(),
+      ]);
       this.applySnapshot(snapshot);
       this.summaries = summaries;
       this.activity = events;
@@ -293,19 +436,23 @@ export class ConsoleApp {
       if (scope) await this.load(scope);
     } catch (e) {
       this.connection = "offline";
+      this.map.setConnection("offline");
       this.say(`Disconnected: ${stringify(e)} · ? → Doctor / Daemon start / Reconnect`, "error");
     } finally {
       this.syncing = false;
       this.render();
-      if (this.connection === "connected") void this.replay();
+      if (this.connection === "connected") this.track(this.replay());
     }
   }
 
   private applySnapshot(s: SyncResult): void {
     this.sessions = s.sessions;
     this.sessionOrders = { ...s.sessionLastOrders };
+    this.sessionOrdersDirty = false;
+    this.sessionPings = { ...s.sessionPings };
     this.channels = s.channels;
     this.readStates = new Map(s.readStates.map((r) => [keyOf(r.scope), r]));
+    this.failedCount = s.failedCount;
     this.watermark = s.watermark;
   }
 
@@ -317,38 +464,77 @@ export class ConsoleApp {
         const r = await this.client.replay(this.watermark);
         if (r.gap) {
           this.say("History gap: retained events were pruned; reloading the snapshot. Older missing changes cannot be recovered.");
+          this.map.setNotice("HISTORY GAP · missing channel renames cannot be recovered");
+          this.freshMapPositions.clear();
           this.resync = true;
           break;
         }
         for (const event of r.events) {
-          this.watermark = Math.max(this.watermark, event.position);
-          this.applyEvent(event);
+          if (event.position <= this.watermark) continue;
+          this.watermark = event.position;
+          const animate = this.freshMapPositions.delete(event.position);
+          this.applyEvent(event, animate);
         }
         if (!r.hasMore) break;
       }
+      // Refresh only after relevant replay transitions; the held op is authoritative even
+      // when a hold and its release both occurred between snapshots.
+      if (this.heldDirty && !this.resync) await this.refreshHeld();
+      if (this.sessionOrdersDirty && !this.resync) {
+        // Closure may move the newest messages out of an identity. A loaded page cannot
+        // establish its remaining maximum; refresh orders without skipping replay events.
+        this.sessionOrders = (await this.client.sync()).sessionLastOrders;
+        this.sessionOrdersDirty = false;
+      }
     } catch (e) {
       this.connection = "offline";
+      this.map.setConnection("offline");
       this.say(`Disconnected: ${stringify(e)} · reconnecting`, "error");
     } finally {
       this.replaying = false;
-      this.ensureSelection();
-      this.render();
       if (this.resync) {
         this.resync = false;
         this.streams.clear();
+        this.activity = [];
+        this.summaries = [];
+        this.sessions = [];
+        this.sessionPings = {};
+        this.readStates.clear();
+        this.heldMessages.clear();
+        this.panel = undefined;
+        this.readHold = undefined;
         this.watermark = 0;
         await this.hydrate();
       } else if (this.connection === "connected" && this.pushedPosition > this.watermark) await this.replay();
+      if (this.connection === "connected" && this.recovering && !this.resync && !this.replaying && !this.syncing) {
+        this.recovering = false;
+        this.freshMapPositions.clear();
+        if (this.mapActive()) {
+          this.map.refresh();
+          this.fetchMap(this.map.take());
+        }
+      }
+      this.ensureSelection();
+      this.render();
     }
   }
 
-  private applyEvent(item: PositionedEvent): void {
+  private applyEvent(item: PositionedEvent, animate = false): void {
     if (!this.activity.length || item.position > this.activity.at(-1)!.position) {
       this.activity.push(item);
       if (this.activity.length > 200) this.activity.shift();
     }
     const e = item.event;
+    if (this.mapEvents) {
+      this.mapEvents.push({
+        position: item.position,
+        event: e.type === "channel" ? { ...e, channel: { ...e.channel } } : e,
+      });
+    }
     if (e.type === "message") {
+      this.map.onMessage(e.msg, animate && this.mapActive());
+      if (e.failedCount !== undefined) this.failedCount = e.failedCount;
+      if (e.status === "held" || this.heldMessages.has(e.msg.id)) this.heldDirty = true;
       const m: StoredMessage = { ...e.msg, status: e.status, ...(e.reason ? { reason: e.reason } : {}) };
       if (!e.reason) delete m.reason;
       if (!m.channel) {
@@ -357,11 +543,28 @@ export class ConsoleApp {
         }
       }
       for (const [key, stream] of this.streams) {
+        if (!stream.loaded) continue;
+        const index = stream.messages.findIndex((x) => x.id === m.id);
         const matches = m.channel
           ? key === `c:${m.channel}`
           : key === `s:${m.fromSessionId}` || key === `s:${m.toSessionId}` || (key === "inbox" && m.to === "human");
-        if (!matches || !stream.loaded) continue;
-        const index = stream.messages.findIndex((x) => x.id === m.id);
+        if (!matches) {
+          if (index >= 0) {
+            const next = stream.messages[index + 1];
+            const previous = stream.messages[index - 1];
+            const neighbor = next ?? previous;
+            stream.messages.splice(index, 1);
+            stream.expanded.delete(m.id);
+            if (stream.selectedId === m.id) stream.selectedId = neighbor?.id;
+            const anchor = stream.viewport.anchor;
+            if (anchor?.id === m.id) {
+              if (next) stream.viewport = { ...stream.viewport, anchor: { id: next.id, row: 0 } };
+              else if (previous) stream.viewport = { ...stream.viewport, anchor: { id: previous.id, row: anchor.row } };
+              else stream.viewport = { follow: true };
+            }
+          }
+          continue;
+        }
         if (index >= 0) stream.messages[index] = m;
         else if (!stream.hasMore || !stream.messages.length || m.order > stream.messages[0].order) {
           stream.messages.push(m);
@@ -379,8 +582,8 @@ export class ConsoleApp {
       }
       if (m.channel && e.status === "posted") {
         const channel = this.channels.find((c) => c.name === m.channel);
-        if (channel) Object.assign(channel, { count: channel.count + 1, lastAt: m.createdAt, lastOrder: m.order });
-        else this.channels.push({ name: m.channel, count: 1, lastAt: m.createdAt, lastOrder: m.order });
+        if (channel && m.order > channel.lastOrder) Object.assign(channel, { count: channel.count + 1, lastAt: m.createdAt, lastOrder: m.order });
+        else if (!channel) this.channels.push({ name: m.channel, count: 1, lastAt: m.createdAt, lastOrder: m.order, memberIds: [] });
         this.channels.sort((a, b) => b.lastOrder - a.lastOrder);
       }
       const incoming = m.from !== "human" && (m.channel !== undefined || m.to === "human");
@@ -392,14 +595,66 @@ export class ConsoleApp {
       }
     } else if (e.type === "read") {
       this.readStates.set(keyOf(e.state.scope), e.state);
+    } else if (e.type === "channel") {
+      if (e.action === "deleted") {
+        const key = `c:${e.channel.name}`;
+        this.channels = this.channels.filter((channel) => channel.name !== e.channel.name);
+        this.streams.delete(key);
+        this.readStates.delete(key);
+        this.drafts.delete(`channel:${e.channel.name}`);
+        if (this.readHold === key) this.readHold = undefined;
+        if (this.selectedChannel() === e.channel.name) {
+          this.selection.channels = undefined;
+          if (this.tab === "channels") this.focus = "list";
+        }
+      } else if (e.action === "renamed" && e.oldName) {
+        this.map.renameChannel(e.oldName, e.channel.name);
+        const oldKey = `c:${e.oldName}`;
+        const newKey = `c:${e.channel.name}`;
+        const oldIndex = this.channels.findIndex((c) => c.name === e.oldName);
+        if (oldIndex >= 0) this.channels.splice(oldIndex, 1);
+        const oldStream = this.streams.get(oldKey);
+        if (oldStream) {
+          for (const m of oldStream.messages) if (m.channel === e.oldName) m.channel = e.channel.name;
+          this.streams.delete(oldKey);
+          this.streams.set(newKey, oldStream);
+        }
+        const oldRead = this.readStates.get(oldKey);
+        if (oldRead) {
+          this.readStates.delete(oldKey);
+          this.readStates.set(newKey, { ...oldRead, scope: { scope: "channel", channel: e.channel.name } });
+        }
+        if (this.selection.channels === oldKey) this.selection.channels = newKey;
+        const oldDraftKey = `channel:${e.oldName}`;
+        const draft = this.drafts.get(oldDraftKey);
+        if (draft !== undefined) { this.drafts.delete(oldDraftKey); this.drafts.set(`channel:${e.channel.name}`, draft); }
+        if (this.readHold === oldKey) this.readHold = newKey;
+        for (const item of this.activity) {
+          const ev = item.event;
+          if (ev.type === "channel" && ev.channel.name === e.oldName) {
+            item.event = { ...ev, channel: { ...ev.channel, name: e.channel.name } };
+          }
+        }
+      }
+      if (e.action !== "deleted") {
+        const index = this.channels.findIndex((c) => c.name === e.channel.name);
+        if (index >= 0) this.channels[index] = e.channel;
+        else this.channels.push(e.channel);
+        this.channels.sort((a, b) => b.lastOrder - a.lastOrder || a.name.localeCompare(b.name));
+      }
     } else if (e.type === "session") {
       const index = this.sessions.findIndex((s) => s.id === e.session.id);
+      if (e.session.closedAt !== undefined && this.sessions[index]?.closedAt === undefined) this.sessionOrdersDirty = true;
       if (index >= 0) this.sessions[index] = e.session;
       else this.sessions.push(e.session);
       for (const summary of this.summaries) if (summary.sessionId === e.session.id) summary.name = e.session.name;
+      if (e.session.state !== "live") delete this.sessionPings[e.session.id];
+    } else if (e.type === "ping") {
+      if (this.session(e.sessionId)?.state === "live") this.sessionPings[e.sessionId] = e.ping;
     } else if (e.type === "retention") {
       this.resync = true;
     }
+    if (this.mapActive() && (e.type === "session" || e.type === "channel" || e.type === "ping")) this.track(this.refreshMap());
     if (this.tab === "activity" && this.followActivity) this.selection.activity = undefined;
   }
 
@@ -430,7 +685,9 @@ export class ConsoleApp {
   // ------------------------------------------------------------------ lists
 
   private stateLabel(s: SessionIdentity): TerminalSpan {
-    if (s.state === "live") return { text: "live", style: theme.ok };
+    if (s.state === "live") return this.sessionPings[s.id] === "not_responding"
+      ? { text: "not_responding", style: theme.warn }
+      : { text: "live", style: theme.ok };
     if (s.state === "gone") return { text: "gone", style: theme.warn };
     return { text: "archived", style: theme.dim };
   }
@@ -443,13 +700,17 @@ export class ConsoleApp {
     return [{ text: long ? `${state.unread} unread${reminder} · ` : `+${state.unread}${reminder} · `, style: theme.unread }];
   }
 
-  private marker(selected: boolean): TerminalSpan {
-    return { text: selected ? "› " : "  ", style: theme.accentBold };
+  private marker(selected: boolean, list = false): TerminalSpan {
+    return {
+      text: selected ? (list ? "▌ " : "› ") : "  ",
+      style: theme.accentBold,
+    };
   }
 
   private entries(tab: Tab): Entry[] {
-    const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.accent }]] });
-    const pick = (selected: boolean, focused: boolean) => selected && focused ? theme.selected : undefined;
+    if (tab === "map") return [];
+    const heading = (text: string): Entry => ({ rows: (width) => [[{ text: ellipsize(text, width), style: theme.dim }]] });
+    const pick = (selected: boolean) => selected ? theme.selected : undefined;
     if (tab === "sessions") {
       const q = this.query.toLowerCase();
       const orders = this.sessionOrders;
@@ -458,29 +719,46 @@ export class ConsoleApp {
         .sort((a, b) => (orders[b.id] ?? 0) - (orders[a.id] ?? 0) || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
       const row = (s: SessionIdentity): Entry => ({
         key: `s:${s.id}`,
-        rows: (width, selected, focused) => {
+        rows: (width, selected) => {
           const unread = (this.readStates.get(`s:${s.id}`)?.unread ?? 0) > 0;
           const former = q && !s.name.includes(q) ? s.previousNames.find((name) => name.includes(q)) : undefined;
-          return [justify(
-            [this.marker(selected), { text: s.name, style: unread ? theme.bold : {} }, ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : [])],
-            [...this.unreadSpans(`s:${s.id}`), this.stateLabel(s)],
-            width, pick(selected, focused),
-          )];
+          const archived = s.state === "removed";
+          const failedPing = s.state === "live" && this.sessionPings[s.id] === "not_responding";
+          const left: TerminalLine = [
+            this.marker(selected, true),
+            { text: archived ? "  " : s.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || s.state === "gone" ? theme.warn : theme.ok },
+            { text: s.name, style: selected ? theme.brand : archived ? theme.dim : unread ? theme.bold : {} },
+            ...(former ? [{ text: ` was ${former}`, style: theme.dim }] : []),
+          ];
+          const right: TerminalSpan[] = [{ text: harnessShortName(s.harness).padEnd(3), style: theme.dim }];
+          const role = s.role === "orchestrator" ? "orch" : s.role === "worker" ? "wrk" : "";
+          if (role) right.push({ text: " " }, { text: role, style: { ...theme.selected, ...(archived ? theme.dim : theme.bold) } });
+          if (s.inbound !== "accept") right.push({ text: " " }, { text: s.inbound === "hold" ? "⏸" : "refuse", style: s.inbound === "hold" ? theme.warn : theme.bad });
+          const badge = this.unreadSpans(`s:${s.id}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") }));
+          if (badge.length) right.push({ text: " " }, ...badge);
+          const detailWidth = right.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+          const fill = pick(selected);
+          // Keep complete metadata and a readable name even at the narrow split boundary.
+          const rows = width < 4 + Math.min(3, terminalTextWidth(s.name)) + 1 + detailWidth
+            ? [padSpans(left, width, fill), justify([], right, width, fill)]
+            : [justify(left, right, width, fill)];
+          if (failedPing) rows.push(justify([], [this.stateLabel(s)], width, fill));
+          return rows;
         },
       });
       const live = matching.filter((s) => s.state === "live");
       const gone = matching.filter((s) => s.state === "gone");
       const archived = matching.filter((s) => s.state === "removed");
       const result: Entry[] = [];
-      if (live.length) result.push(heading(`Live ${live.length}`), ...live.map(row));
-      if (gone.length) result.push(heading(`Reconnecting ${gone.length}`), ...gone.map(row));
+      if (live.length) result.push(heading("LIVE"), ...live.map(row));
+      if (gone.length) result.push(heading("RECONNECTING"), ...gone.map(row));
       if (archived.length) {
         const open = this.archiveOpen || q !== "";
         result.push({
           key: "archive",
-          rows: (width, selected, focused) => [justify(
-            [this.marker(selected), { text: `${open ? "▾" : "▸"} Archive`, style: theme.accent }],
-            [{ text: `${archived.length}`, style: theme.dim }], width, pick(selected, focused),
+          rows: (width, selected) => [justify(
+            [this.marker(selected, true), { text: `${open ? "▾" : "▸"} archive ${archived.length}`, style: theme.dim }],
+            [], width, pick(selected),
           )],
         });
         if (open) result.push(...archived.map(row));
@@ -492,38 +770,70 @@ export class ConsoleApp {
         const key = summary.sessionId ? `i:${summary.sessionId}` : `i:n:${summary.name}`;
         return {
           key,
-          rows: (width, selected, focused) => {
+          rows: (width, selected) => {
             const unreadKey = summary.sessionId ? `s:${summary.sessionId}` : "";
-            const preview = sanitizeTerminalText(summary.latest.text);
+            const preview = sanitizeTerminalText(renderMessageBody(summary.latest));
             return [
               justify(
-                [this.marker(selected), { text: summary.name, style: theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
+                [this.marker(selected, true), { text: summary.name, style: selected ? theme.brand : theme.agent }, ...(summary.sessionId ? [] : [{ text: " legacy", style: theme.dim }])],
                 [...this.unreadSpans(unreadKey), { text: formatTime(summary.latest.createdAt, Date.now(), true), style: theme.dim }],
-                width, pick(selected, focused),
+                width, pick(selected),
               ),
-              padSpans([{ text: "  " }, { text: ellipsize(preview, Math.max(0, width - 2)), style: theme.dim }], width, pick(selected, focused)),
+              padSpans([{ text: "  " }, { text: ellipsize(preview, Math.max(0, width - 2)), style: theme.dim }], width, pick(selected)),
             ];
           },
         };
       });
     }
     if (tab === "channels") {
-      return this.channels.map((channel) => ({
-        key: `c:${channel.name}`,
-        rows: (width, selected, focused) => [justify(
-          [this.marker(selected), { text: `#${channel.name}`, style: theme.accentBold }],
-          this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
-          width, pick(selected, focused),
-        )],
-      }));
+      return this.channels.flatMap((channel): Entry[] => [
+        {
+          key: `c:${channel.name}`,
+          rows: (width, selected) => [justify(
+            [this.marker(selected, true), { text: `#${channel.name}`, style: selected ? theme.brand : theme.accentBold }],
+            this.unreadSpans(`c:${channel.name}`).map((span) => ({ ...span, text: span.text.replace(/ · $/, "") })),
+            width, pick(selected),
+          )],
+        },
+        ...(channel.memberIds ?? []).flatMap((id): Entry[] => {
+          const member = this.session(id);
+          if (!member) return [];
+          return [{
+            key: `m:${channel.name}:${id}`,
+            rows: (width, selected) => {
+              const archived = member.state === "removed";
+              const failedPing = member.state === "live" && this.sessionPings[member.id] === "not_responding";
+              const role = member.role === "orchestrator" ? "orch" : member.role === "worker" ? "wrk" : "unset";
+              const detail: TerminalSpan[] = [
+                { text: harnessShortName(member.harness).padEnd(3), style: theme.dim },
+                { text: " " },
+                { text: role, style: role === "unset" ? theme.dim : { ...theme.selected, ...(archived ? theme.dim : theme.bold) } },
+              ];
+              if (member.inbound !== "accept") detail.push({ text: " " }, { text: member.inbound === "hold" ? "⏸" : "refuse", style: member.inbound === "hold" ? theme.warn : theme.bad });
+              const label: TerminalLine = [
+                this.marker(selected, true), { text: "  " },
+                { text: archived ? "  " : member.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || member.state === "gone" ? theme.warn : theme.ok },
+                { text: member.name, style: selected ? theme.brand : archived ? theme.dim : theme.agent },
+              ];
+              const detailWidth = detail.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+              const fill = pick(selected);
+              const rows = width < 6 + Math.min(3, terminalTextWidth(member.name)) + 1 + detailWidth
+                ? [padSpans(label, width, fill), justify([], detail, width, fill)]
+                : [justify(label, detail, width, fill)];
+              if (failedPing) rows.push(justify([], [this.stateLabel(member)], width, fill));
+              return rows;
+            },
+          }];
+        }),
+      ]);
     }
     const names = (id: string): string | undefined => this.session(id)?.name;
     return this.activity
       .filter((item) => this.activityFilter === "all" || isImportantEvent(item))
       .map((item) => ({
         key: `e:${item.position}`,
-        rows: (width, selected, focused) => [padSpans(
-          [this.marker(selected), ...activitySpans(item, names)], width, pick(selected, focused),
+        rows: (width, selected) => [padSpans(
+          [this.marker(selected, true), ...activitySpans(item, names)], width, pick(selected),
         )],
       }));
   }
@@ -543,6 +853,13 @@ export class ConsoleApp {
       if (!current || !keys.includes(current)) {
         // Keep an archived selection that the collapsed archive merely hides.
         if (tab === "sessions" && current?.startsWith("s:") && this.session(current.slice(2))) continue;
+        if (tab === "channels" && current?.startsWith("m:")) {
+          const channelKey = `c:${this.selectedChannel()}`;
+          if (keys.includes(channelKey)) {
+            this.selection.channels = channelKey;
+            continue;
+          }
+        }
         this.selection[tab] = keys.find((key) => key !== "archive") ?? keys[0];
       }
     }
@@ -557,7 +874,8 @@ export class ConsoleApp {
     if (!keys.length) return;
     const current = this.tab === "activity" ? this.selectedActivity() : this.selection[this.tab];
     const index = current ? keys.indexOf(current) : -1;
-    const next = Math.max(0, Math.min(keys.length - 1, index < 0 ? (delta > 0 ? 0 : keys.length - 1) : index + delta));
+    const next = delta === Infinity ? keys.length - 1 : delta === -Infinity ? 0
+      : Math.max(0, Math.min(keys.length - 1, index < 0 ? (delta > 0 ? 0 : keys.length - 1) : index + delta));
     this.selection[this.tab] = keys[next];
     if (this.tab === "activity") this.followActivity = next === keys.length - 1;
     await this.opened();
@@ -598,6 +916,16 @@ export class ConsoleApp {
     if (!item) return;
     const e = item.event;
     let sessionId: string | undefined;
+    if (e.type === "channel") {
+      if (!this.channels.some((channel) => channel.name === e.channel.name)) {
+        this.say("That channel has been deleted.");
+        return this.render();
+      }
+      this.selection.channels = `c:${e.channel.name}`;
+      await this.setTab("channels");
+      this.focus = "transcript";
+      return this.render();
+    }
     if (e.type === "message") {
       if (e.msg.channel) {
         this.selection.channels = `c:${e.msg.channel}`;
@@ -607,6 +935,7 @@ export class ConsoleApp {
       }
       sessionId = e.msg.from === "human" ? e.msg.toSessionId : e.msg.fromSessionId ?? e.msg.toSessionId;
     } else if (e.type === "session") sessionId = e.session.id;
+    else if (e.type === "ping") sessionId = e.sessionId;
     else if (e.type === "read") sessionId = e.state.scope.scope === "session" ? e.state.scope.sessionId : undefined;
     const session = sessionId && this.session(sessionId);
     if (!session) {
@@ -621,18 +950,287 @@ export class ConsoleApp {
     this.render();
   }
 
+  // ------------------------------------------------------------------ quick jump
+
+  private jumpItems(): JumpItem[] {
+    const query = (this.finder?.query ?? "").toLowerCase();
+    const items: JumpItem[] = [];
+    if (!query.startsWith("#")) {
+      for (const session of this.sessions) {
+        let rank = jumpRank(session.name, query);
+        let former: string | undefined;
+        for (const name of session.previousNames) {
+          const previousRank = jumpRank(name, query);
+          if (previousRank < rank) {
+            rank = previousRank;
+            former = name;
+          }
+        }
+        if (rank !== Infinity) items.push({
+          key: `s:${session.id}`, name: session.name, session, rank,
+          state: session.state === "live" ? 0 : session.state === "gone" ? 1 : 2,
+          ...(former ? { former } : {}),
+        });
+      }
+    }
+    const channelQuery = query.startsWith("#") ? query.slice(1) : query;
+    for (const channel of this.channels) {
+      const rank = jumpRank(channel.name, channelQuery);
+      if (rank !== Infinity) items.push({ key: `c:${channel.name}`, name: channel.name, rank, state: 0 });
+    }
+    return items.sort((a, b) => a.rank - b.rank || a.state - b.state
+      || Number(!a.session) - Number(!b.session)
+      || a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+  }
+
+  private openFinder(): void {
+    this.mention = undefined;
+    if (!this.finder) this.finder = { query: "", top: 0, purpose: "jump" };
+    this.render();
+  }
+
+  /** Any non-closed retained identity, including an automatically removed archive, may be replaced. */
+  private openReplaceSource(): void {
+    this.mention = undefined;
+    this.finder = { query: "", top: 0, purpose: "replace-source" };
+    this.render();
+  }
+
+  private beginReplaceTarget(sourceId: string): void {
+    this.finder = { query: "", top: 0, purpose: "replace-target", replaceFrom: sourceId };
+    this.render();
+  }
+
+  private replaceItems(): JumpItem[] {
+    const finder = this.finder!;
+    const query = finder.query.toLowerCase();
+    const items: JumpItem[] = [];
+    for (const session of this.sessions) {
+      const eligible = finder.purpose === "replace-source"
+        ? session.closedAt === undefined
+        : session.state === "live" && session.id !== finder.replaceFrom;
+      if (!eligible) continue;
+      let rank = jumpRank(session.name, query);
+      let former: string | undefined;
+      for (const name of session.previousNames) {
+        const previousRank = jumpRank(name, query);
+        if (previousRank < rank) {
+          rank = previousRank;
+          former = name;
+        }
+      }
+      if (rank !== Infinity) items.push({
+        key: `s:${session.id}`, name: session.name, session, rank,
+        state: session.state === "live" ? 0 : session.state === "gone" ? 1 : 2,
+        ...(former ? { former } : {}),
+      });
+    }
+    return items.sort((a, b) => a.rank - b.rank || a.state - b.state || a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+  }
+
+  private finderItems(): JumpItem[] {
+    return this.finder!.purpose === "jump" ? this.jumpItems() : this.replaceItems();
+  }
+
+  private finderIndex(items: JumpItem[]): number {
+    const finder = this.finder!;
+    const found = items.findIndex((item) => item.key === finder.selected);
+    if (found < 0 && finder.selected !== undefined && finder.purpose !== "jump") {
+      return -1;
+    }
+    const index = Math.max(0, found);
+    finder.selected = items[index]?.key;
+    return index;
+  }
+
+  private async jumpTo(key: string): Promise<void> {
+    const item = this.jumpItems().find((entry) => entry.key === key);
+    if (!item) return this.render();
+    if (this.form) this.syncFormDraft(this.form);
+    this.finder = undefined;
+    this.form = undefined;
+    this.palette = undefined;
+    this.panel = undefined;
+    this.searching = false;
+    this.query = "";
+    this.readHold = undefined;
+    this.tab = item.session ? "sessions" : "channels";
+    this.selection[this.tab] = item.key;
+    if (item.session?.state === "removed") this.archiveOpen = true;
+    this.focus = "transcript";
+    await this.opened();
+  }
+
+  private async chooseFinderItem(key: string): Promise<void> {
+    const finder = this.finder!;
+    if (finder.purpose === "jump") return this.jumpTo(key);
+    if (finder.purpose === "replace-source") return this.beginReplaceTarget(key.slice(2));
+    if (!finder.replaceFrom) return this.render();
+    this.confirmReplace(finder.replaceFrom, key.slice(2));
+  }
+
+  private confirmReplace(fromId: string, toId: string): void {
+    this.finder = undefined;
+    const from = this.session(fromId);
+    const to = this.session(toId);
+    if (!from || !to) {
+      this.say("Replace picker target is no longer retained; reopen it.", "error");
+      return this.render();
+    }
+    const fromName = from.name;
+    const toName = to.name;
+    this.confirmation = {
+      title: "Replace session",
+      lines: [
+        `Replace ${fromName} with ${toName}? ${fromName} will be closed.`,
+        "",
+        "Role, channel memberships, former names and waiting messages move to the destination.",
+        "The source's existing conversation remains archived and readable.",
+        "y confirm · n cancel · Esc cancel",
+      ],
+      top: 0, height: 0, rows: 0, busy: false,
+      submit: async () => {
+        const snapshot = await this.client.sync();
+        const source = snapshot.sessions.find((session) => session.id === fromId);
+        const destination = snapshot.sessions.find((session) => session.id === toId);
+        if (!source || source.closedAt !== undefined) throw new Error(`source ${fromName} is no longer replaceable`);
+        if (!destination || destination.state !== "live" || destination.id === source.id) {
+          throw new Error(`destination ${toName} is no longer live`);
+        }
+        const result = await this.client.request("replace", { fromId, toId }) as ReplacementResult;
+        await this.hydrate();
+        if (result.skippedNames.length) {
+          this.showPanel("Replacement complete", {
+            lines: [
+              `Replaced ${result.from.name} with ${result.to.name}; ${result.from.name} is closed.`,
+              "",
+              "These names remain reserved by other live or reconnecting identities and do not forward to the destination:",
+              ...result.skippedNames,
+            ],
+          });
+        } else {
+          this.say(`Replaced ${result.from.name} with ${result.to.name}; ${result.from.name} is closed.`);
+        }
+      },
+    };
+    this.render();
+  }
+
+  private async finderKey(k: KeyInput): Promise<void> {
+    const finder = this.finder!;
+    const items = this.finderItems();
+    const selected = this.finderIndex(items);
+    if (k.name === "ESCAPE") this.finder = undefined;
+    else if (k.name === "UP" || k.name === "DOWN") {
+      const index = Math.max(0, Math.min(items.length - 1, selected + (k.name === "UP" ? -1 : 1)));
+      finder.selected = items[index]?.key;
+    } else if (k.name === "ENTER" || k.name === "KP_ENTER") {
+      const item = items[selected];
+      if (item) return this.chooseFinderItem(item.key);
+    } else if (k.name === "BACKSPACE" || k.name === "CTRL_U") {
+      finder.query = k.name === "CTRL_U" ? "" : finder.query.slice(0, stepGrapheme(finder.query, finder.query.length, -1));
+      finder.selected = undefined;
+      finder.top = 0;
+    } else if (k.text && !k.ctrl) {
+      finder.query += cleanInput(k.text).replace(/\n/g, " ");
+      finder.selected = undefined;
+      finder.top = 0;
+    }
+    this.render();
+  }
+
+  private finderPane(width: number, height: number, y0: number): Pane {
+    const finder = this.finder!;
+    const items = this.finderItems();
+    const selectedIndex = this.finderIndex(items);
+    const boxed = width >= 6 && height >= 4;
+    const inset = boxed ? 1 : 0;
+    const innerWidth = Math.max(0, width - 2 * inset);
+    const innerHeight = height - 2 * inset;
+    const title: TerminalLine = [{ text: finder.purpose === "jump" ? "Quick jump"
+      : finder.purpose === "replace-source" ? "Replace: source session" : "Replace: live destination", style: theme.accentBold }];
+    const rows: TerminalLine[] = !boxed && innerHeight >= 2 ? [clipSpans(title, innerWidth)] : [];
+    const queryRow = rows.length;
+    const prompt = innerWidth >= 3 ? "› " : "";
+    const promptWidth = terminalTextWidth(prompt);
+    const query = editorLayout(finder.query, finder.query.length, Math.max(1, innerWidth - promptWidth));
+    rows.push(clipSpans([
+      { text: prompt, style: theme.accentBold },
+      { text: query.rows[query.cursorRow] },
+    ], innerWidth));
+    const available = Math.max(0, innerHeight - rows.length);
+    if (selectedIndex < finder.top) finder.top = selectedIndex;
+    if (selectedIndex >= finder.top + available) finder.top = selectedIndex - available + 1;
+    finder.top = Math.max(0, Math.min(finder.top, items.length - available));
+    if (!items.length && available) {
+      const empty = finder.purpose === "jump" ? "No matching sessions or channels"
+        : finder.purpose === "replace-source" ? "No session available to replace" : "No other live session available";
+      rows.push(clipSpans([{ text: empty, style: theme.dim }], innerWidth));
+    }
+    for (let index = finder.top; index < Math.min(items.length, finder.top + available); index++) {
+      const item = items[index];
+      const selected = item.key === finder.selected;
+      let left: TerminalSpan[];
+      let right: TerminalSpan[];
+      if (item.session && finder.purpose !== "jump") {
+        const session = item.session;
+        const archived = session.state === "removed";
+        const failedPing = session.state === "live" && this.sessionPings[session.id] === "not_responding";
+        left = [
+          this.marker(selected, true),
+          { text: archived ? "  " : session.state === "live" ? "● " : "◌ ", style: archived ? theme.dim : failedPing || session.state === "gone" ? theme.warn : theme.ok },
+          { text: item.name, style: selected ? theme.brand : archived ? theme.dim : {} },
+          ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
+        ];
+        right = [{ text: harnessShortName(session.harness).padEnd(3), style: theme.dim }];
+        const role = session.role === "orchestrator" ? "orch" : session.role === "worker" ? "wrk" : "";
+        if (role) right.push({ text: " " }, { text: role, style: { ...theme.selected, ...(archived ? theme.dim : theme.bold) } });
+        if (session.inbound !== "accept") right.push({ text: " " }, { text: session.inbound === "hold" ? "⏸" : "refuse", style: session.inbound === "hold" ? theme.warn : theme.bad });
+        if (failedPing) right.push({ text: " " }, this.stateLabel(session));
+      } else {
+        left = [
+          this.marker(selected),
+          { text: item.session ? item.name : `#${item.name}`, style: selected ? theme.accentBold : theme.bold },
+          ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
+        ];
+        right = item.session
+          ? [item.session.state === "gone" ? { text: "reconnecting", style: theme.warn } : this.stateLabel(item.session)]
+          : [{ text: "channel", style: theme.dim }];
+      }
+      this.hits.push({ row: y0 + inset + rows.length, start: inset, end: width - inset, target: { kind: "finder", key: item.key } });
+      rows.push(justify(left, right, innerWidth, selected ? theme.selected : undefined));
+    }
+    const cursor = width > 0 ? {
+      row: y0 + inset + queryRow,
+      column: inset + Math.max(0, Math.min(innerWidth - 1, promptWidth + query.cursorColumn)),
+    } : undefined;
+    return {
+      rows: boxed ? roundedPanel(title, rows, width, height, true) : rows,
+      ...(cursor ? { cursor } : {}),
+    };
+  }
+
   // ------------------------------------------------------------------ rendering
 
   private render(): void {
     if (this.closed) return;
+    if (this.mention) {
+      const target = this.composeTarget();
+      if (this.focus !== "composer" || target?.kind !== "channel" || this.draftKey(target) !== this.mention.key
+        || this.finder || this.palette || this.form || this.panel) this.mention = undefined;
+    }
     const { columns: width, rows: height } = this.screen.size;
     this.hits = [];
+    this.mapHeight = 0;
+    this.syncMap();
     this.shown = undefined;
+    this.shownHeldId = undefined;
     const top = height >= 4 ? 1 : 0;
     const bottom = height >= 2 ? 1 : 0;
     const bodyHeight = Math.max(0, height - top - bottom);
     const lines: TerminalLine[] = [];
     if (top) lines.push(this.tabBar(width));
+    if (this.finder) this.hits = []; // visible tabs are inert while the finder owns input
     const body = this.body(width, bodyHeight, top);
     lines.push(...body.rows);
     if (bottom) lines.push(this.footer(width));
@@ -644,69 +1242,266 @@ export class ConsoleApp {
     }
   }
 
+  // ------------------------------------------------------------------ map tab
+
+  /** True while the Map is on screen and owns keys and clicks: it is the shown tab and no overlay covers it. */
+  private mapActive(): boolean {
+    return this.tab === "map" && !this.confirmation && !this.finder && !this.palette && !this.form && !this.searching && !this.panel;
+  }
+
+  /**
+   * Starts the animation timer and fetching when the Map becomes active and stops the timer when it stops being
+   * (another tab or an overlay). Results of fetches begun before a stop are discarded. Idempotent.
+   */
+  private syncMap(): void {
+    const active = this.mapActive();
+    if (active === (this.stopMapTicks !== undefined)) return;
+    if (!active) {
+      this.stopMapTicks?.();
+      this.stopMapTicks = undefined;
+      this.mapGen++;
+      this.freshMapPositions.clear();
+      this.map.suspend();
+      return;
+    }
+    this.stopMapTicks = this.schedule(() => this.stepMap(), TICK_MS);
+    this.map.refresh();
+    this.fetchMap(this.map.take());
+  }
+
+  private stepMap(): void {
+    if (this.closed || !this.mapActive()) return;
+    this.fetchMap(this.map.step(TICK_MS));
+    this.render();
+  }
+
+  private fetchMap(due: MapDue): void {
+    if (due.list) this.track(this.refreshMap());
+    if (due.scan) this.track(this.rescanMap());
+  }
+
+  /** Fetch one authoritative bundle; a failed or stale generation never replaces the last city. */
+  private async refreshMap(): Promise<void> {
+    if (this.closed || !this.mapActive() || this.recovering) return;
+    if (this.mapLoading) {
+      this.mapAgain = true;
+      return;
+    }
+    this.mapLoading = true;
+    try {
+      do {
+        this.mapAgain = false;
+        const gen = this.mapGen;
+        const events: PositionedEvent[] = [];
+        this.mapEvents = events;
+        try {
+          const bundle = await within((async () => {
+            const [list, channelList] = await Promise.all([this.client.request("list"), this.client.request("channel_list")]);
+            const sessions = list.sessions as ListedSession[];
+            const channels = (channelList.channels as ChannelSummary[]).map((channel) => ({ ...channel }));
+            const identities = [...this.sessions];
+            const known = new Set([...sessions, ...identities].map((session) => session.id));
+            await Promise.all(channels.map(async (channel) => {
+              if (channel.memberIds !== undefined && channel.memberIds.every((id) => known.has(id))) return;
+              const reply = await this.client.request("channel_members", { channel: channel.name });
+              const members = reply.members as SessionIdentity[];
+              if (channel.memberIds === undefined) channel.memberIds = members.map((member) => member.id);
+              for (const member of members) if (!identities.some((identity) => identity.id === member.id)) identities.push(member);
+            }));
+            return { sessions, channels, identities };
+          })(), REQUEST_TIMEOUT_MS);
+          if (this.closed) return;
+          if (gen === this.mapGen) {
+            rebaseCitySnapshot(bundle, events);
+            for (const identity of bundle.identities) if (!this.session(identity.id)) this.sessions.push(identity);
+            this.map.setSnapshot(bundle.sessions, bundle.channels, bundle.identities);
+            this.map.setConnection("connected");
+            this.render();
+          }
+        } catch {
+          if (this.closed) return;
+          if (gen === this.mapGen) {
+            this.map.setConnection("offline");
+            this.render();
+          }
+        } finally {
+          if (this.mapEvents === events) this.mapEvents = null;
+        }
+      } while (this.mapAgain && this.mapActive());
+    } finally {
+      this.mapLoading = false;
+    }
+  }
+
+  /** Scans processes for the map; a request during a scan schedules exactly one more pass, none is dropped. */
+  private async rescanMap(): Promise<void> {
+    if (this.closed || !this.mapActive()) return;
+    if (this.mapScanning) {
+      this.scanAgain = true;
+      return;
+    }
+    this.mapScanning = true;
+    try {
+      do {
+        this.scanAgain = false;
+        const gen = this.mapGen;
+        let procs: ProcInfo[] | undefined;
+        try {
+          procs = await this.scan();
+        } catch {
+          // keep the previous scan
+        }
+        if (this.closed) return;
+        if (procs && gen === this.mapGen) {
+          this.map.setProcs(procs);
+          this.render();
+        }
+      } while (this.scanAgain && this.mapActive());
+    } finally {
+      this.mapScanning = false;
+    }
+  }
+
+  /** The scene fills the body exactly; its key hints and view flags are shown by the console footer. */
+  private mapPane(width: number, height: number, y0: number): Pane {
+    this.mapTop = y0;
+    this.mapHeight = height;
+    const lines = this.map.frame({ columns: width, rows: height }).slice(0, height);
+    return { rows: [...lines, ...Array<TerminalLine>(height - lines.length).fill("")] };
+  }
+
   private tabBar(width: number): TerminalLine {
-    const badge = (tab: Tab): string => {
-      let unread = 0;
-      for (const [key, state] of this.readStates) {
-        if (tab === "inbox" && key.startsWith("s:")) unread += state.unread;
-        if (tab === "channels" && key.startsWith("c:")) unread += state.unread;
-      }
-      return unread ? ` ${unread}` : "";
-    };
+    let inboxUnread = 0;
+    let channelUnread = 0;
+    for (const [key, state] of this.readStates) {
+      if (key.startsWith("s:")) inboxUnread += state.unread;
+      if (key.startsWith("c:")) channelUnread += state.unread;
+    }
+    // One entry per counter: adding another does not change the fitting or hit logic.
+    const counters = [
+      { count: this.sessions.filter((s) => s.state === "live").length, label: "live", short: "L", style: theme.dim },
+      { count: this.sessions.filter((s) => s.state === "gone").length, label: "reconnecting", short: "R", style: theme.warn },
+      { count: this.heldMessages.size, label: "held", short: "H", style: theme.warn },
+      { count: inboxUnread + channelUnread, label: "unread", short: "U", style: theme.unread },
+      { count: this.failedCount, label: "failed", short: "F", style: theme.bad },
+    ];
     const connection: TerminalSpan = this.connection === "connected"
       ? { text: "● connected", style: theme.ok }
       : this.connection === "offline" ? { text: "○ offline", style: theme.bad } : { text: "◌ connecting", style: theme.warn };
-    const brand: TerminalSpan = { text: " asenq ", style: { ...theme.brand, inverse: true } };
-    const build = (short: boolean): { spans: TerminalSpan[]; hits: Hit[] } => {
-      // Narrow terminals keep the active tab's full name and abbreviate the others.
-      const spans: TerminalSpan[] = [brand, { text: " " }];
+    const used = (spans: TerminalSpan[]): number => spans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
+    type Fit = { labels: "full" | "active" | "short" | "minimal"; brand: boolean; badges: boolean; counters: "full" | "short" | "none"; status: boolean };
+    // Keep counters reachable with compact tabs before omitting them; preserve complete
+    // tab hit regions and a connection symbol even at physically constrained widths.
+    const fits: Fit[] = [
+      { labels: "full", brand: true, badges: true, counters: "full", status: true },
+      { labels: "active", brand: true, badges: false, counters: "full", status: true },
+      { labels: "full", brand: true, badges: true, counters: "short", status: true },
+      { labels: "active", brand: true, badges: false, counters: "short", status: false },
+      { labels: "short", brand: false, badges: false, counters: "short", status: true },
+      { labels: "short", brand: false, badges: false, counters: "short", status: false },
+      { labels: "minimal", brand: false, badges: false, counters: "short", status: false },
+      { labels: "full", brand: true, badges: true, counters: "none", status: true },
+      { labels: "full", brand: true, badges: true, counters: "none", status: false },
+      { labels: "active", brand: true, badges: false, counters: "none", status: true },
+      { labels: "active", brand: true, badges: false, counters: "none", status: false },
+      { labels: "short", brand: false, badges: false, counters: "none", status: true },
+      { labels: "short", brand: false, badges: false, counters: "none", status: false },
+      { labels: "minimal", brand: false, badges: false, counters: "none", status: false },
+    ];
+    for (const fit of fits) {
+      const left: TerminalSpan[] = fit.brand ? [{ text: " asenq ", style: { ...theme.brand, inverse: true } }, { text: " " }] : [];
       const hits: Hit[] = [];
-      let column = terminalTextWidth(brand.text) + 1;
+      let column = used(left);
       for (const [tab, label] of TABS) {
         const active = tab === this.tab;
-        const text = ` ${short && !active ? label[0] : label}${badge(tab)} `;
-        const style = active ? (this.focus === "tabs" ? { ...theme.accentBold, inverse: true } : theme.focused) : theme.dim;
-        spans.push({ text, style });
-        hits.push({ row: 0, start: column, end: column + terminalTextWidth(text), target: { kind: "tab", tab } });
-        column += terminalTextWidth(text);
+        const full = fit.labels === "full" || (fit.labels === "active" && active);
+        const text = fit.labels === "minimal" ? label[0] : ` ${full ? label : label[0]}`;
+        const style = active ? { ...theme.accentBold, inverse: true } : theme.dim;
+        const spans: TerminalSpan[] = [{ text, style }];
+        const unread = tab === "inbox" ? inboxUnread : tab === "channels" ? channelUnread : 0;
+        if (fit.badges && unread) spans.push({ text: ` ${unread}`, style: theme.unread });
+        if (fit.labels !== "minimal") spans.push({ text: " ", style });
+        const length = used(spans);
+        left.push(...spans);
+        hits.push({ row: 0, start: column, end: column + length, target: { kind: "tab", tab } });
+        column += length;
       }
-      return { spans, hits };
-    };
-    const used = (spans: TerminalSpan[]): number => spans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-    let bar = build(false);
-    if (used(bar.spans) + terminalTextWidth(connection.text) + 1 > width) bar = build(true);
-    // The symbol alone still distinguishes the states (● ○ ◌) when there is no room for the word.
-    const status = used(bar.spans) + terminalTextWidth(connection.text) + 1 > width ? { ...connection, text: connection.text.slice(0, 1) } : connection;
-    this.hits.push(...bar.hits);
-    return justify(bar.spans, [status], width);
+      const right: TerminalSpan[] = [];
+      if (fit.counters !== "none") {
+        counters.forEach((counter, index) => {
+          if (index) right.push({ text: " · ", style: theme.dim });
+          right.push({ text: `${counter.count} ${fit.counters === "full" ? counter.label : counter.short}`, style: counter.style });
+        });
+        right.push({ text: "  " });
+      }
+      right.push(fit.status ? connection : { ...connection, text: connection.text.slice(0, 1) });
+      const gap = width - column - used(right);
+      // Never clip constructed tabs: recorded hit regions must exactly match visible cells.
+      if (gap >= (fit.labels === "minimal" ? 0 : 1)) {
+        this.hits.push(...hits);
+        return [...left, { text: " ".repeat(gap) }, ...right];
+      }
+    }
+    // Below six cells there is no room for five mouse tabs plus the state symbol.
+    // Keyboard tab shortcuts and the palette remain available; show only the active target.
+    if (width <= 1) return clipSpans([{ ...connection, text: connection.text.slice(0, 1) }], width);
+    this.hits.push({ row: 0, start: 0, end: 1, target: { kind: "tab", tab: this.tab } });
+    return [
+      { text: TABS.find(([tab]) => tab === this.tab)![1][0], style: { ...theme.accentBold, inverse: true } },
+      { text: " ".repeat(width - 2) },
+      { ...connection, text: connection.text.slice(0, 1) },
+    ];
   }
 
   private footer(width: number): TerminalLine {
-    const hints = this.palette ? "type to filter · ↑↓ · Enter run · Esc close"
-      : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel"
-      : this.searching ? "type name · ↑↓ · Enter keep · Esc clear"
-      : this.focus === "composer" ? "Enter send · Shift+Enter newline · Ctrl+E editor · Esc done"
-      : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · ? menu"
-      : this.focus === "tabs" ? "←→ switch · Enter open · ? menu"
-      : "↑↓ move · Enter open · Tab focus · ? menu";
-    const notice = this.notice;
-    let left: TerminalSpan[];
-    if (notice) {
-      const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
-      left = [{ text: notice.kind === "error" ? "✖ " : notice.kind === "new" ? "● " : "· ", style }, { text: notice.text, style }];
-      if (notice.kind === "error") left.push({ text: " · Esc dismiss", style: theme.dim });
-    } else {
-      const live = this.sessions.filter((s) => s.state === "live").length;
-      left = [{ text: `${live} live · ${this.sessions.length} sessions`, style: theme.dim }];
+    let hints = this.confirmation ? (this.confirmation.busy ? "working…" : "y confirm · n cancel · Esc cancel · ↑↓ scroll")
+      : this.finder ? (this.finder.purpose === "jump" ? "type to filter · ↑↓ choose · Enter open · Esc close" : "type to filter · ↑↓ choose · Enter select · Esc close")
+      : this.palette ? "type to filter · ↑↓ · Enter run · Esc close · Ctrl+K jump"
+      : this.form ? "Tab field · Enter submit · Shift+Enter newline · Esc cancel · Ctrl+K jump"
+      : this.searching ? "type name · ↑↓ · Enter keep · Esc clear · Ctrl+K jump"
+      : this.mention ? "↑↓ choose · Enter insert · Esc close · Ctrl+K jump"
+      : this.focus === "composer" ? "Enter send · Shift+Enter newline · Ctrl+E editor · Esc done · Ctrl+K jump"
+      : this.focus === "transcript" ? "↑↓ select · Enter details · End latest · c write · Ctrl+K jump · ? menu"
+      : this.focus === "tabs" ? "←→ switch · Enter open · Ctrl+K jump · ? menu"
+      : this.tab === "sessions" && this.selection.sessions === "archive" ? "↑↓ move · Enter expand · Ctrl+K jump · ? purge archives"
+      : this.tab === "sessions" && this.selection.sessions?.startsWith("s:")
+        ? this.session(this.selection.sessions.slice(2))?.state === "removed"
+          ? "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? purge"
+          : "↑↓ move · Enter open · Ctrl+X close · Ctrl+K jump · ? menu"
+      : this.tab === "map" ? this.map.searching
+        ? "type to search · ↑↓ choose · Enter select · Esc cancel · Ctrl+K jump"
+        : "arrows pan · hjkl/Tab select · Enter open · +/- zoom · / search · I inspect · f filter · r refresh · ? menu"
+      : "↑↓ move · Enter open · Tab focus · Ctrl+K jump · ? menu";
+    if (this.shownHeldId && !this.confirmation && !this.finder && !this.palette && !this.form && !this.searching && this.focus !== "composer") {
+      hints += " · r release · x drop";
     }
-    const right = clipSpans([{ text: hints, style: theme.dim }], notice ? Math.floor(width / 2) : width);
+    const notice = this.notice;
+    const flags = this.mapActive() ? this.map.flags : "";
+    if (!notice) {
+      return flags
+        ? justify(hintSpans(hints, Math.max(0, width - flags.length - 1)), [{ text: flags, style: theme.warn }], width)
+        : padSpans(hintSpans(hints, width), width);
+    }
+    const style = notice.kind === "error" ? theme.bad : notice.kind === "new" ? theme.unread : theme.accent;
+    const left: TerminalSpan[] = [
+      { text: notice.kind === "error" ? "✖ " : notice.kind === "new" ? "● " : "· ", style },
+      { text: notice.text, style },
+    ];
+    const half = Math.floor(width / 2);
+    const hintText = notice.kind === "error" ? `Esc dismiss · ${hints}` : hints;
+    const right = flags
+      ? [...hintSpans(hintText, Math.max(0, half - flags.length - 2)), { text: "  " }, { text: flags, style: theme.warn }]
+      : hintSpans(hintText, half);
     return justify(left, right, width);
   }
 
   private body(width: number, height: number, y0: number): Pane {
     if (height <= 0) return { rows: [] };
+    if (this.confirmation) return this.confirmationPane(width, height);
+    if (this.finder) return this.finderPane(width, height, y0);
     if (this.palette) return this.palettePane(width, height, y0);
     if (this.form) return this.formPane(width, height, y0);
+    if (this.tab === "map") return this.mapPane(width, height, y0);
     if (this.tab === "activity") return this.listPane(width, height, y0, 0);
     const panes = paneWidths(width);
     if (!panes) {
@@ -714,34 +1509,44 @@ export class ConsoleApp {
         ? this.listPane(width, height, y0, 0)
         : this.conversationPane(width, height, y0, 0, true);
     }
-    const left = this.listPane(panes.list, height, y0, 0);
-    const right = this.conversationPane(panes.conversation, height, y0, panes.list + 1, false);
+    const interiorHeight = Math.max(0, height - 2);
+    const left: Pane = interiorHeight ? this.listPane(panes.list - 2, interiorHeight, y0 + 1, 1) : { rows: [] };
+    const right = this.conversationPane(panes.conversation - 2, interiorHeight, y0 + 1, panes.list + 2, false);
+    const listTitle: TerminalLine = [{ text: TABS.find(([tab]) => tab === this.tab)![1], style: theme.accentBold }];
+    const leftRows = roundedPanel(listTitle, left.rows, panes.list, height, this.focus === "list");
+    const rightRows = roundedPanel(
+      this.title(panes.conversation - 6, false, y0, panes.list + 4),
+      right.rows, panes.conversation, height, this.focus === "transcript" || this.focus === "composer",
+    );
     const rows: TerminalLine[] = [];
-    for (let row = 0; row < height; row++) {
-      const leftRow = padSpans(typeof left.rows[row] === "string" ? [{ text: left.rows[row] as string }] : (left.rows[row] as TerminalSpan[] | undefined) ?? [], panes.list);
-      const rightRow = typeof right.rows[row] === "string" ? [{ text: right.rows[row] as string }] : (right.rows[row] as TerminalSpan[] | undefined) ?? [];
-      rows.push([...leftRow, { text: "│", style: this.focus === "list" ? theme.accent : theme.dim }, ...rightRow]);
-    }
+    for (let row = 0; row < height; row++) rows.push([...leftRows[row], { text: " " }, ...rightRows[row]]);
     return { rows, ...(left.cursor ?? right.cursor ? { cursor: left.cursor ?? right.cursor } : {}) };
   }
 
   private listPane(width: number, height: number, y0: number, x0: number): Pane {
     const tab = this.tab;
-    const focused = this.focus === "list";
     const header: TerminalLine[] = [];
     let cursor: TerminalCursor | undefined;
     if (tab === "sessions" && (this.searching || this.query)) {
       header.push(justify([{ text: "/ ", style: theme.accentBold }, { text: this.query }], this.searching ? [] : [{ text: "Esc clear", style: theme.dim }], width));
-      if (this.searching) cursor = { row: y0, column: x0 + Math.min(width - 1, 2 + terminalTextWidth(this.query)) };
+      if (this.searching && width > 0) cursor = { row: y0, column: x0 + Math.min(width - 1, 2 + terminalTextWidth(this.query)) };
     } else if (tab === "activity") {
       header.push(justify(
-        [{ text: "Activity ", style: theme.accentBold }, { text: this.activityFilter === "important" ? "messages, sessions and retention" : "all events", style: theme.dim }],
+        [{ text: "Activity ", style: theme.accentBold }, { text: this.activityFilter === "important" ? "messages, sessions, channels and retention" : "all events", style: theme.dim }],
         [{ text: this.activityFilter === "important" ? "f all · Enter open" : "f important · Enter open", style: theme.dim }], width,
       ));
     } else if (tab === "inbox") {
       header.push(justify([{ text: this.inboxFeed ? "Senders · feed shown" : "Senders", style: theme.accentBold }], [{ text: "v feed", style: theme.dim }], width));
     }
-    const available = Math.max(0, height - header.length);
+    // Decorations must leave at least one content row in a tiny viewport.
+    if (header.length >= height) {
+      header.length = Math.max(0, height - 1);
+      cursor = undefined;
+    }
+    const footer: TerminalLine[] = tab === "sessions" && !this.searching && !this.query && width >= 17 && height - header.length >= 5
+      ? [[{ text: "/ filter sessions", style: theme.dim }], [{ text: "─".repeat(width), style: theme.border }]]
+      : [];
+    const available = Math.max(0, height - header.length - footer.length);
     const selected = tab === "activity" ? this.selectedActivity() : this.selection[tab];
     const rows: TerminalLine[] = [];
     const keys: (string | undefined)[] = [];
@@ -750,7 +1555,7 @@ export class ConsoleApp {
     for (const entry of this.entries(tab)) {
       const isSelected = entry.key !== undefined && entry.key === selected;
       if (isSelected) selStart = rows.length;
-      for (const row of entry.rows(width, isSelected, focused)) {
+      for (const row of entry.rows(width, isSelected)) {
         rows.push(row);
         keys.push(entry.key);
       }
@@ -766,7 +1571,13 @@ export class ConsoleApp {
     if (tab === "activity" && this.followActivity) top = rows.length - available;
     if (selStart >= 0 && selStart < top) top = selStart;
     if (selEnd >= 0 && selEnd >= top + available) top = selEnd - available + 1;
+    if (selStart >= 0 && selEnd - selStart + 1 > available) top = selStart;
     top = Math.max(0, Math.min(top, rows.length - available));
+    if (available > 0 && !keys.slice(top, top + available).some((key) => key !== undefined)) {
+      const next = keys.findIndex((key, index) => index >= top && key !== undefined);
+      const previous = keys.findLastIndex((key) => key !== undefined);
+      if (next >= 0 || previous >= 0) top = next >= 0 ? next : previous;
+    }
     this.listTop[tab] = top;
     const visible = rows.slice(top, top + available);
     header.forEach((_, index) => this.hits.push({ row: y0 + index, start: x0, end: x0 + width, target: { kind: "list" } }));
@@ -774,15 +1585,11 @@ export class ConsoleApp {
       const key = keys[top + index];
       this.hits.push({ row: y0 + header.length + index, start: x0, end: x0 + width, target: key ? { kind: "entry", key } : { kind: "list" } });
     });
-    return { rows: [...header, ...visible], ...(cursor ? { cursor } : {}) };
-  }
-
-  private rule(left: TerminalSpan[], right: TerminalSpan[], width: number): TerminalSpan[] {
-    const rightSpans = clipSpans(right, Math.max(0, Math.floor(width / 2)));
-    const rightWidth = rightSpans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-    const leftSpans = clipSpans(left, Math.max(0, width - rightWidth - 1));
-    const leftWidth = leftSpans.reduce((sum, span) => sum + terminalTextWidth(span.text), 0);
-    return [...leftSpans, { text: "─".repeat(Math.max(0, width - leftWidth - rightWidth)), style: theme.accent }, ...rightSpans];
+    if (footer.length) {
+      while (visible.length < available) visible.push([]);
+      footer.forEach((_, index) => this.hits.push({ row: y0 + header.length + available + index, start: x0, end: x0 + width, target: { kind: "list" } }));
+    }
+    return { rows: [...header, ...visible, ...footer], ...(cursor ? { cursor } : {}) };
   }
 
   private title(width: number, narrow: boolean, y0: number, x0: number): TerminalLine {
@@ -800,6 +1607,7 @@ export class ConsoleApp {
     }
     const session = this.session(scope.sessionId);
     const left: TerminalSpan[] = [...back, { text: session?.name ?? scope.sessionId, style: theme.accentBold }];
+    if (session?.role) left.push({ text: ` · ${session.role}` });
     if (session?.previousNames.length) left.push({ text: ` formerly ${session.previousNames.join(", ")}`, style: theme.dim });
     if (session?.harness && session.harness !== "unknown") left.push({ text: ` · ${session.harness}`, style: theme.dim });
     const right: TerminalSpan[] = [...this.unreadSpans(keyOf(scope), true)];
@@ -808,46 +1616,61 @@ export class ConsoleApp {
   }
 
   private conversationPane(width: number, height: number, y0: number, x0: number, narrow: boolean): Pane {
+    if (height <= 0) {
+      if (this.panel) this.panel.height = 0;
+      return { rows: [] };
+    }
     const rows: TerminalLine[] = [];
-    const titled = height >= 3;
+    const titled = narrow && height >= 3;
     if (titled) rows.push(this.title(width, narrow, y0, x0));
     if (this.panel) return this.panelPane(rows, width, height, y0, x0);
     const target = this.composeTarget();
-    const composerRoom = height - rows.length >= 4 ? Math.max(1, height - rows.length - 3) : 0;
-    let composer: Pane | undefined;
-    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(6, composerRoom), x0);
-    const transcriptHeight = height - rows.length - (composer?.rows.length ?? 0);
-    const transcriptY = y0 + rows.length;
     const scope = this.scope();
+    const available = height - rows.length;
+    // Held controls follow the viewed identity, including read-only archived conversations.
+    const held = scope?.scope === "session" ? this.heldForSession(scope.sessionId) : undefined;
+    // Reserve one transcript row and the editor's input before held chrome. A full bar
+    // needs three rows; short panes use one, and the smallest panes hide it entirely.
+    const heldRows = held ? heldBar(held.message, held.count, width, available >= 8 ? 3 : available >= 3 ? 1 : 0) : [];
+    // Keep two transcript rows in previews; focused editors may borrow one, but never
+    // lose their input row to chrome. Short panes use an unboxed editor instead.
+    const composerRoom = this.focus === "composer" ? Math.max(1, available - 1) : available >= 5 ? available - 2 : 0;
+    let composer: Pane | undefined;
+    if (target && composerRoom) composer = this.composerPane(target, width, Math.min(8, Math.max(1, composerRoom - heldRows.length)), x0);
+    const transcriptHeight = height - rows.length - heldRows.length - (composer?.rows.length ?? 0);
+    const transcriptY = y0 + rows.length;
+    let visibleHeight = transcriptHeight;
+    let latestHint = false;
     let body: TerminalLine[];
     if (!scope) {
       const text = this.connection === "offline" && !this.sessions.length
         ? `Daemon unavailable. ${this.notice?.text ?? ""}`
-        : this.tab === "channels" ? "Channels appear once someone posts; use ? → Post channel." : "Select a session in the list.";
+        : this.tab === "channels" ? "Use ? → Create channel or Post channel to start a channel." : "Select a session in the list.";
       body = wrapTerminalText(text, width).map((line) => [{ text: line, style: theme.dim }]);
     } else {
       const key = keyOf(scope);
       const stream = this.streams.get(key);
+      latestHint = stream?.viewport.follow === false && transcriptHeight >= 2;
+      if (latestHint) visibleHeight--;
       const readScope = scope.scope === "inbox" ? undefined : scope;
       const state = readScope && this.readStates.get(key);
       const firstUnread = readScope && state?.unread
         ? stream?.messages.find((m) => this.eligible(readScope, m) && (m.order > state.position || m.order === state.reminder))
         : undefined;
-      const leading: TerminalLine[] = [[{
-        text: ellipsize(stream?.loading ? "Loading…" : stream?.hasMore ? "↑ older messages · scroll up or PgUp" : "Beginning of retained history", width),
-        style: theme.dim,
-      }]];
+      const historyText = ellipsize(stream?.loading ? "Loading…" : stream?.hasMore ? "↑ older messages · scroll up or PgUp" : "· beginning of retained history ·", width);
+      const historyIndent = !stream?.loading && !stream?.hasMore ? Math.max(0, Math.floor((width - terminalTextWidth(historyText)) / 2)) : 0;
+      const leading: TerminalLine[] = [[{ text: " ".repeat(historyIndent) + historyText, style: theme.dim }]];
       const layout = layoutTranscript(stream?.messages ?? [], {
         width,
         ...(stream?.selectedId && this.focus === "transcript" ? { selectedId: stream.selectedId } : {}),
         expanded: (id) => stream?.expanded.has(id) ?? false,
-        ...(firstUnread ? { firstUnreadId: firstUnread.id } : {}),
+        ...(firstUnread ? { firstUnreadId: firstUnread.id, unreadCount: state?.unread } : {}),
         leading,
         empty: stream?.loaded ? "No retained messages" : "",
       });
-      const top = viewportTop(layout, stream?.viewport ?? { follow: true }, transcriptHeight);
-      this.shown = { key, layout, top, height: transcriptHeight };
-      body = layout.rows.slice(top, top + transcriptHeight);
+      const top = viewportTop(layout, stream?.viewport ?? { follow: true }, visibleHeight);
+      this.shown = { key, layout, top, height: visibleHeight };
+      body = layout.rows.slice(top, top + visibleHeight);
       const rowIds: (string | undefined)[] = new Array(layout.rows.length);
       for (const [id, range] of layout.ranges) for (let row = range.start; row <= range.end; row++) rowIds[row] = id;
       body.forEach((_, index) => {
@@ -855,15 +1678,25 @@ export class ConsoleApp {
         this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: id ? { kind: "message", id } : { kind: "transcript" } });
       });
     }
-    body = body.slice(0, transcriptHeight);
-    for (let index = body.length; index < transcriptHeight; index++) {
+    body = body.slice(0, visibleHeight);
+    for (let index = body.length; index < visibleHeight; index++) {
       body.push("");
       this.hits.push({ row: transcriptY + index, start: x0, end: x0 + width, target: { kind: "transcript" } });
     }
+    if (latestHint) {
+      body.push(justify([], [{ text: "End ↓ latest", style: theme.dim }], width));
+      this.hits.push({ row: transcriptY + visibleHeight, start: x0, end: x0 + width, target: { kind: "transcript" } });
+    }
     rows.push(...body);
+    if (held && heldRows.length) {
+      rows.push(...heldRows);
+      this.shownHeldId = held.message.id;
+    }
     if (!composer) return { rows };
     const composerY = y0 + rows.length;
-    composer.rows.forEach((_, index) => this.hits.push({ row: composerY + index, start: x0, end: x0 + width, target: { kind: "composer" } }));
+    composer.rows.forEach((_, index) => {
+      this.hits.push({ row: composerY + index, start: x0, end: x0 + width, target: { kind: "composer" } });
+    });
     rows.push(...composer.rows);
     return { rows, ...(composer.cursor ? { cursor: { ...composer.cursor, row: composerY + composer.cursor.row } } : {}) };
   }
@@ -876,22 +1709,53 @@ export class ConsoleApp {
       this.cursor = text.length;
     }
     const focused = this.focus === "composer";
-    const label = target.kind === "session" ? `to ${target.name}` : `#${target.name}`;
-    const hint = focused ? "Enter send" : "c write";
-    const rows: TerminalLine[] = [];
-    const layout = editorLayout(text, this.cursor, Math.max(1, width - 2));
-    const count = Math.min(maxRows, Math.max(1, layout.rows.length));
+    const label = `to ${target.kind === "channel" ? "#" : ""}${target.name}`;
+    const boxed = width >= 6 && maxRows >= (this.mention?.key === key ? 4 : 3);
+    const inset = boxed ? 1 : 0;
+    const innerWidth = width - 2 * inset;
+    const promptWidth = Math.min(2, Math.max(0, innerWidth - 1));
+    const hint = innerWidth >= 60 ? "⏎ send ⇧⏎ newline ^E editor" : innerWidth >= 30 ? "⏎ send" : "";
+    const hintWidth = terminalTextWidth(hint);
+    const textWidth = Math.max(1, innerWidth - promptWidth - hintWidth - (hint ? 1 : 0));
+    const layout = editorLayout(text, this.cursor, textWidth);
+    const picker = this.mention?.key === key ? this.mention : undefined;
+    const items = picker ? this.mentionItems(picker) : [];
+    const selected = picker ? this.mentionIndex(items) : 0;
+    const choiceRows = picker ? Math.min(Math.max(0, maxRows - 2 * inset - 1), Math.max(1, items.length)) : 0;
+    const count = Math.min(maxRows - 2 * inset - choiceRows, Math.max(1, layout.rows.length));
     const first = Math.max(0, Math.min(layout.cursorRow - count + 1, layout.rows.length - count));
-    rows.push(this.rule([{ text: "── ", style: theme.accent }, { text: label, style: focused ? theme.accentBold : theme.bold }, { text: this.sending ? " sending… " : " ", style: theme.warn }], [{ text: ` ${hint}`, style: theme.dim }], width));
-    if (!text && !focused) {
-      rows.push([{ text: "› ", style: theme.dim }, { text: ellipsize(`Write to ${target.kind === "session" ? target.name : `#${target.name}`} — press c`, width - 2), style: theme.dim }]);
-    } else {
-      for (let index = 0; index < count; index++) {
-        rows.push([{ text: index + first === 0 ? "› " : "  ", style: theme.human }, { text: layout.rows[first + index] ?? "" }]);
+    const content: TerminalLine[] = [];
+    for (let index = 0; index < count; index++) {
+      const prompt = (index + first === 0 ? "› " : "  ").slice(0, promptWidth);
+      const value = !text && !focused
+        ? ellipsize(`Write to ${target.kind === "session" ? target.name : `#${target.name}`} — press c`, textWidth)
+        : layout.rows[first + index] ?? "";
+      content.push(justify(
+        [{ text: prompt, style: focused ? theme.human : theme.dim }, { text: value, ...(!text && !focused ? { style: theme.dim } : {}) }],
+        index === 0 && hint ? [{ text: hint, style: theme.dim }] : [], innerWidth,
+      ));
+    }
+    if (picker && choiceRows) {
+      if (selected < picker.top) picker.top = selected;
+      if (selected >= picker.top + choiceRows) picker.top = selected - choiceRows + 1;
+      picker.top = Math.max(0, Math.min(picker.top, items.length - choiceRows));
+      if (!items.length) content.push(clipSpans([{ text: "No matching mentions", style: theme.dim }], innerWidth));
+      for (const item of items.slice(picker.top, picker.top + choiceRows)) {
+        const chosen = item.key === picker.selected;
+        content.push(justify([
+          this.marker(chosen),
+          { text: `@${item.name}`, style: chosen ? theme.accentBold : theme.bold },
+          ...(item.former ? [{ text: ` was ${item.former}`, style: theme.dim }] : []),
+        ], [{ text: item.session ? item.session.role ?? "member" : "keyword", style: theme.dim }], innerWidth, chosen ? theme.selected : undefined));
       }
     }
-    // Cursor row is relative to the composer's first row; the caller places the composer.
-    return focused ? { rows, cursor: { row: 1 + layout.cursorRow - first, column: x0 + 2 + layout.cursorColumn } } : { rows };
+    const rows = boxed ? roundedPanel(
+      [{ text: label, style: focused ? theme.accentBold : theme.bold }, ...(this.sending ? [{ text: " sending…", style: theme.warn }] : [])],
+      content, width, content.length + 2, focused,
+    ) : content;
+    // Both the prompt and the hard-wrap budget exclude borders and hints. The cursor
+    // stays on an input cell, including at a full-width wrap or in the short fallback.
+    return focused ? { rows, cursor: { row: inset + layout.cursorRow - first, column: x0 + inset + promptWidth + layout.cursorColumn } } : { rows };
   }
 
   private panelPane(rows: TerminalLine[], width: number, height: number, y0: number, x0: number): Pane {
@@ -945,9 +1809,24 @@ export class ConsoleApp {
     return { rows, cursor: { row: y0, column: Math.min(width - 1, 2 + terminalTextWidth(palette.query)) } };
   }
 
+  private confirmationPane(width: number, height: number): Pane {
+    const confirmation = this.confirmation!;
+    const boxed = width >= 6 && height >= 3;
+    const content = confirmation.lines.flatMap((line) => wrapTerminalText(line, Math.max(1, width - (boxed ? 2 : 0))));
+    confirmation.height = Math.max(0, height - (boxed ? 2 : 1));
+    confirmation.rows = content.length;
+    confirmation.top = Math.max(0, Math.min(confirmation.top, content.length - confirmation.height));
+    const title: TerminalLine = [{ text: ellipsize(confirmation.title, width), style: theme.accentBold }];
+    const visible = content.slice(confirmation.top, confirmation.top + confirmation.height);
+    return { rows: boxed ? roundedPanel(title, visible, width, height, true) : [title, ...visible] };
+  }
+
   private paletteItems(): { group: string; label: Action }[] {
     const q = (this.palette?.query ?? "").toLowerCase();
-    return ACTIONS.filter((item) => !q || item.label.toLowerCase().includes(q) || item.group.toLowerCase().includes(q));
+    const archive = this.tab === "sessions" && (this.selection.sessions === "archive"
+      || (this.scope()?.scope === "session" && this.session(this.selection.sessions?.slice(2) ?? "")?.state === "removed"));
+    return ACTIONS.filter((item) => (item.group !== "Archive" || archive)
+      && (!q || item.label.toLowerCase().includes(q) || item.group.toLowerCase().includes(q)));
   }
 
   private formPane(width: number, height: number, y0: number): Pane {
@@ -1129,8 +2008,13 @@ export class ConsoleApp {
   }
 
   private paste(text: string): void {
+    if (this.confirmation) return;
     const clean = cleanInput(text);
-    if (this.palette) this.palette.query += clean.replace(/\n/g, " ");
+    if (this.finder) {
+      this.finder.query += clean.replace(/\n/g, " ");
+      this.finder.selected = undefined;
+      this.finder.top = 0;
+    } else if (this.palette) this.palette.query += clean.replace(/\n/g, " ");
     else if (this.form) this.formInsert(clean);
     else if (this.searching) this.query += clean.replace(/\n/g, " ").toLowerCase();
     else if (this.composeTarget()) {
@@ -1147,6 +2031,62 @@ export class ConsoleApp {
     if (this.cursorKey !== key) [this.cursorKey, this.cursor] = [key, draft.length];
     this.drafts.set(key, draft.slice(0, this.cursor) + text + draft.slice(this.cursor));
     this.cursor += text.length;
+    this.updateMention();
+  }
+
+  /** Derive completion from the real draft and cursor, never a separate input buffer. */
+  private updateMention(): void {
+    const target = this.composeTarget();
+    if (target?.kind !== "channel" || this.focus !== "composer") {
+      this.mention = undefined;
+      return;
+    }
+    const key = this.draftKey(target);
+    const draft = this.drafts.get(key) ?? "";
+    const match = /@([A-Za-z0-9_-]*)$/.exec(draft.slice(0, this.cursor));
+    if (!match || match.index + match[0].length !== this.cursor || !hasMentionOpening(draft, match.index)) {
+      this.mention = undefined;
+      return;
+    }
+    const query = match[1];
+    const start = match.index;
+    const end = this.cursor + (/^[A-Za-z0-9_-]*/.exec(draft.slice(this.cursor))?.[0].length ?? 0);
+    const previous = this.mention;
+    this.mention = previous?.key === key && previous.start === start && previous.query === query
+      ? { ...previous, end }
+      : { key, start, end, query, top: 0 };
+  }
+
+  private mentionItems(picker: MentionPicker): MentionItem[] {
+    const channel = this.channels.find((c) => `channel:${c.name}` === picker.key);
+    const query = picker.query.toLowerCase();
+    const items: MentionItem[] = MENTION_KEYWORDS.filter((name) => name.startsWith(query))
+      .map((name) => ({ key: `k:${name}`, name }));
+    for (const id of channel?.memberIds ?? []) {
+      const session = this.session(id);
+      if (!session || MENTION_KEYWORDS.includes(session.name)) continue;
+      const former = session.previousNames.find((name) => name.toLowerCase().startsWith(query));
+      if (!session.name.toLowerCase().startsWith(query) && !former) continue;
+      items.push({ key: `s:${session.id}`, name: session.name, session,
+        ...(!session.name.toLowerCase().startsWith(query) && former ? { former } : {}) });
+    }
+    return items.sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+  }
+
+  private mentionIndex(items: MentionItem[]): number {
+    const picker = this.mention!;
+    const index = Math.max(0, items.findIndex((item) => item.key === picker.selected));
+    picker.selected = items[index]?.key;
+    return index;
+  }
+
+  private acceptMention(item: MentionItem): void {
+    const picker = this.mention!;
+    const draft = this.drafts.get(picker.key) ?? "";
+    const token = `@${item.name}`;
+    this.drafts.set(picker.key, draft.slice(0, picker.start) + token + draft.slice(picker.end));
+    this.cursor = picker.start + token.length;
+    this.mention = undefined;
   }
 
   private async composerKey(k: KeyInput): Promise<void> {
@@ -1158,6 +2098,24 @@ export class ConsoleApp {
     const key = this.draftKey(target);
     const draft = this.drafts.get(key) ?? "";
     if (this.cursorKey !== key) [this.cursorKey, this.cursor] = [key, draft.length];
+    if (this.mention?.key === key) {
+      const items = this.mentionItems(this.mention);
+      const selected = this.mentionIndex(items);
+      if (k.name === "ESCAPE") {
+        this.mention = undefined;
+        return this.render();
+      }
+      if (k.name === "UP" || k.name === "DOWN") {
+        const index = Math.max(0, Math.min(items.length - 1, selected + (k.name === "UP" ? -1 : 1)));
+        this.mention.selected = items[index]?.key;
+        return this.render();
+      }
+      if (k.name === "ENTER" || k.name === "KP_ENTER") {
+        if (items[selected]) this.acceptMention(items[selected]);
+        return this.render();
+      }
+      this.mention = undefined;
+    }
     const set = (text: string, cursor: number): void => {
       if (text) this.drafts.set(key, text);
       else this.drafts.delete(key);
@@ -1175,11 +2133,13 @@ export class ConsoleApp {
       case "BACKSPACE": {
         const start = stepGrapheme(draft, this.cursor, -1);
         set(draft.slice(0, start) + draft.slice(this.cursor), start);
+        this.updateMention();
         break;
       }
       case "DELETE": {
         const end = stepGrapheme(draft, this.cursor, 1);
         set(draft.slice(0, this.cursor) + draft.slice(end), this.cursor);
+        this.updateMention();
         break;
       }
       case "LEFT": this.cursor = stepGrapheme(draft, this.cursor, -1); break;
@@ -1230,11 +2190,49 @@ export class ConsoleApp {
 
   private async key(k: KeyInput): Promise<void> {
     if (this.closed) return;
+    if (k.name === "CTRL_C") return this.quit();
+    if (this.confirmation) return this.confirmationKey(k);
+    if (k.name === "CTRL_K") return this.openFinder();
+    if (this.finder) return this.finderKey(k);
     if (this.palette) return this.paletteKey(k);
     if (this.form) return this.formKey(k);
     if (this.searching) return this.searchKey(k);
     if (this.focus === "composer") return this.composerKey(k);
+    if (this.mapActive() && (this.map.searching || !(this.focus === "tabs" && MAP_TAB_KEYS[k.name]))) {
+      if (!this.map.searching && (k.name === "ENTER" || k.name === "KP_ENTER")) {
+        const scope = this.map.conversation();
+        if (scope?.scope === "channel") {
+          this.selection.channels = `c:${scope.channel}`;
+          await this.setTab("channels");
+          return this.openEntry();
+        }
+        if (scope?.scope === "session") {
+          const session = this.session(scope.sessionId);
+          if (session?.state === "removed") this.archiveOpen = true;
+          this.query = "";
+          this.selection.sessions = `s:${scope.sessionId}`;
+          await this.setTab("sessions");
+          return this.openEntry();
+        }
+      }
+      const hostShortcut = !k.ctrl && !k.alt && ["s", "i", "#", "a", "m", "c", "q", "?"].includes(k.text ?? k.name);
+      if ((this.map.searching || !hostShortcut) && this.map.key(k)) {
+        this.fetchMap(this.map.take());
+        return this.render();
+      }
+    }
+    if (this.shownHeldId && (k.text === "r" || k.text === "x")) {
+      return this.heldAction(k.text === "r" ? "release" : "drop");
+    }
     const name = k.name;
+    if (name === "CTRL_X") {
+      if (this.tab === "sessions" && this.focus === "list" && this.selection.sessions?.startsWith("s:")
+        && this.selectable("sessions").includes(this.selection.sessions)) {
+        const session = this.session(this.selection.sessions.slice(2));
+        if (session) this.confirmSessions("close", [session]);
+      }
+      return this.render();
+    }
     if (name === "TAB" || name === "SHIFT_TAB") {
       this.cycleFocus(name === "TAB" ? 1 : -1);
       return this.render();
@@ -1251,6 +2249,7 @@ export class ConsoleApp {
       case "i": return this.setTab("inbox");
       case "#": return this.setTab("channels");
       case "a": return this.setTab("activity");
+      case "m": return this.setTab("map");
       case "c": this.focusComposer(); return this.render();
       case "u": return this.markUnread();
       case "v": return this.action("Toggle inbox feed");
@@ -1403,7 +2402,28 @@ export class ConsoleApp {
 
   private async mouse(m: MouseInput): Promise<void> {
     if (this.closed) return;
+    if (this.confirmation) return;
     const hit = this.hits.find((h) => h.row === m.row && m.column >= h.start && m.column < h.end);
+    if (this.finder) {
+      if (m.action === "wheel-up" || m.action === "wheel-down") {
+        const items = this.finderItems();
+        const index = Math.max(0, Math.min(items.length - 1, this.finderIndex(items) + (m.action === "wheel-up" ? -1 : 1)));
+        this.finder.selected = items[index]?.key;
+        return this.render();
+      }
+      if (m.action === "press" && m.button === "left" && hit?.target.kind === "finder") {
+        return this.chooseFinderItem(hit.target.key);
+      }
+      return;
+    }
+    if (this.mapActive() && (!hit || m.action === "drag" || m.action === "release")) {
+      const row = m.row - this.mapTop;
+      if ((row >= 0 && row < this.mapHeight) || m.action === "drag" || m.action === "release") {
+        const from = m.from ? { ...m.from, row: m.from.row - this.mapTop } : undefined;
+        if (this.map.mouse({ ...m, row, ...(from ? { from } : {}) })) this.render();
+        return;
+      }
+    }
     if (m.action === "wheel-up" || m.action === "wheel-down") {
       const delta = m.action === "wheel-up" ? -3 : 3;
       if (this.palette) this.palette.selected = Math.max(0, this.palette.selected + Math.sign(delta));
@@ -1453,6 +2473,29 @@ export class ConsoleApp {
 
   // ------------------------------------------------------------------ forms & actions
 
+  private async heldAction(action: "release" | "drop"): Promise<void> {
+    const msgId = this.shownHeldId;
+    if (!msgId || !this.heldMessages.has(msgId) || this.heldActionPending) return;
+    this.heldActionPending = true;
+    try {
+      const reply = await this.client.request(action, { msgId });
+      this.heldMessages.delete(msgId);
+      this.say(`${msgId}: ${action === "drop" ? "dropped" : String(reply.status)}`);
+    } catch (e) {
+      this.say(stringify(e), "error");
+    } finally {
+      try {
+        await this.refreshHeld();
+        await this.replay();
+      } catch (e) {
+        this.say(stringify(e), "error");
+      } finally {
+        this.heldActionPending = false;
+        this.render();
+      }
+    }
+  }
+
   private openForm(title: string, fields: Field[], submit: Form["submit"], description?: string[]): void {
     this.form = { title, fields, focus: 0, submit, ...(description ? { description } : {}) };
     this.render();
@@ -1460,6 +2503,69 @@ export class ConsoleApp {
 
   private ask(title: string, labels: string[], submit: (v: string[]) => Promise<void>, defaults: string[] = [], description?: string[]): void {
     this.openForm(title, labels.map((label, i) => ({ label, value: defaults[i] ?? "" })), submit, description);
+  }
+
+  private async pingSessions(): Promise<SyncResult> {
+    this.say("Pinging sessions…");
+    this.render();
+    await this.client.request("ping");
+    await this.replay();
+    const snapshot = await this.client.sync();
+    this.sessionPings = { ...snapshot.sessionPings };
+    this.say("Session ping complete");
+    this.render();
+    return snapshot;
+  }
+
+  private confirmSessions(operation: "close" | "purge", sessions: SessionIdentity[]): void {
+    if (!sessions.length) {
+      this.say(operation === "close" ? "No stale sessions to close" : "No archived conversations to purge");
+      return;
+    }
+    const targets = sessions.map((session) => ({ id: session.id, name: session.name }));
+    this.confirmation = {
+      title: `${operation === "close" ? "Close" : "Purge"} ${targets.length} ${targets.length === 1 ? "conversation" : "conversations"}`,
+      lines: [
+        operation === "close"
+          ? "Terminally archives these sessions and expires waiting messages. Resuming creates a new identity."
+          : "Permanently deletes these archived conversations and identities. Channel posts are kept.",
+        "",
+        ...targets.slice(0, 10).map((target) => `${target.name} (${target.id})`),
+        ...(targets.length > 10 ? [`and ${targets.length - 10} more`] : []),
+        "",
+        "y confirm · n cancel · Esc cancel",
+      ],
+      top: 0, height: 0, rows: 0, busy: false,
+      submit: async () => {
+        for (const target of targets) await this.client.request(operation, { identity: target.id });
+        await this.replay();
+        this.say(`${operation === "close" ? "Closed" : "Purged"} ${targets.length} conversations`);
+      },
+    };
+    this.render();
+  }
+
+  private async confirmationKey(k: KeyInput): Promise<void> {
+    const confirmation = this.confirmation!;
+    if (confirmation.busy) return;
+    if (k.name === "ESCAPE" || (!k.ctrl && k.text?.toLowerCase() === "n")) {
+      this.confirmation = undefined;
+    } else if (!k.ctrl && k.text?.toLowerCase() === "y") {
+      confirmation.busy = true;
+      this.render();
+      try {
+        await confirmation.submit();
+      } catch (e) {
+        this.say(`${stringify(e)} · refresh before retrying; some confirmed identities may already be processed`, "error");
+      } finally {
+        this.confirmation = undefined;
+      }
+    } else {
+      const delta = k.name === "UP" ? -1 : k.name === "DOWN" ? 1 : k.name === "PAGE_UP" ? -confirmation.height
+        : k.name === "PAGE_DOWN" ? confirmation.height : k.name === "HOME" ? -Infinity : k.name === "END" ? Infinity : 0;
+      confirmation.top = Math.max(0, Math.min(confirmation.rows - confirmation.height, confirmation.top + delta));
+    }
+    this.render();
   }
 
   /** Full editor with every send option; a bound session target keeps its stable identity until edited. */
@@ -1511,6 +2617,7 @@ export class ConsoleApp {
     if (!text.trim()) throw new Error("Message text is empty");
     const count = this.sessions.filter((s) => s.state === "live").length;
     if (target === "*" && confirmation !== `yes ${count}`) throw new Error(`Broadcast to ${count} live sessions: enter 'yes ${count}' to confirm`);
+    if (kind === "control") throw new Error("Control messages require an action; send them with CLI --kind control --action or MCP asenq_send instead");
     const kindOption = KINDS.find((candidate) => candidate === kind);
     if (kind && !kindOption) throw new Error(`Kind must be one of ${KINDS.join(", ")}`);
     if (done && !["yes", "no", "true", "false"].includes(done)) throw new Error("Done must be yes or no");
@@ -1528,7 +2635,7 @@ export class ConsoleApp {
 
   private showPanel(title: string, content: { lines?: string[]; messages?: StoredMessage[] }): void {
     this.panel = { title, ...content, top: 0, height: 1, rows: 0 };
-    if (this.tab === "activity") this.tab = "sessions";
+    if (this.tab === "activity" || this.tab === "map") this.tab = "sessions";
     this.focus = "transcript";
   }
 
@@ -1549,6 +2656,8 @@ export class ConsoleApp {
         case "Inbox": return this.setTab("inbox");
         case "Channels": return this.setTab("channels");
         case "Activity": return this.setTab("activity");
+        case "Map": return this.setTab("map");
+        case "Quick jump": return this.openFinder();
         case "Search sessions":
           await this.setTab("sessions");
           this.searching = true;
@@ -1582,6 +2691,36 @@ export class ConsoleApp {
             await this.replay();
           }, ["Posts are stored for readers; agents are never pushed channel messages."]);
           break;
+        case "Create channel":
+          this.ask("Create channel", ["Channel"], async ([channel]) => {
+            await this.client.request("channel_create", { channel });
+            await this.replay();
+            this.selection.channels = `c:${channel}`;
+            await this.setTab("channels");
+          }, [scope?.scope === "channel" ? scope.channel : ""]);
+          break;
+        case "Add channel member":
+          this.ask("Add channel member", ["Channel", "Live session name"], async ([channel, name]) => {
+            await this.client.request("channel_add", { channel, name });
+            await this.replay();
+          }, [scope?.scope === "channel" ? scope.channel : "", selected?.name ?? ""], ["Membership follows the session identity across renames and reconnections."]);
+          break;
+        case "Remove channel member": {
+          const channel = scope?.scope === "channel" ? scope.channel : this.selectedChannel() ?? "";
+          const members = (this.channels.find((item) => item.name === channel)?.memberIds ?? []).flatMap((id) => {
+            const member = this.session(id);
+            return member ? [member] : [];
+          });
+          const id = this.selectedChannelMember() ?? members[0]?.id ?? "";
+          this.ask("Remove channel member", ["Channel", "Session identity ID"], async ([channel, sessionId]) => {
+            await this.client.request("channel_remove", { channel, sessionId });
+            await this.replay();
+          }, [channel, id], [
+            "Removes by stable identity, never by a reused or former name.",
+            ...members.map((member) => `${member.name} · ${member.role ?? "unset"} · ${member.state} · ${member.id}`),
+          ]);
+          break;
+        }
         case "Log by session or message ID":
           this.ask("Log", ["Session name (blank for all)", "Message ID (optional)"], async ([name, msgId]) => {
             const reply = await this.client.request("log", { name: name || undefined, msgId: msgId || undefined, limit: 200 });
@@ -1612,12 +2751,41 @@ export class ConsoleApp {
             this.say(`${from} → ${String(reply.name)}`);
           }, [selected?.name ?? ""], ["Renaming keeps the same stable session identity and conversation."]);
           break;
+        case "Replace session": this.openReplaceSource(); break;
         case "Inbound policy":
           this.ask("Inbound policy", ["Session", "accept/hold/refuse"], async ([name, mode]) => {
             await this.client.request("set_inbound", { name, mode });
             this.say(`${name}: ${mode}`);
           }, [selected?.name ?? "", selected?.inbound ?? "accept"], ["accept delivers, hold keeps agent messages for review, refuse rejects them."]);
           break;
+        case "Set role":
+          this.ask("Set role", ["Session", "orchestrator/worker/unset"], async ([name, role]) => {
+            await this.client.request("set_role", { name, role: role === "unset" ? null : role });
+            this.say(`${name}: ${role}`);
+          }, [selected?.name ?? "", selected?.role ?? "unset"], ["Roles do not restrict messaging. Orchestrators can edit members and roles within their own channels."]);
+          break;
+        case "Ping sessions":
+          await this.pingSessions();
+          break;
+        case "Close session":
+          if (this.tab !== "sessions" || !selected) throw new Error("Select a session row to close");
+          this.confirmSessions("close", [selected]);
+          break;
+        case "Close all stale": {
+          const snapshot = await this.pingSessions();
+          this.confirmSessions("close", snapshot.sessions.filter((session) =>
+            isStaleSession(session, snapshot.sessionPings[session.id])));
+          break;
+        }
+        case "Purge conversation":
+          if (this.tab !== "sessions" || selected?.state !== "removed") throw new Error("Select an archived conversation to purge");
+          this.confirmSessions("purge", [selected]);
+          break;
+        case "Purge all archives": {
+          const snapshot = await this.client.sync();
+          this.confirmSessions("purge", snapshot.sessions.filter((session) => session.state === "removed"));
+          break;
+        }
         case "Daemon status": await this.executeLocal(["daemon", "status"]); break;
         case "Daemon start": await this.executeLocal(["daemon", "start"]); break;
         case "Daemon stop":
@@ -1644,6 +2812,10 @@ export class ConsoleApp {
   }
 }
 
-export async function runTui(): Promise<number> {
-  return new ConsoleApp().run();
+export async function runTui(args: string[]): Promise<number> {
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--reduced-motion")) {
+    process.stderr.write("usage: asenq tui [--reduced-motion]\n");
+    return 1;
+  }
+  return new ConsoleApp({ reducedMotion: args.length === 1 }).run();
 }

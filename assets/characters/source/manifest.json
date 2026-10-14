@@ -1,0 +1,80 @@
+{
+  "kind": "generated pose concepts",
+  "pose_columns": [
+    "idle_a",
+    "idle_b",
+    "walk_a",
+    "walk_b",
+    "work_a",
+    "work_b",
+    "send_a",
+    "send_b"
+  ],
+  "sheets": {
+    "claude": {
+      "file": "claude.png",
+      "width": 1374,
+      "height": 1145,
+      "rows": 6,
+      "columns": 8,
+      "alpha_min": 0,
+      "alpha_max": 255,
+      "transparent_pixels": 783094
+    },
+    "codex": {
+      "file": "codex.png",
+      "width": 1536,
+      "height": 1024,
+      "rows": 6,
+      "columns": 8,
+      "alpha_min": 0,
+      "alpha_max": 254,
+      "transparent_pixels": 803204
+    },
+    "gemini": {
+      "file": "gemini.png",
+      "width": 1448,
+      "height": 1086,
+      "rows": 6,
+      "columns": 8,
+      "alpha_min": 0,
+      "alpha_max": 255,
+      "transparent_pixels": 852738
+    },
+    "qwen": {
+      "file": "qwen.png",
+      "width": 1448,
+      "height": 1086,
+      "rows": 6,
+      "columns": 8,
+      "alpha_min": 0,
+      "alpha_max": 255,
+      "transparent_pixels": 759311
+    },
+    "llama": {
+      "file": "llama.png",
+      "width": 1536,
+      "height": 1024,
+      "rows": 6,
+      "columns": 8,
+      "alpha_min": 0,
+      "alpha_max": 254,
+      "transparent_pixels": 849796
+    },
+    "mistral": {
+      "file": "mistral.png",
+      "width": 1536,
+      "height": 1024,
+      "rows": 6,
+      "columns": 8,
+      "alpha_min": 0,
+      "alpha_max": 254,
+      "transparent_pixels": 783645
+    }
+  },
+  "limitations": [
+    "Not sliced or normalized into engine-ready animation frames.",
+    "Some poses retain accessory and face inconsistencies.",
+    "Raster references require character-cell adaptation for a strict TUI."
+  ]
+}
