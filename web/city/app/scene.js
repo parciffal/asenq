@@ -4,6 +4,7 @@ import { paintVenue } from "./art/buildings.js";
 import { paintStreetTile, paintWorkstation } from "./art/street.js";
 import { textureFor, loadCharacterTextures } from "./art/characters.js";
 import { PAL, HARNESS_COLORS } from "./art/palette.js";
+import { paintTunnelTile, paintBedrockTile } from "./art/underground.js";
 
 const color = (name) => Number.parseInt(PAL[name].slice(1), 16);
 const COLORS = {
@@ -46,6 +47,7 @@ export class CityScene extends Phaser.Scene {
     this.mainCamera.setOrigin(0, 0);
 
     this.bgLayer = this.add.layer();
+    this.undergroundLayer = this.add.layer();
     this.streetLayer = this.add.layer();
     this.venueLayer = this.add.layer();
     this.signLayer = this.add.layer();
@@ -58,13 +60,14 @@ export class CityScene extends Phaser.Scene {
     this.selectionLayer = this.add.layer();
     this.offlineLayer = this.add.layer();
     this.fxLayer = this.add.layer();
-    this.worldLayers = [this.streetLayer, this.venueLayer, this.signLayer, this.conduitLayer, this.stationLayer,
+    this.worldLayers = [this.undergroundLayer, this.streetLayer, this.venueLayer, this.signLayer, this.conduitLayer, this.stationLayer,
       this.characterLayer, this.hologramLayer, this.labelLayer, this.packetLayer, this.selectionLayer, this.offlineLayer];
     this.mainCamera.ignore([this.bgLayer, this.fxLayer]);
     this.bgCamera.ignore([...this.worldLayers, this.fxLayer]);
     this.fxCamera.ignore([...this.worldLayers, this.bgLayer]);
 
     this.conduits = this.add.graphics(); this.conduitLayer.add(this.conduits);
+    this.cablePulses = this.add.graphics(); this.conduitLayer.add(this.cablePulses);
     this.activityGraphics = this.add.graphics(); this.stationLayer.add(this.activityGraphics);
     this.packetGraphics = this.add.graphics(); this.packetLayer.add(this.packetGraphics);
     this.selectionGraphics = this.add.graphics(); this.selectionLayer.add(this.selectionGraphics);
@@ -219,7 +222,7 @@ export class CityScene extends Phaser.Scene {
     this.drawStreet(wire);
     this.drawVenues(state);
     this.drawSigns(state);
-    this.drawConduits(state.routesByKey);
+    this.drawConduits(state.routesByKey, state);
     this.drawStations(state);
     this.drawCharacters(state);
     this.drawHolograms(state);
@@ -229,21 +232,47 @@ export class CityScene extends Phaser.Scene {
 
   drawStreet(wire) {
     const bounds = wire.layout.bounds;
-    const x = bounds.x * 8;
-    const pixelWidth = Math.max(320, Math.ceil(bounds.width * 8), this.vacantX + 320 - x);
+    // Street runs edge to edge: one 384px world-phased tile repeated far past the city on both sides.
+    const lotEnd = (this.vacantX ?? 0) + 320;
+    const x = Math.floor((bounds.x * 8 - 4096) / 384) * 384;
+    const pixelWidth = Math.ceil((Math.max((bounds.x + bounds.width) * 8, lotEnd) + 4096 - x) / 384) * 384;
     const signature = `${x}:${pixelWidth}`;
     if (this.streetSignature !== signature) {
-      const canvas = document.createElement("canvas");
-      paintStreetTile(canvas, x, pixelWidth);
+      if (!this.textures.exists("city-street")) {
+        const canvas = document.createElement("canvas");
+        paintStreetTile(canvas, 0, 384);
+        this.replaceCanvasTexture("city-street", canvas);
+      }
       this.streetSprite?.destroy();
-      this.replaceCanvasTexture("city-street", canvas);
-      this.streetSprite = this.add.image(x, STREET.top, "city-street").setOrigin(0, 0);
+      this.streetSprite = this.add.tileSprite(x, STREET.top, pixelWidth, STREET.height, "city-street").setOrigin(0, 0);
       this.streetLayer.add(this.streetSprite);
       this.streetLayer.sendToBack(this.streetSprite);
       this.streetSignature = signature;
     }
     this.streetSprite?.setPosition(x, STREET.top);
+    this.drawUnderground(wire);
     this.drawVacant(this.vacantX);
+  }
+
+  drawUnderground(wire) {
+    const bounds = wire.layout.bounds;
+    const left = Math.floor((bounds.x * 8 - 4096) / 384) * 384;
+    const width = Math.ceil((bounds.width * 8 + 8192) / 384) * 384;
+    const levels = Math.max(1, Math.ceil(((bounds.y + bounds.height) * 8 - STREET.bottom) / 80));
+    const signature = `${left}:${width}:${levels}`;
+    if (signature === this.undergroundSignature) return;
+    this.undergroundSignature = signature;
+    if (!this.textures.exists("city-tunnel")) {
+      const tunnel = document.createElement("canvas"); paintTunnelTile(tunnel);
+      this.replaceCanvasTexture("city-tunnel", tunnel);
+      const rock = document.createElement("canvas"); paintBedrockTile(rock);
+      this.replaceCanvasTexture("city-bedrock", rock);
+    }
+    this.tunnelSprite?.destroy();
+    this.bedrockSprite?.destroy();
+    this.tunnelSprite = this.add.tileSprite(left, STREET.bottom, width, levels * 80, "city-tunnel").setOrigin(0, 0);
+    this.bedrockSprite = this.add.tileSprite(left, STREET.bottom + levels * 80, width, 4096, "city-bedrock").setOrigin(0, 0);
+    this.undergroundLayer.add([this.tunnelSprite, this.bedrockSprite]);
   }
 
   drawVacant(x) {
@@ -251,6 +280,8 @@ export class CityScene extends Phaser.Scene {
     this.vacantPosition = x;
     this.vacantGraphics ??= this.add.graphics();
     this.vacantGraphics.clear();
+    this.vacantGraphics.fillStyle(COLORS.burgundy, 0.75);
+    this.vacantGraphics.fillRect(x, STREET.top, 320, STREET.roadTop);
     this.vacantGraphics.lineStyle(1, COLORS.border, 0.9);
     dashedRect(this.vacantGraphics, x, STREET.top, 320, STREET.roadTop, 7, 5);
     this.streetLayer.add(this.vacantGraphics);
@@ -317,20 +348,87 @@ export class CityScene extends Phaser.Scene {
     }
   }
 
-  drawConduits(routes) {
-    const signature = JSON.stringify([...routes]);
+  cableStyle(key, state) {
+    const selected = state?.ui.selected ? keyOf(state.ui.selected) : null;
+    const id = key.startsWith("c:") ? key.slice(2) : key.startsWith("m:") ? key.split(":").pop() : null;
+    const character = id ? state?.charactersById.get(id) : null;
+    const hot = selected && (selected === key || (selected.startsWith("c:") && id === selected.slice(2))
+      || (selected.startsWith("v:") && key.startsWith("m:") && key.slice(2).startsWith(selected.slice(2) + ":"))
+      || (selected.startsWith("v:") && key === selected)
+      || (selected.startsWith("v:") && key.startsWith("c:") && state.wire.layout.characters.find((c) => c.id === id)?.home === selected.slice(2)));
+    const color = key.startsWith("v:") ? COLORS.yellow : character?.role === "orchestrator" ? COLORS.yellow
+      : key.startsWith("m:") ? 0xa98bb7 : COLORS.cyan;
+    const dead = character && (character.state === "gone" || character.state === "stale" || character.stale || character.ping === "not_responding");
+    return { color: dead ? 0x6f5960 : color, hot: Boolean(hot), dim: Boolean(selected) && !hot, dead };
+  }
+
+  drawConduits(routes, state = this.state) {
+    const selected = state?.ui.selected ? keyOf(state.ui.selected) : "";
+    const k = this.mainCamera?.zoom === 1 ? 2 : 1; // keep cables legible when zoomed out
+    const signature = JSON.stringify([...routes]) + selected + k;
     if (signature === this.conduitSignature) return;
     this.conduitSignature = signature;
-    this.conduits.clear();
-    this.conduits.lineStyle(1, COLORS.cyan, 0.6);
-    for (const path of routes.values()) {
-      for (const segment of path.segments) {
-        this.conduits.beginPath();
-        this.conduits.moveTo(segment.from.x * 8, segment.from.y * 8);
-        this.conduits.lineTo(segment.to.x * 8, segment.to.y * 8);
-        this.conduits.strokePath();
-        this.conduits.fillStyle(COLORS.yellow, 0.9);
-        this.conduits.fillRect(segment.to.x * 8 - 1, segment.to.y * 8 - 1, 2, 2);
+    this.cableRoutes = [];
+    const g = this.conduits;
+    g.clear();
+    const ordered = [...routes].map(([key, path]) => ({ key, path, style: this.cableStyle(key, state) }))
+      .sort((a, b) => Number(a.style.hot) - Number(b.style.hot));
+    // Pass 1: dark casing so cables read over busy building art.
+    for (const { path, style } of ordered) {
+      g.lineStyle((style.hot ? 5 : 4) * k, COLORS.burgundy, style.dim ? 0.5 : 0.9);
+      for (const seg of path.segments) {
+        g.beginPath(); g.moveTo(seg.from.x * 8, seg.from.y * 8); g.lineTo(seg.to.x * 8, seg.to.y * 8); g.strokePath();
+      }
+    }
+    // Pass 2: coloured sheath + bright core.
+    for (const { key, path, style } of ordered) {
+      const alpha = style.dim ? 0.45 : style.hot ? 1 : 0.8;
+      for (const seg of path.segments) {
+        const x1 = seg.from.x * 8, y1 = seg.from.y * 8, x2 = seg.to.x * 8, y2 = seg.to.y * 8;
+        g.lineStyle((style.hot ? 3 : 2) * k, style.color, alpha * 0.55);
+        g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.strokePath();
+        g.lineStyle(k, style.hot ? COLORS.cream : style.color, alpha);
+        g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.strokePath();
+      }
+      // Junction boxes at each bend, socket at the street spine, plug at the anchor.
+      for (let i = 1; i < path.segments.length; i++) {
+        const p = path.segments[i].from;
+        g.fillStyle(COLORS.burgundy, alpha).fillRect(p.x * 8 - 2, p.y * 8 - 2, 5, 5);
+        g.lineStyle(1, style.color, alpha).strokeRect(p.x * 8 - 1.5, p.y * 8 - 1.5, 4, 4);
+      }
+      const first = path.segments[0]?.from, last = path.segments[path.segments.length - 1]?.to;
+      if (first) { g.fillStyle(style.color, alpha).fillRect(first.x * 8 - 2, first.y * 8 - 1, 5, 3); }
+      if (last) {
+        g.fillStyle(COLORS.burgundy, alpha).fillRect(last.x * 8 - 3, last.y * 8 - 3, 7, 7);
+        g.fillStyle(style.dead ? 0x6f5960 : COLORS.yellow, alpha).fillRect(last.x * 8 - 1, last.y * 8 - 1, 3, 3);
+      }
+      if (!style.dead && path.length > 0) this.cableRoutes.push({ key, path, style, phase: (fnv1a(key) % 1000) / 1000 });
+    }
+    // Street spine: the shared trunk every route plugs into.
+    const xs = [...routes.values()].map((p) => p.segments[p.segments.length - 1]?.to).filter((p) => p && p.y === STREET.spine).map((p) => p.x * 8);
+    if (xs.length > 1) {
+      const trunkY = STREET.spine * 8;
+      const left = Math.min(...xs), right = Math.max(...xs);
+      g.lineStyle(4, COLORS.burgundy, 0.9); g.beginPath(); g.moveTo(left, trunkY); g.lineTo(right, trunkY); g.strokePath();
+      g.lineStyle(2, COLORS.cyan, 0.35); g.beginPath(); g.moveTo(left, trunkY); g.lineTo(right, trunkY); g.strokePath();
+      g.lineStyle(1, COLORS.cyan, 0.8); g.beginPath(); g.moveTo(left, trunkY); g.lineTo(right, trunkY); g.strokePath();
+    }
+  }
+
+  drawCablePulses(now) {
+    const g = this.cablePulses;
+    if (!g) return;
+    g.clear();
+    if (!this.cableRoutes || this.state.wire?.reducedMotion || this.state.wire?.connection !== "connected") return;
+    for (const { path, style, phase } of this.cableRoutes) {
+      if (style.dim) continue;
+      const speed = style.hot ? 14 : 6; // cells per second
+      const spacing = 12;
+      const offset = ((now / 1000) * speed + phase * spacing) % spacing;
+      for (let d = path.length - offset; d >= 0; d -= spacing) {
+        const p = sample(path, d);
+        g.fillStyle(style.color, 0.25).fillRect(Math.round(p.x * 8) - 2, Math.round(p.y * 8) - 2, 5, 5);
+        g.fillStyle(style.hot ? COLORS.cream : style.color, 1).fillRect(Math.round(p.x * 8) - 1, Math.round(p.y * 8) - 1, 2, 2);
       }
     }
   }
@@ -605,6 +703,7 @@ export class CityScene extends Phaser.Scene {
     for (const [id, animation] of this.state.animations) {
       if (typeof animation.send === "number" && this.clock - animation.send >= 800) clearAnimation(this.store.animations, id, "send");
     }
+    this.drawCablePulses(this.clock);
     this.drawPackets();
     this.drawRain(time);
     this.updateFollow(delta);
@@ -684,14 +783,16 @@ export class CityScene extends Phaser.Scene {
     const tileWidth = Math.ceil(width / this.tileScale) + 2;
     const farBottom = (8 - camera.scrollY) * camera.zoom;
     const midBottom = (48 - camera.scrollY) * camera.zoom;
-    this.farTile.setScale(this.tileScale).setSize(tileWidth, 270).setPosition(0, farBottom - 270 * this.tileScale);
+    const farTop = farBottom - 270 * this.tileScale;
+    this.farTile.setScale(this.tileScale).setSize(tileWidth, 270).setPosition(0, farTop);
     this.midTile.setScale(this.tileScale).setSize(tileWidth, 270).setPosition(0, midBottom - 270 * this.tileScale);
     this.farTile.tilePositionX = camera.scrollX * 0.15 / this.tileScale;
     this.midTile.tilePositionX = camera.scrollX * 0.35 / this.tileScale;
     this.skyFill.clear().fillStyle(0x100609, 1).fillRect(0, 0, width, height);
+    if (farTop > 0) this.skyFill.fillStyle(this.skyTop ?? 0x100609, 1).fillRect(0, 0, width, Math.ceil(farTop) + 1);
     this.groundFill.clear();
     const groundTop = clamp(midBottom, 0, height);
-    this.groundFill.fillStyle(0x0b0407, 1).fillRect(0, groundTop, width, height - groundTop);
+    this.groundFill.fillStyle(0x120a0f, 1).fillRect(0, groundTop, width, height - groundTop);
     if (midBottom >= 0 && midBottom < height) {
       this.groundFill.fillStyle(0xa52b3a, 1).fillRect(0, midBottom, width, 1);
     }
@@ -708,6 +809,7 @@ export class CityScene extends Phaser.Scene {
     camera.setZoom(zoom).setScroll(view.scrollX, view.scrollY);
     this.updateBackdrop();
     if (zoomChanged && this.characterReady && this.state.wire) {
+      this.drawConduits(this.state.routesByKey, this.state);
       this.drawSigns(this.state);
       this.drawCharactersFrame(this.state, performance.now());
       this.drawHolograms(this.state);
@@ -762,11 +864,20 @@ export class CityScene extends Phaser.Scene {
       if (!response.ok) return;
       const bitmap = await createImageBitmap(await response.blob());
       const canvas = document.createElement("canvas"); canvas.width = bitmap.width; canvas.height = bitmap.height;
-      canvas.getContext("2d").drawImage(bitmap, 0, 0);
+      const context = canvas.getContext("2d");
+      context.drawImage(bitmap, 0, 0);
       bitmap.close?.();
       const loadedKey = `${key}:provided`;
       this.replaceCanvasTexture(loadedKey, canvas);
       (key === "skyline-far" ? this.farTile : this.midTile).setTexture(loadedKey);
+      if (key === "skyline-far") {
+        const row = context.getImageData(0, 0, canvas.width, 1).data;
+        let r = 0, g = 0, b = 0, n = 0;
+        for (let i = 0; i < row.length; i += 4) if (row[i + 3] > 0) { r += row[i]; g += row[i + 1]; b += row[i + 2]; n++; }
+        if (n) this.skyTop = (Math.round(r / n) << 16) | (Math.round(g / n) << 8) | Math.round(b / n);
+        this.backdropSignature = null;
+        this.updateBackdrop();
+      }
     } catch { /* The deterministic procedural skyline remains in place. */ }
   }
 

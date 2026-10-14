@@ -200,7 +200,165 @@ function communications(ctx, rng) {
   for (let y = 12; y < 55; y += 10) rect(ctx, PAL.steelLight, 50, y, 5, 1);
 }
 
-const INTERIORS = { office, bar, garage, arcade, communications };
+function house(ctx, rng) {
+  // Window with a sky strip; left floor bay stays empty.
+  rect(ctx, PAL.steelLight, 11, 11, 26, 23);
+  rect(ctx, PAL.glass, 13, 13, 22, 19);
+  rect(ctx, PAL.cyanDark, 13, 13, 22, 6);
+  rect(ctx, PAL.cyan, 13, 13, 22, 1);
+  rect(ctx, PAL.steelLight, 23, 13, 2, 19);
+  rect(ctx, PAL.redDark, 9, 11, 3, 25);
+  rect(ctx, PAL.redDark, 36, 11, 3, 25);
+  // Bookshelf.
+  rect(ctx, PAL.steel, 50, 14, 24, 30);
+  for (const y of [15, 25, 35]) {
+    rect(ctx, PAL.void, 51, y, 22, 8);
+    for (let x = 52; x < 72; x += 3) {
+      const color = [PAL.alert, PAL.cyan, PAL.orange, PAL.green, PAL.magenta][Math.floor(rng() * 5)];
+      rect(ctx, color, x, y + 8 - 5 - Math.floor(rng() * 3), 2, 5 + Math.floor(rng() * 3));
+    }
+    rect(ctx, PAL.steelLight, 50, y + 8, 24, 1);
+  }
+  // Rug and sofa.
+  rect(ctx, PAL.redDark, 80, 58, 56, 4);
+  rect(ctx, PAL.border, 80, 58, 56, 1);
+  rect(ctx, PAL.panel, 86, 34, 36, 12);
+  rect(ctx, PAL.border, 86, 34, 36, 2);
+  rect(ctx, PAL.panel, 82, 40, 6, 16);
+  rect(ctx, PAL.panel, 120, 40, 6, 16);
+  rect(ctx, PAL.border, 88, 46, 32, 10);
+  rect(ctx, PAL.redDark, 88, 52, 32, 4);
+  rect(ctx, PAL.steel, 85, 56, 2, 3);
+  rect(ctx, PAL.steel, 121, 56, 2, 3);
+  rect(ctx, PAL.orange, 91, 42, 6, 5);
+  // Floor lamp with warm glow.
+  rect(ctx, PAL.steelLight, 131, 24, 1, 33);
+  rect(ctx, PAL.steel, 128, 57, 7, 2);
+  rect(ctx, PAL.orange, 127, 17, 9, 7);
+  rect(ctx, PAL.yellow, 129, 20, 5, 2);
+  rect(ctx, PAL.redDark, 123, 5, 17, 1);
+  // Plant.
+  rect(ctx, PAL.panel, 60, 52, 8, 7);
+  rect(ctx, PAL.green, 63, 42, 2, 10);
+  rect(ctx, PAL.green, 59, 44, 4, 3);
+  rect(ctx, PAL.green, 66, 46, 4, 3);
+  if (rng() > 0.5) rect(ctx, PAL.orange, 78, 10, 3, 5);
+}
+
+function server(ctx, rng) {
+  // Cable tray overhead.
+  rect(ctx, PAL.steel, 44, 6, 96, 4);
+  rect(ctx, PAL.steelLight, 44, 6, 96, 1);
+  for (let x = 48; x < 138; x += 9) rect(ctx, PAL.cyanDark, x, 10, 1, 4);
+  const leds = [PAL.cyan, PAL.yellow, PAL.green];
+  // Two rows of racks, three racks each at the back, the cooling unit in front.
+  for (let row = 0; row < 2; row++) {
+    const y = row ? 40 : 15;
+    const h = row ? 20 : 24;
+    for (let i = 0; i < 4; i++) {
+      const x = 48 + i * 22;
+      rect(ctx, PAL.steel, x, y, 18, h);
+      rect(ctx, PAL.void, x + 2, y + 2, 14, h - 4);
+      frame(ctx, PAL.steelLight, x, y, 18, h);
+      for (let yy = y + 3; yy < y + h - 4; yy += 4) {
+        rect(ctx, PAL.panel, x + 3, yy, 8, 2);
+        rect(ctx, leds[Math.floor(rng() * 3)], x + 13, yy, 2, 1);
+        if (rng() > 0.4) rect(ctx, leds[Math.floor(rng() * 3)], x + 13, yy + 2, 2, 1);
+      }
+    }
+  }
+  rect(ctx, PAL.panel, 8, 17, 22, 18);
+  frame(ctx, PAL.steel, 8, 17, 22, 18);
+  for (let y = 20; y < 33; y += 3) rect(ctx, PAL.steelLight, 11, y, 16, 1);
+  rect(ctx, PAL.cyan, 26, 19, 2, 1);
+}
+
+function library(ctx, rng) {
+  const spines = [PAL.alert, PAL.cyan, PAL.orange, PAL.green, PAL.magenta, PAL.yellow];
+  // Tall shelves across the back wall; left bay stays open.
+  for (let i = 0; i < 3; i++) {
+    const x = 46 + i * 31;
+    rect(ctx, PAL.steel, x, 4, 28, 54);
+    for (let y = 6; y < 54; y += 12) {
+      rect(ctx, PAL.void, x + 2, y, 24, 10);
+      for (let bx = x + 3; bx < x + 24; bx += 3) {
+        const h = 6 + Math.floor(rng() * 4);
+        rect(ctx, spines[Math.floor(rng() * spines.length)], bx, y + 10 - h, 2, h);
+      }
+      rect(ctx, PAL.steelLight, x + 1, y + 10, 26, 1);
+    }
+  }
+  // Ladder against the shelf.
+  rect(ctx, PAL.orange, 38, 8, 1, 50);
+  rect(ctx, PAL.orange, 43, 8, 1, 50);
+  for (let y = 12; y < 56; y += 6) rect(ctx, PAL.orange, 38, y, 6, 1);
+  // Reading table and lamp.
+  rect(ctx, PAL.panel, 96, 47, 30, 3);
+  rect(ctx, PAL.orange, 96, 47, 30, 1);
+  rect(ctx, PAL.steel, 99, 50, 2, 10);
+  rect(ctx, PAL.steel, 121, 50, 2, 10);
+  rect(ctx, PAL.steelLight, 108, 43, 1, 4);
+  rect(ctx, PAL.orange, 105, 40, 7, 3);
+  rect(ctx, PAL.yellow, 106, 43, 5, 1);
+  rect(ctx, PAL.white, 113, 45, 6, 2);
+}
+
+function lab(ctx, rng) {
+  // Hazard stripe along the ceiling edge.
+  for (let x = 2; x < 142; x += 8) {
+    rect(ctx, PAL.yellow, x, 3, 4, 3);
+    rect(ctx, PAL.void, x + 4, 3, 4, 3);
+  }
+  // Wall chart (left, above the bay) and whiteboard grid.
+  rect(ctx, PAL.steel, 9, 12, 22, 20);
+  rect(ctx, PAL.white, 10, 13, 20, 18);
+  for (let i = 0; i < 5; i++) rect(ctx, i % 2 ? PAL.cyanDark : PAL.alert, 12 + i * 3, 29 - (3 + i * 2), 2, 3 + i * 2);
+  rect(ctx, PAL.steel, 50, 12, 38, 24);
+  rect(ctx, PAL.white, 51, 13, 36, 22);
+  for (let x = 57; x < 87; x += 6) rect(ctx, PAL.steelLight, x, 13, 1, 22);
+  for (let y = 19; y < 35; y += 6) rect(ctx, PAL.steelLight, 51, y, 36, 1);
+  rect(ctx, PAL.cyan, 54, 16, 8, 1);
+  rect(ctx, PAL.alert, 66, 22, 10, 1);
+  // Workbench.
+  rect(ctx, PAL.panel, 56, 46, 80, 5);
+  rect(ctx, PAL.cyan, 56, 46, 80, 1);
+  rect(ctx, PAL.steel, 60, 51, 3, 10);
+  rect(ctx, PAL.steel, 128, 51, 3, 10);
+  // Glass vessels.
+  for (let i = 0; i < 3; i++) {
+    const x = 66 + i * 9;
+    const color = [PAL.green, PAL.orange, PAL.cyan][i];
+    rect(ctx, PAL.glass, x, 36 + i, 6, 10 - i);
+    frame(ctx, PAL.steelLight, x, 36 + i, 6, 10 - i);
+    rect(ctx, color, x + 1, 41 + i, 4, 4 - i);
+    rect(ctx, PAL.white, x + 2, 34 + i, 2, 2);
+  }
+  // Scope monitor.
+  monitor(ctx, 108, 26, 20, 12);
+  rect(ctx, PAL.steelLight, 100, 40, 6, 6);
+  rect(ctx, rng() > 0.5 ? PAL.alert : PAL.green, 102, 42, 2, 2);
+}
+
+const INTERIORS = { office, bar, garage, arcade, communications, house, server, library, lab };
+const ROOM_KINDS = Object.keys(INTERIORS);
+
+// Small integer hash (xorshift-multiply) so a room's kind never depends on the shared rng.
+function mix(a, b, c) {
+  let h = (Math.imul(a >>> 0, 0x9e3779b1) ^ Math.imul((b + 1) | 0, 0x85ebca6b) ^ Math.imul((c + 1) | 0, 0xc2b2ae35)) >>> 0;
+  h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d) >>> 0;
+  h ^= h >>> 12; h = Math.imul(h, 0x297a2d39) >>> 0;
+  return (h ^ (h >>> 15)) >>> 0;
+}
+
+/** kinds: ground-left is `appearance`; others hashed from (seed, floor, side), differing from the other
+ * room on the floor and from the room below. Floors resolve bottom-up so floor n depends only on floors <= n. */
+function pickKind(seed, appearance, floor, side, below, sibling) {
+  if (floor === 0 && side === 0) return appearance;
+  const avoid = new Set([below, sibling]);
+  let choices = ROOM_KINDS.filter((kind) => !avoid.has(kind));
+  if (choices.length === 0) choices = ROOM_KINDS.filter((kind) => kind !== sibling);
+  return choices[mix(seed, floor, side) % choices.length];
+}
 
 function room(ctx, x, y, interior, rng) {
   ctx.save();
@@ -284,6 +442,12 @@ export function paintVenue(canvas, { appearance, floors, roomsPerFloor = 2, seed
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingEnabled = false;
   const rng = random(seed);
+  const kinds = [];
+  for (let floor = 0; floor < floors; floor++) {
+    const below = kinds[floor - 1] ?? [];
+    const left = pickKind(seed, appearance, floor, 0, below[0], undefined);
+    kinds.push([left, pickKind(seed, appearance, floor, 1, below[1], left)]);
+  }
   roof(ctx, appearance, rng);
   for (let floor = floors - 1; floor >= 0; floor--) {
     const y = 48 + 80 * (floors - 1 - floor);
@@ -292,8 +456,8 @@ export function paintVenue(canvas, { appearance, floors, roomsPerFloor = 2, seed
       rect(ctx, PAL.redDark, x, y, 1, 80);
       if (rng() > 0.6) rect(ctx, PAL.border, x + 2, y + 3, 3, 1);
     }
-    room(ctx, 8, y + 8, INTERIORS[appearance], rng);
-    room(ctx, 168, y + 8, INTERIORS[appearance], rng);
+    room(ctx, 8, y + 8, INTERIORS[kinds[floor][0]], rng);
+    room(ctx, 168, y + 8, INTERIORS[kinds[floor][1]], rng);
     rect(ctx, PAL.steel, 0, y + 72, 320, 8);
     rect(ctx, PAL.steelLight, 0, y + 72, 320, 1);
     rect(ctx, PAL.void, 0, y + 76, 320, 2);
