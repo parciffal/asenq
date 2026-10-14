@@ -5,3 +5,4 @@ site/
 .omp/
 .claude/*
 !.claude/skills/
+design/
