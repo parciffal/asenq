@@ -113,9 +113,7 @@ function addPluginDir(claudeBase: string, modDir: string): void {
   if (!existsSync(settingsPath)) return;
   let changed = false;
   let wasCreated = false;
-  let envExisted = false;
   editJson(settingsPath, (s) => {
-    envExisted = isObj(s.env);
     const env = (isObj(s.env) ? s.env : (s.env = {})) as Json;
     const raw = env.CLAUDE_CODE_PLUGIN_DIRS;
     // If the existing value is not a string and not undefined, don't overwrite (F-09)
@@ -176,8 +174,8 @@ function removePluginDir(claudeBase: string, modDir: string, asenqCreated: boole
     } else {
       env.CLAUDE_CODE_PLUGIN_DIRS = dirs.join(":");
     }
-    // If asenq created the key and env is now empty, remove env too
-    if (asenqCreated && Object.keys(env).length === 0) delete s.env;
+    // If env is now empty, remove it.
+    if (Object.keys(env).length === 0) delete s.env;
     changed = true;
   });
   if (changed) report("-", `${settingsPath} env.CLAUDE_CODE_PLUGIN_DIRS: ${modDir}`);
