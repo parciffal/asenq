@@ -762,40 +762,40 @@ describe('status line reads atom (F-15)', () => {
 
 // --- tail stderr "connected" line triggers refetch ---
 
-describe('tail connected line', () => {
-  test('stderr connected line triggers refetch', async ($, on) => {
+describe('tail stderr lines', () => {
+  test('split connection and mismatch lines are parsed, including the EOF remainder', async ($, on) => {
     const clock = mock.clock(on)
     let fetchCount = 0
-    on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
+    const toasts: string[] = []
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
     on('session.id', () => ({ value: 'cc-test' }))
     on('command.register', () => V)
     on('ui.open', () => ({ value: { isPlaced: true } }))
     on('ui.close', () => V)
-    on('ui.toast', () => V)
+    on('ui.toast', (_$, e) => { toasts.push(e.text ?? ''); return V })
     on('ui.status', () => V)
     on('ui.render', () => ({ type: 'engine', ref: 0 }))
-    on('fs.read', (_$: any, e: any) => {
+    on('fs.read', (_$, e) => {
       if (e.path && e.path.endsWith('asenq-cli.json')) return { value: CLI_JSON }
       throw new Error(`unexpected fs.read: ${e.path}`)
     })
-    on('process.run', (_$: any, e: any) => {
+    on('process.run', (_$, e) => {
       const sub = e.argv.slice(2).join(' ')
       if (sub === 'ls --json') { fetchCount++; return procOk(LS_JSON) }
       if (sub === 'channels --json') return procOk(CHANNELS_JSON)
       return procFail()
     })
-    // Spawn yields connected then hangs
     on('process.spawn', async function* () {
-      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
-      // Second connect after reconnect
-      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+      yield { stream: 'stderr' as const, text: 'asenq tail: con' }
+      yield { stream: 'stderr' as const, text: 'nected\nprotocol mis' }
+      yield { stream: 'stderr' as const, text: 'match detected' }
       return { value: { code: 0, signal: null } }
     })
 
-    fetchCount = 0
     await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
     await clock.settle()
-    // Each "connected" line should trigger a refetch
-    expect(fetchCount).toBeGreaterThanOrEqual(2)
+
+    expect(fetchCount).toBeGreaterThanOrEqual(1)
+    expect(toasts).toEqual(['asenq mod is out of date with the daemon: rerun `asenq setup`'])
   })
 })
