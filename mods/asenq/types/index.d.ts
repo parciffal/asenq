@@ -26,6 +26,8 @@ export type AsenqData = {
   sessions: Session[]
   channels: Channel[]
   online: boolean
+  /** Tail disconnects hold the status offline until a connected marker arrives. */
+  tailDisconnected?: boolean
   /** Monotonic sequence number; a fetch with a lower seq never overwrites a higher one. */
   seq: number
 }

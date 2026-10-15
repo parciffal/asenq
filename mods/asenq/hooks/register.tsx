@@ -12,7 +12,7 @@ const VERSION_MISMATCH_RE = /protocol|version/i
 const CONNECTED_LINE = 'asenq tail: connected'
 const DISCONNECTED_LINE = 'asenq tail: disconnected'
 
-const EMPTY: AsenqData = { sessions: [], channels: [], online: false, seq: 0 }
+const EMPTY: AsenqData = { sessions: [], channels: [], online: false, tailDisconnected: false, seq: 0 }
 
 const dataAtom = atom(
   { plugin: 'asenq', key: 'data' } as const,
@@ -66,11 +66,12 @@ async function sessionId($: any): Promise<string> {
   return $.session.id()
 }
 
-/** Writes data to the atom only if seq >= the stored seq (last-write-wins by sequence). */
+/** Writes data by sequence while preserving an authoritative tail disconnect hold. */
 async function setData($: any, data: AsenqData): Promise<void> {
-  await update($, dataAtom, (prev: AsenqData) =>
-    data.seq >= prev.seq ? data : prev,
-  )
+  await update($, dataAtom, (prev: AsenqData) => {
+    const next = data.seq >= prev.seq ? data : prev
+    return prev.tailDisconnected ? { ...next, tailDisconnected: true } : next
+  })
 }
 
 /** F-15: compute status from what the atom holds, so status and pane agree. */
@@ -78,7 +79,9 @@ async function updateStatus($: any): Promise<void> {
   const currentStatus = ++statusSeq
   const id = await sessionId($)
   const data = await read($, dataAtom)
-  if (currentStatus === statusSeq) $.ui.status(statusLine(data, id))
+  if (currentStatus === statusSeq) {
+    $.ui.status(data.tailDisconnected ? 'asenq offline' : statusLine(data, id))
+  }
 }
 
 async function refreshAndStatus($: any): Promise<void> {
@@ -105,9 +108,15 @@ function startTail($: any): void {
       const processStderrLine = async (line: string): Promise<void> => {
         const completeLine = line.endsWith('\r') ? line.slice(0, -1) : line
         if (completeLine === CONNECTED_LINE) {
+          await update($, dataAtom, (prev: AsenqData) => ({ ...prev, tailDisconnected: false }))
           await refreshAndStatus($)
         } else if (completeLine === DISCONNECTED_LINE) {
-          await setData($, { ...EMPTY, seq: ++fetchSeq })
+          if (debounceTimer) {
+            debounceTimer.cancel()
+            debounceTimer = null
+          }
+          const seq = ++fetchSeq
+          await update($, dataAtom, (prev: AsenqData) => ({ ...prev, tailDisconnected: true, seq }))
           await updateStatus($)
         } else if (!versionMismatchToasted && VERSION_MISMATCH_RE.test(completeLine)) {
           versionMismatchToasted = true
@@ -245,8 +254,8 @@ export const register: Register = (on) => {
       description: 'asenq sessions, roles and channels',
     })
 
-    // Show placeholder status immediately (F-02: don't block on CLI)
-    $.ui.status('asenq …')
+    // Keep a persisted disconnect authoritative while a reloaded tail reconnects.
+    $.ui.status(stored?.tailDisconnected ? 'asenq offline' : 'asenq …')
 
     const started = await next(e)
 

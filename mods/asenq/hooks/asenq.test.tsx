@@ -1003,3 +1003,90 @@ describe('tail disconnect status', () => {
     }
   })
 })
+
+for (const cause of ['debounce', 'command', 'tail-event'] as const) {
+  test(`Q20 offline hold survives ${cause} refresh until reconnect`, async ($, on) => {
+    const clock = mock.clock(on)
+    const statuses: string[] = []
+    let finish!: () => void
+    const waiting = new Promise<void>((resolve) => { finish = resolve })
+    let listFetches = 0
+    setupReviewHooks(on, statuses)
+    on('process.run', (_$, e) => {
+      if (e.argv[2] === 'channels') return procOk('[]')
+      listFetches++
+      return procOk(JSON.stringify([reviewSession('live-lead')]))
+    })
+    on('process.spawn', async function* () {
+      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+      if (cause === 'debounce') yield { stream: 'stdout' as const, text: 'session changed\n' }
+      yield { stream: 'stderr' as const, text: 'asenq tail: disconnected\n' }
+      if (cause === 'tail-event') yield { stream: 'stdout' as const, text: 'session changed\n' }
+      await waiting
+      return { value: { code: 0, signal: null } }
+    })
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    const fetchesAtDisconnect = listFetches
+    try {
+      expect(statuses[statuses.length - 1]).toBe('asenq offline')
+      if (cause === 'command') {
+        await $.command.run(CMD_RUN)
+        await clock.settle()
+        expect(listFetches).toBeGreaterThan(fetchesAtDisconnect)
+      } else {
+        await clock.advance(400)
+        if (cause === 'debounce') expect(listFetches).toBe(fetchesAtDisconnect)
+        else expect(listFetches).toBeGreaterThan(fetchesAtDisconnect)
+      }
+      expect(statuses[statuses.length - 1]).toBe('asenq offline')
+    } finally {
+      finish()
+      await clock.settle()
+    }
+  })
+}
+
+test('Q20 disconnected hold survives session start until a new connected marker', async ($, on) => {
+  const clock = mock.clock(on)
+  const statuses: string[] = []
+  let releaseFirst!: () => void
+  let releaseReconnect!: () => void
+  let finishReconnect!: () => void
+  const firstTail = new Promise<void>((resolve) => { releaseFirst = resolve })
+  const reconnect = new Promise<void>((resolve) => { releaseReconnect = resolve })
+  const reconnectTail = new Promise<void>((resolve) => { finishReconnect = resolve })
+  let spawnCount = 0
+  setupReviewHooks(on, statuses)
+  on('process.run', (_$, e) => procOk(e.argv[2] === 'channels' ? '[]' : JSON.stringify([reviewSession('live-lead')])))
+  on('process.spawn', async function* () {
+    spawnCount++
+    if (spawnCount === 1) {
+      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+      yield { stream: 'stderr' as const, text: 'asenq tail: disconnected\n' }
+      await firstTail
+      return { value: { code: 0, signal: null } }
+    }
+    await reconnect
+    yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+    await reconnectTail
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  try {
+    expect(statuses[statuses.length - 1]).toBe('asenq offline')
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    expect(statuses[statuses.length - 1]).toBe('asenq offline')
+    expect(spawnCount).toBe(2)
+    releaseReconnect()
+    await clock.settle()
+    expect(statuses[statuses.length - 1]).toContain('live-lead')
+  } finally {
+    releaseFirst()
+    releaseReconnect()
+    finishReconnect()
+    await clock.settle()
+  }
+})
