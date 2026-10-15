@@ -1,4 +1,5 @@
 import { test, expect, mock, describe } from 'claude-code/testing'
+import type { On } from 'claude-code'
 import type { AsenqData, Session, Channel } from '../types'
 import { statusLine, findSelf, sharedWorkers, formatWorkerNames, firstOrchestrator } from './format'
 
@@ -185,6 +186,47 @@ function setupMocks(on: any, opts: MockOpts = {}) {
   on('process.spawn', async function* () {
     return { value: { code: 1, signal: null } }
   })
+}
+
+function setupReviewHooks(on: On, statuses: string[]): void {
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'cc-test' }))
+  on('command.register', () => V)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.close', () => V)
+  on('ui.toast', () => V)
+  on('ui.status', (_$, e) => { statuses.push(e.text ?? ''); return V })
+  on('ui.render', () => ({ type: 'engine', ref: 0 }))
+  on('fs.read', (_$, e) => {
+    if (e.path && e.path.endsWith('asenq-cli.json')) return { value: CLI_JSON }
+    throw new Error(`unexpected fs.read: ${e.path}`)
+  })
+}
+
+function reviewSession(name: string): Session {
+  return { id: 's1', name, role: 'orchestrator', state: 'live', harness: 'claude', harnessSessionId: 'cc-test', cwd: '/', channels: [] }
+}
+
+function setupDeferredRefresh(on: On, statuses: string[]) {
+  setupReviewHooks(on, statuses)
+  let fetches = 0
+  let release!: () => void
+  const blocked = new Promise<void>((resolve) => { release = resolve })
+  let finish!: () => void
+  const tailWait = new Promise<void>((resolve) => { finish = resolve })
+  on('process.run', async (_$, e) => {
+    if (e.argv[2] === 'channels') return procOk('[]')
+    fetches++
+    const first = fetches === 1
+    if (first) await blocked
+    return procOk(JSON.stringify([reviewSession(first ? 'old-lead' : 'new-lead')]))
+  })
+  on('process.spawn', async function* () {
+    yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+    await tailWait
+    return { value: { code: 1, signal: null } }
+  })
+  return { release, finish, get fetches() { return fetches } }
 }
 
 // --- session.start ---
@@ -740,74 +782,84 @@ describe('drafts', () => {
   })
 })
 
-// --- F-15: status from atom, seq guard, fetchSeq seed ---
+// --- Review regressions: persisted sequence and last-write-wins status/data ---
 
-describe('seq guard in setData', () => {
-  test('a command.run after tail-offline overwrites with a higher seq', async ($, on) => {
+describe('sequenced refresh protections', () => {
+  test('an older tail fetch completing last cannot overwrite newer pane data', async ($, on) => {
     const clock = mock.clock(on)
-    const statusCalls: string[] = []
+    const statuses: string[] = []
+    const pending = setupDeferredRefresh(on, statuses)
 
-    on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
-    on('session.id', () => ({ value: 'cc-test' }))
-    on('command.register', () => V)
-    on('ui.open', () => ({ value: { isPlaced: true } }))
-    on('ui.close', () => V)
-    on('ui.toast', () => V)
-    on('ui.status', (_$: any, e: any) => { statusCalls.push(e.text ?? ''); return V })
-    on('ui.render', () => ({ type: 'engine', ref: 0 }))
-    on('fs.read', (_$: any, e: any) => {
-      if (e.path && e.path.endsWith('asenq-cli.json')) return { value: CLI_JSON }
-      throw new Error(`unexpected fs.read: ${e.path}`)
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    try {
+      expect(pending.fetches).toBe(1)
+      await $.command.run(CMD_RUN)
+      await clock.settle()
+      pending.release()
+      await clock.settle()
+
+      const ui = await $.ui.mount({ plugin: 'asenq', surface: 'terminal', component: 'Pane', requestId: 'asenq', props: PANE_PROPS })
+      const input = await ui.find({ type: 'Input', key: 'rename-s1' })
+      expect(input!.props['placeholder']).toBe('new-lead')
+      await ui.unmount()
+    } finally {
+      pending.release()
+      pending.finish()
+      await clock.settle()
+    }
+  })
+
+  test('an older tail fetch completing last cannot publish obsolete status', async ($, on) => {
+    const clock = mock.clock(on)
+    const statuses: string[] = []
+    const pending = setupDeferredRefresh(on, statuses)
+
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    try {
+      await $.command.run(CMD_RUN)
+      await clock.settle()
+      pending.release()
+      await clock.settle()
+      expect(statuses[statuses.length - 1]).toContain('new-lead')
+    } finally {
+      pending.release()
+      pending.finish()
+      await clock.settle()
+    }
+  })
+
+  test('a persisted high sequence does not block fresh data after session restart', async ($, on) => {
+    const clock = mock.clock(on)
+    const statuses: string[] = []
+    setupReviewHooks(on, statuses)
+    let name = 'persisted-lead'
+    on('process.run', (_$, e) => {
+      if (e.argv[2] === 'channels') return procOk('[]')
+      return procOk(JSON.stringify([reviewSession(name)]))
     })
-    on('process.run', (_$: any, e: any) => {
-      const sub = e.argv.slice(2).join(' ')
-      if (sub === 'channels --json') return procOk(CHANNELS_JSON)
-      if (sub === 'ls --json') return procOk(LS_JSON)
-      return procFail()
-    })
-    // Tail connects, refetches, then exits -> sets offline
     on('process.spawn', async function* () {
-      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
       return { value: { code: 1, signal: null } }
     })
 
     await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
     await clock.settle()
-
-    // After the tail exits, status should be offline
-    const offlineIdx = statusCalls.findIndex((s) => s.includes('offline'))
-    expect(offlineIdx).toBeGreaterThanOrEqual(0)
-
-    // command.run refetches with a higher seq and goes online again
-    await $.command.run(CMD_RUN)
-    await clock.settle()
-
-    const last = statusCalls[statusCalls.length - 1]
-    expect(last).toContain('lead')
-    expect(last).toContain('orchestrator')
-  })
-})
-
-describe('status line reads atom (F-15)', () => {
-  test('status matches pane data after a mutation', async ($, on) => {
-    const clock = mock.clock(on)
-    const statusCalls: string[] = []
-    setupMocks(on, { onStatus: (t) => statusCalls.push(t) })
-
+    for (let i = 0; i < 5; i++) {
+      await $.command.run(CMD_RUN)
+      await clock.settle()
+    }
+    name = 'fresh-lead'
     await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
     await clock.settle()
     await $.command.run(CMD_RUN)
     await clock.settle()
 
-    // The status should reflect the atom data (1 worker)
-    const last = statusCalls[statusCalls.length - 1]
-    expect(last).toContain('1 workers')
-
-    // Mount the pane and check the data matches
     const ui = await $.ui.mount({ plugin: 'asenq', surface: 'terminal', component: 'Pane', requestId: 'asenq', props: PANE_PROPS })
-    expect(await ui.find({ type: 'Text', text: /lead/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /w1/ })).toBeDefined()
+    const input = await ui.find({ type: 'Input', key: 'rename-s1' })
+    expect(input!.props['placeholder']).toBe('fresh-lead')
     await ui.unmount()
+    expect(statuses[statuses.length - 1]).toContain('fresh-lead')
   })
 })
 
