@@ -29,12 +29,15 @@
   },
   "files": [
     "dist/src",
+    "mods",
+    "!mods/**/*.test.*",
     "skills",
     "web"
   ],
   "scripts": {
     "build": "tsc -p .",
     "test": "tsc -p . && node --disable-warning=ExperimentalWarning --test --test-concurrency=1 \"dist/test/*.test.js\"",
+    "test:mod": "claude plugin test mods/asenq",
     "prepublishOnly": "npm test"
   },
   "dependencies": {

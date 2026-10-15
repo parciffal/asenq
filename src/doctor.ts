@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { claudeHookInstalled, CLAUDE_EVENTS, claudeDir, hookCommand, ompAgentDir, opencodeDir, type Install } from "./setup/setup.js";
 import { isObj, readJson } from "./setup/jsonfile.js";
+import { checkMod, modsSourceDir } from "./setup/mods.js";
 import { inspectSkills, SKILL_NAMES, skillsSourceDir, type SkillState } from "./setup/skills.js";
 import { AsenqClient } from "./shared/client.js";
 import { readConfig } from "./shared/config.js";
@@ -116,6 +117,13 @@ export async function doctor(): Promise<number> {
         line("warn", `claude.envelope is untested on ${v}; set it to false if sender names or replies break`);
       } else line("ok", "claude.envelope enabled");
     }
+
+    const mod = checkMod(claudeDir(), modsSourceDir());
+    if (!mod.installed) line("fail", "claude mod: ~/.claude/mods/asenq not installed; run: asenq setup");
+    else if (!mod.registered) line("fail", "claude mod: ~/.claude/mods/asenq not in CLAUDE_CODE_PLUGIN_DIRS; run: asenq setup");
+    else if (!mod.current) line("fail", "claude mod: ~/.claude/mods/asenq is outdated; run: asenq setup");
+    else if (!mod.cliValid) line("fail", "claude mod: asenq-cli.json missing or paths do not exist; run: asenq setup");
+    else line("ok", "claude mod: installed and registered");
   } else line("ok", "claude: not installed, skipped");
   reportSkills("claude", claudeDir(), existsSync(claudeDir()));
 

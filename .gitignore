@@ -6,3 +6,4 @@ site/
 .claude/*
 !.claude/skills/
 design/
+mods/*/.claude-plugin/types/

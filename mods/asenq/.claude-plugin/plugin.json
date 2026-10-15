@@ -1,0 +1,6 @@
+{
+  "name": "asenq",
+  "version": "0.1.0",
+  "description": "Status line, /asenq pane and live tail for asenq sessions, roles and channels",
+  "types": "./types/index.d.ts"
+}
