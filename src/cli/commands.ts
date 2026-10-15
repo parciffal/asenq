@@ -133,8 +133,7 @@ async function runClientCommand(client: AsenqClient, cmd: string, argv: string[]
           process.stderr.write("asenq tail: connected\n");
         },
         onDisconnect: () => {
-          process.stderr.write("asenq tail: reconnect limit reached\n");
-          process.exit(1);
+          process.stderr.write("asenq tail: disconnected\n");
         },
       });
       client.close();

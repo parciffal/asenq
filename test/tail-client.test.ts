@@ -11,13 +11,13 @@ const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 
 // --- Client unit tests for maxReconnects / onDisconnect ---
 
-test("client calls onDisconnect after maxReconnects consecutive failures", async () => {
+test("client reports one disconnect before reconnect attempts exhaust", async () => {
   const env = await startEnv();
   try {
-    let disconnected = false;
+    let disconnects = 0;
     const limited = new AsenqClient({
       maxReconnects: 2,
-      onDisconnect: () => { disconnected = true; },
+      onDisconnect: () => { disconnects++; },
       schedule: (fn) => { setTimeout(fn, 5); },
     });
     await limited.connect();
@@ -25,20 +25,20 @@ test("client calls onDisconnect after maxReconnects consecutive failures", async
     await env.daemon.close();
     // Wait for reconnects to exhaust (2 * ~5ms each + overhead)
     await new Promise((r) => setTimeout(r, 300));
-    assert.ok(disconnected, "onDisconnect was called");
+    assert.equal(disconnects, 1, "one callback for the socket drop, not for each failed retry");
     limited.close();
   } finally {
     await env.close();
   }
 });
 
-test("client without maxReconnects does not call onDisconnect", async () => {
+test("client reports disconnect without a retry limit", async () => {
   const env = await startEnv();
   try {
-    let disconnected = false;
+    let disconnects = 0;
     let attempts = 0;
     const unlimited = new AsenqClient({
-      onDisconnect: () => { disconnected = true; },
+      onDisconnect: () => { disconnects++; },
       schedule: (fn) => {
         attempts++;
         if (attempts < 4) setTimeout(fn, 5);
@@ -49,7 +49,7 @@ test("client without maxReconnects does not call onDisconnect", async () => {
     await unlimited.request("hello", { protocol: 1 });
     await env.daemon.close();
     await new Promise((r) => setTimeout(r, 300));
-    assert.ok(!disconnected, "onDisconnect not called without maxReconnects");
+    assert.equal(disconnects, 1, "callback fires for the socket drop regardless of retry limit");
     assert.ok(attempts >= 2, `made ${attempts} reconnect attempts`);
     unlimited.close();
   } finally {
@@ -59,7 +59,7 @@ test("client without maxReconnects does not call onDisconnect", async () => {
 
 // --- CLI tail test ---
 
-test("tail prints connected on stderr after successful subscribe", async () => {
+test("tail reports disconnect before reconnecting", async () => {
   const env = await startEnv();
   try {
     writeFileSync(
@@ -71,27 +71,35 @@ test("tail prints connected on stderr after successful subscribe", async () => {
       env: { ...process.env, ASENQ_HOME: env.home },
       stdio: ["ignore", "pipe", "pipe"],
     });
-
     let stderr = "";
     child.stderr!.on("data", (d: Buffer) => { stderr += d.toString(); });
-
-    try {
+    const count = (line: string) => stderr.split(line).length - 1;
+    const waitForCount = async (line: string, expected: number): Promise<void> => {
+      if (count(line) >= expected) return;
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => { reject(new Error("timeout")); }, 5000);
-        child.stderr!.on("data", () => {
-          if (stderr.includes("asenq tail: connected")) {
+        // Integration test: reconnect uses the child process's real timer, so bound the wait.
+        const timer = setTimeout(() => reject(new Error(`timeout waiting for ${line} #${expected}`)), 5000);
+        const check = () => {
+          if (count(line) >= expected) {
             clearTimeout(timer);
+            child.stderr!.off("data", check);
             resolve();
           }
-        });
+        };
+        child.stderr!.on("data", check);
       });
+    };
+
+    try {
+      await waitForCount("asenq tail: connected", 1);
+      await env.restart();
+      await waitForCount("asenq tail: disconnected", 1);
+      await waitForCount("asenq tail: connected", 2);
+      assert.equal(count("asenq tail: disconnected"), 1, "one disconnect marker for one socket drop");
     } finally {
       child.kill();
-      // Wait for the child to exit
-      await new Promise<void>((r) => child.on("exit", () => r()));
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     }
-
-    assert.ok(stderr.includes("asenq tail: connected"), "connected line on stderr");
   } finally {
     await env.close();
   }

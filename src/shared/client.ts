@@ -14,7 +14,7 @@ import {
 export type ClientOpts = {
   onPush?(p: Push): void;
   onReconnect?(): Promise<void>;
-  /** Called when reconnect finally fails (maxReconnects reached). */
+  /** Called once when an established daemon connection closes, before reconnect attempts. */
   onDisconnect?(): void;
   schedule?(fn: () => void, ms: number): unknown;
   autoStart?: boolean;
@@ -160,6 +160,7 @@ export class AsenqClient {
       this.pending.delete(id);
     }
     if (this.closed) return;
+    try { this.opts.onDisconnect?.(); } catch {}
     const gate = Promise.withResolvers<void>();
     gate.promise.catch(() => {});
     this.ready = gate.promise;
@@ -177,7 +178,6 @@ export class AsenqClient {
       }, () => {
         this.reconnectCount++;
         if (this.opts.maxReconnects !== undefined && this.reconnectCount >= this.opts.maxReconnects) {
-          this.opts.onDisconnect?.();
           return gate.reject(new Error("asenq reconnect limit reached"));
         }
         this.backoff = Math.min(this.backoff * 2, 10_000);

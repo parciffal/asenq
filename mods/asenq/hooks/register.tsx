@@ -10,6 +10,7 @@ const MAX_BACKOFF_MS = 30_000
 const STABLE_MS = 5_000
 const VERSION_MISMATCH_RE = /protocol|version/i
 const CONNECTED_LINE = 'asenq tail: connected'
+const DISCONNECTED_LINE = 'asenq tail: disconnected'
 
 const EMPTY: AsenqData = { sessions: [], channels: [], online: false, seq: 0 }
 
@@ -101,10 +102,13 @@ function startTail($: any): void {
     void (async () => {
       let stableTimer: Timer | null = null
       let stderrBuffer = ''
-      const processStderrLine = (line: string): void => {
+      const processStderrLine = async (line: string): Promise<void> => {
         const completeLine = line.endsWith('\r') ? line.slice(0, -1) : line
         if (completeLine === CONNECTED_LINE) {
-          void refreshAndStatus($)
+          await refreshAndStatus($)
+        } else if (completeLine === DISCONNECTED_LINE) {
+          await setData($, { ...EMPTY, seq: ++fetchSeq })
+          await updateStatus($)
         } else if (!versionMismatchToasted && VERSION_MISMATCH_RE.test(completeLine)) {
           versionMismatchToasted = true
           $.ui.toast('asenq mod is out of date with the daemon: rerun `asenq setup`')
@@ -123,7 +127,7 @@ function startTail($: any): void {
             stderrBuffer += chunk.text
             let newline = stderrBuffer.indexOf('\n')
             while (newline >= 0) {
-              processStderrLine(stderrBuffer.slice(0, newline))
+              await processStderrLine(stderrBuffer.slice(0, newline))
               stderrBuffer = stderrBuffer.slice(newline + 1)
               newline = stderrBuffer.indexOf('\n')
             }
@@ -140,7 +144,7 @@ function startTail($: any): void {
       } catch {
         // spawn failed
       }
-      if (stderrBuffer) processStderrLine(stderrBuffer)
+      if (stderrBuffer) await processStderrLine(stderrBuffer)
       // tail ended or failed: go offline, retry with backoff
       if (stableTimer) { stableTimer.cancel(); stableTimer = null }
       const offlineData: AsenqData = { ...EMPTY, seq: ++fetchSeq }

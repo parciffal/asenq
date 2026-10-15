@@ -857,3 +857,50 @@ describe('status publication ordering', () => {
     expect(statuses[statuses.length - 1]).toContain('new-lead')
   })
 })
+describe('tail disconnect status', () => {
+  test('shows offline at disconnect and refetches on reconnect', async ($, on) => {
+    const clock = mock.clock(on)
+    const statuses: string[] = []
+    let finish!: () => void
+    const waiting = new Promise<void>((resolve) => { finish = resolve })
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('session.id', () => ({ value: 'cc-test' }))
+    on('command.register', () => V)
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    on('ui.close', () => V)
+    on('ui.toast', () => V)
+    on('ui.status', (_$, e) => { statuses.push(e.text ?? ''); return V })
+    on('ui.render', () => ({ type: 'engine', ref: 0 }))
+    on('fs.read', (_$, e) => {
+      if (e.path && e.path.endsWith('asenq-cli.json')) return { value: CLI_JSON }
+      throw new Error(`unexpected fs.read: ${e.path}`)
+    })
+    on('process.run', (_$, e) => {
+      const sub = e.argv.slice(2).join(' ')
+      if (sub === 'ls --json') return procOk(LS_JSON)
+      if (sub === 'channels --json') return procOk(CHANNELS_JSON)
+      return procFail()
+    })
+    on('process.spawn', async function* () {
+      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+      yield { stream: 'stderr' as const, text: 'asenq tail: disconnected\n' }
+      yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+      await waiting
+      return { value: { code: 0, signal: null } }
+    })
+
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    try {
+      const onlineBefore = statuses.findIndex((status) => status.includes('lead'))
+      const offline = statuses.findIndex((status, index) => index > onlineBefore && status === 'asenq offline')
+      const onlineAfter = statuses.findIndex((status, index) => index > offline && status.includes('lead'))
+      expect(onlineBefore).toBeGreaterThanOrEqual(0)
+      expect(offline).toBeGreaterThan(onlineBefore)
+      expect(onlineAfter).toBeGreaterThan(offline)
+    } finally {
+      finish()
+      await clock.settle()
+    }
+  })
+})
