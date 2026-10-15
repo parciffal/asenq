@@ -30,6 +30,7 @@ let argv: string[] = []
 let debounceTimer: Timer | null = null
 let versionMismatchToasted = false
 let fetchSeq = 0
+let statusSeq = 0
 
 async function loadArgv($: any): Promise<string[]> {
   const text = await $.fs.read(`${$.plugin.root}/asenq-cli.json`)
@@ -73,9 +74,10 @@ async function setData($: any, data: AsenqData): Promise<void> {
 
 /** F-15: compute status from what the atom holds, so status and pane agree. */
 async function updateStatus($: any): Promise<void> {
-  const data = await read($, dataAtom)
+  const currentStatus = ++statusSeq
   const id = await sessionId($)
-  $.ui.status(statusLine(data, id))
+  const data = await read($, dataAtom)
+  if (currentStatus === statusSeq) $.ui.status(statusLine(data, id))
 }
 
 async function refreshAndStatus($: any): Promise<void> {

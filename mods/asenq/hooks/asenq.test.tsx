@@ -193,7 +193,8 @@ describe('session.start', () => {
   test('shows placeholder then fetches data via tail stderr connect line', async ($, on) => {
     const clock = mock.clock(on)
     const statusCalls: string[] = []
-
+    let finish!: () => void
+    const waiting = new Promise<void>((resolve) => { finish = resolve })
     on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
     on('session.id', () => ({ value: 'cc-test' }))
     on('command.register', () => V)
@@ -215,6 +216,7 @@ describe('session.start', () => {
     // F-14: spawn yields the "connected" stderr line, then stdout events
     on('process.spawn', async function* () {
       yield { stream: 'stderr' as const, text: 'asenq tail: connected\n' }
+      await waiting
       return { value: { code: 0, signal: null } }
     })
 
@@ -225,6 +227,8 @@ describe('session.start', () => {
     const real = statusCalls.find((s) => s.includes('lead'))
     expect(real).toBeDefined()
     expect(real).toContain('1 workers')
+    finish()
+    await clock.settle()
   })
 })
 
@@ -797,5 +801,59 @@ describe('tail stderr lines', () => {
 
     expect(fetchCount).toBeGreaterThanOrEqual(1)
     expect(toasts).toEqual(['asenq mod is out of date with the daemon: rerun `asenq setup`'])
+  })
+})
+describe('status publication ordering', () => {
+  test('slow identity lookup cannot publish status older than the current atom', async ($, on) => {
+    const clock = mock.clock(on)
+    const statuses: string[] = []
+    let pauseId = false
+    let release!: () => void
+    const waiting = new Promise<void>((resolve) => { release = resolve })
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('session.id', async () => {
+      if (pauseId) { pauseId = false; await waiting }
+      return { value: 'cc-test' }
+    })
+    on('command.register', () => V)
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    on('ui.close', () => V)
+    on('ui.toast', () => V)
+    on('ui.status', (_$, e) => { statuses.push(e.text ?? ''); return V })
+    on('ui.render', () => ({ type: 'engine', ref: 0 }))
+    on('fs.read', (_$, e) => {
+      if (e.path && e.path.endsWith('asenq-cli.json')) return { value: CLI_JSON }
+      throw new Error(`unexpected fs.read: ${e.path}`)
+    })
+    let name = 'old-lead'
+    on('process.run', (_$, e) => {
+      const sub = e.argv.slice(2).join(' ')
+      if (sub === 'channels --json') return procOk(CHANNELS_JSON)
+      if (sub === 'ls --json') return procOk(JSON.stringify([
+        { id: 's1', name, role: 'orchestrator', state: 'live', harness: 'claude', harnessSessionId: 'cc-test', cwd: '/', channels: [] },
+      ]))
+      return procFail()
+    })
+    on('process.spawn', async function* () {
+      return { value: { code: 1, signal: null } }
+    })
+
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    pauseId = true
+    const older = $.command.run(CMD_RUN)
+    await clock.settle()
+    name = 'new-lead'
+    await $.command.run(CMD_RUN)
+    await clock.settle()
+    release()
+    await older
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: 'asenq', surface: 'terminal', component: 'Pane', requestId: 'asenq', props: PANE_PROPS })
+    const input = await ui.find({ type: 'Input', key: 'rename-s1' })
+    expect(input!.props['placeholder']).toBe('new-lead')
+    await ui.unmount()
+    expect(statuses[statuses.length - 1]).toContain('new-lead')
   })
 })
