@@ -348,8 +348,10 @@ export const register: Register = (on) => {
     const selfChannels = self
       ? data.channels.filter((ch) => self.channels.includes(ch.name))
       : []
+    // Channel rows are roster summaries; this unique list owns each member's edit controls.
+    const channelMemberIds = new Set(selfChannels.flatMap((ch) => ch.members.map((member) => member.id)))
     const otherSessions = data.sessions.filter(
-      (s) => s.state === 'live' && (!self || s.id !== self.id),
+      (s) => (!self || s.id !== self.id) && (s.state === 'live' || channelMemberIds.has(s.id)),
     )
 
     return (

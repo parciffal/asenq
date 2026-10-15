@@ -257,6 +257,37 @@ describe('pane rendering', () => {
     })
   }
 
+  test('gone channel members retain one editable session row', async ($, on) => {
+    const clock = mock.clock(on)
+    const calls: string[] = []
+    const sessions = [
+      { id: 's1', name: 'lead', role: 'orchestrator', state: 'live', harness: 'claude', harnessSessionId: 'cc-test', cwd: '/', channels: ['prog'] },
+      { id: 's2', name: 'gone-worker', role: 'worker', state: 'gone', harness: 'omp', harnessSessionId: 'omp-2', cwd: '/', channels: ['prog'] },
+    ]
+    const channels = [{ name: 'prog', members: [
+      { id: 's1', name: 'lead', role: 'orchestrator', state: 'live' },
+      { id: 's2', name: 'gone-worker', role: 'worker', state: 'gone' },
+    ], count: 2 }]
+    setupMocks(on, {
+      lsJson: JSON.stringify(sessions),
+      channelsJson: JSON.stringify(channels),
+      onProcessRun: (args) => calls.push(args.slice(2).join(' ')),
+    })
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    await $.command.run(CMD_RUN)
+    await clock.settle()
+    const ui = await $.ui.mount({ plugin: 'asenq', surface: 'terminal', component: 'Pane', requestId: 'asenq', props: PANE_PROPS })
+    expect(await ui.find({ type: 'Input', key: 'rename-s2' })).toBeDefined()
+    expect(await ui.find({ type: 'Select', key: 'role-s2' })).toBeDefined()
+    await ui.input({ plugin: 'asenq', key: 'rename-s2', text: 'renamed-gone', kind: 'submit' })
+    await ui.select({ plugin: 'asenq', key: 'role-s2', value: 'orchestrator' })
+    await clock.settle()
+    expect(calls).toContain('rename gone-worker renamed-gone')
+    expect(calls).toContain('role gone-worker orchestrator')
+    await ui.unmount()
+  })
+
   test('shows offline when daemon is down', async ($, on) => {
     const clock = mock.clock(on)
     setupMocks(on, { failRun: true })
