@@ -288,6 +288,22 @@ describe('pane rendering', () => {
     await ui.unmount()
   })
 
+  test('shows channel memberships on unrelated session rows', async ($, on) => {
+    const clock = mock.clock(on)
+    const sessions = [
+      { id: 's1', name: 'lead', role: 'orchestrator', state: 'live', harness: 'claude', harnessSessionId: 'cc-test', cwd: '/', channels: ['prog'] },
+      { id: 's2', name: 'other-worker', role: 'worker', state: 'live', harness: 'omp', harnessSessionId: 'omp-2', cwd: '/', channels: ['other-project'] },
+    ]
+    setupMocks(on, { lsJson: JSON.stringify(sessions) })
+    await $.session.start({ cwd: '/project', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    await $.command.run(CMD_RUN)
+    await clock.settle()
+    const ui = await $.ui.mount({ plugin: 'asenq', surface: 'terminal', component: 'Pane', requestId: 'asenq', props: PANE_PROPS })
+    expect(await ui.find({ type: 'Text', text: /#other-project/ })).toBeDefined()
+    await ui.unmount()
+  })
+
   test('shows offline when daemon is down', async ($, on) => {
     const clock = mock.clock(on)
     setupMocks(on, { failRun: true })

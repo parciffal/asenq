@@ -293,6 +293,9 @@ export const register: Register = (on) => {
             <Text dimColor> {rolePart} {s.state}</Text>
           </Box>
           <Box>
+            <Text dimColor>{s.channels.length > 0 ? s.channels.map((channel) => `#${channel}`).join(', ') : 'no channels'}</Text>
+          </Box>
+          <Box>
             <Input
               key={renameKey}
               label="name"
